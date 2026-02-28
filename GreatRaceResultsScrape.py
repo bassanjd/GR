@@ -42,7 +42,6 @@ combined_df = combined_df.drop(columns=[c for c in combined_df.columns if c in [
 # Rename first column
 combined_df = combined_df.rename(columns={"RANK+P1KA1:S1": "RANK"})
 
-
 # Reorder columns
 cols_order = [
     "RANK", "CAR", "YEAR", "ScYR", "DIV", "CREW",
