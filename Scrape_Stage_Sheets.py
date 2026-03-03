@@ -1,11 +1,10 @@
-import fitz  # PyMuPDF
+import fitz
 import pytesseract
 import pandas as pd
 import numpy as np
 import cv2
-import re
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 # ==============================
@@ -15,10 +14,9 @@ from pathlib import Path
 INPUT_DIR = Path(".\\Stage Notes")
 OUTPUT_DIR = Path(".\\Stage Notes Output")
 DPI = 300
-ROW_BIN_PIXELS = 35
-MIN_CONFIDENCE = 50  # Filter low-confidence OCR tokens
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Users\Joel\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+
 
 # ==============================
 # PDF RENDER
@@ -45,131 +43,108 @@ def render_pdf_to_images(pdf_path, dpi=300):
 
 
 # ==============================
-# OCR + EXTRACTION
+# TABLE GRID DETECTION
 # ==============================
 
-def preprocess(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return cv2.adaptiveThreshold(
+def detect_table_cells(image):
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(
         gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31, 2
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        15, 8
     )
 
+    # Detect horizontal lines
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
 
-def time_to_seconds(time_str):
-    match = re.match(r"(\d+)m([\d\.]+)s", str(time_str))
-    if not match:
-        return None
-    return int(match.group(1)) * 60 + float(match.group(2))
+    # Detect vertical lines
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+    detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
+
+    # Combine
+    grid = cv2.add(detect_horizontal, detect_vertical)
+
+    # Find contours
+    contours, _ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    cells = []
+
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        # Filter small noise boxes
+        if w > 50 and h > 20:
+            cells.append((x, y, w, h))
+
+    # Sort top-to-bottom, left-to-right
+    cells = sorted(cells, key=lambda b: (b[1], b[0]))
+
+    return cells
 
 
-def extract_page(image):
+# ==============================
+# OCR EACH CELL
+# ==============================
 
-    h, w = image.shape
-    col_A = (0, int(w * 0.45))
-    col_C = (int(w * 0.45), int(w * 0.80))
+def ocr_cell(image, box):
+    x, y, w, h = box
+    cell_img = image[y:y+h, x:x+w]
 
-    data = pytesseract.image_to_data(
-        image,
-        output_type=pytesseract.Output.DATAFRAME,
+    text = pytesseract.image_to_string(
+        cell_img,
         config="--oem 3 --psm 6"
     )
 
-    data = data.dropna(subset=["text"])
-    data = data[data["text"].str.strip() != ""]
-    data = data[data["conf"] > MIN_CONFIDENCE]
-
-    data["row_bin"] = (data["top"] // ROW_BIN_PIXELS).astype(int)
-
-    rows = []
-
-    for _, group in data.groupby("row_bin"):
-        group = group.sort_values("left")
-
-        colA_words = group[
-            (group["left"] >= col_A[0]) &
-            (group["left"] < col_A[1])
-        ]["text"].tolist()
-
-        colC_words = group[
-            (group["left"] >= col_C[0]) &
-            (group["left"] < col_C[1])
-        ]["text"].tolist()
-
-        colA_text = " ".join(colA_words)
-        colC_text = " ".join(colC_words)
-
-        leg_match = re.search(r"\b(\d{1,2})\b", colA_text)
-        times = re.findall(r"\d+m\d+\.\d+s", colC_text)
-
-        if leg_match and len(times) >= 1:
-            leg_time = times[0]
-            cumulative_time = times[1] if len(times) > 1 else None
-
-            rows.append({
-                "Leg": int(leg_match.group(1)),
-                "Instruction": colA_text.strip(),
-                "Leg_Time": leg_time,
-                "Leg_Time_sec": time_to_seconds(leg_time),
-                "Cumulative_Time": cumulative_time,
-                "Cumulative_Time_sec": time_to_seconds(cumulative_time) if cumulative_time else None
-            })
-
-    return rows
+    return text.strip()
 
 
-def extract_stage(pdf_path):
+def extract_table_from_page(image):
 
-    print(f"\nProcessing: {pdf_path.name}")
+    cells = detect_table_cells(image)
+
+    if not cells:
+        return None
+
+    # Cluster rows by Y coordinate
+    rows = {}
+    for (x, y, w, h) in cells:
+        row_key = y // 20
+        rows.setdefault(row_key, []).append((x, y, w, h))
+
+    table = []
+
+    for row_key in sorted(rows.keys()):
+        row_cells = sorted(rows[row_key], key=lambda b: b[0])
+        row_text = [ocr_cell(image, box) for box in row_cells]
+        table.append(row_text)
+
+    return pd.DataFrame(table)
+
+
+# ==============================
+# PROCESS STAGE
+# ==============================
+
+def process_stage(pdf_path):
+
+    print(f"Processing {pdf_path.name}")
 
     images = render_pdf_to_images(pdf_path, dpi=DPI)
 
-    all_rows = []
+    stage_tables = []
 
-    for i, img in enumerate(images):
-        print(f"  OCR page {i+1}")
-        processed = preprocess(img)
-        rows = extract_page(processed)
-        all_rows.extend(rows)
+    for img in images:
+        df = extract_table_from_page(img)
+        if df is not None:
+            stage_tables.append(df)
 
-    df = pd.DataFrame(all_rows).drop_duplicates()
-
-    if df.empty:
-        print("  ⚠ No data extracted.")
+    if not stage_tables:
         return None
 
-    df = df.sort_values("Leg").reset_index(drop=True)
-
-    if df["Cumulative_Time_sec"].notna().all():
-        if not df["Cumulative_Time_sec"].is_monotonic_increasing:
-            print("  ⚠ Warning: cumulative time not monotonic.")
-
-    return df
-
-
-# ==============================
-# MULTIPROCESSING WRAPPER
-# ==============================
-
-def process_single_stage(pdf_path):
-
-    df = extract_stage(pdf_path)
-
-    if df is None:
-        return None
-
-    stage_name = pdf_path.stem
-    df["Stage"] = stage_name
-
-    csv_path = OUTPUT_DIR / f"{stage_name}_clean.csv"
-    parquet_path = OUTPUT_DIR / f"{stage_name}_clean.parquet"
-
-    df.to_csv(csv_path, index=False)
-    df.to_parquet(parquet_path, index=False)
-
-    return df
+    return pd.concat(stage_tables, ignore_index=True)
 
 
 # ==============================
@@ -182,51 +157,31 @@ def main():
 
     stage_files = sorted(INPUT_DIR.glob("*.pdf"))
 
-    if not stage_files:
-        print("No PDFs found.")
-        return
+    workers = max(1, multiprocessing.cpu_count() - 1)
+    print(f"Using {workers} workers")
 
-    total_cores = multiprocessing.cpu_count()
-    workers = max(1, total_cores - 1)
-
-    print(f"Found {len(stage_files)} PDFs")
-    print(f"CPU cores available: {total_cores}")
-    print(f"Using {workers} worker processes\n")
-
-    master_df_list = []
+    master_tables = []
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(process_stage, stage_files))
 
-        futures = {
-            executor.submit(process_single_stage, pdf): pdf
-            for pdf in stage_files
-        }
+    for pdf_file, df in zip(stage_files, results):
+        if df is None:
+            continue
 
-        for future in as_completed(futures):
-            pdf_file = futures[future]
-            try:
-                result = future.result()
-                if result is not None:
-                    master_df_list.append(result)
-                    print(f"✓ Completed: {pdf_file.name}")
-                else:
-                    print(f"⚠ No data: {pdf_file.name}")
-            except Exception as e:
-                print(f"✗ Failed: {pdf_file.name}")
-                print(e)
+        stage_name = pdf_file.stem
 
-    if master_df_list:
-        master_df = pd.concat(master_df_list, ignore_index=True)
+        df.to_csv(OUTPUT_DIR / f"{stage_name}_FULL_TABLE.csv", index=False)
+        df.to_parquet(OUTPUT_DIR / f"{stage_name}_FULL_TABLE.parquet", index=False)
 
-        master_csv = OUTPUT_DIR / "Great_Race_2025_master.csv"
-        master_parquet = OUTPUT_DIR / "Great_Race_2025_master.parquet"
+        master_tables.append(df)
 
-        master_df.to_csv(master_csv, index=False)
-        master_df.to_parquet(master_parquet, index=False)
+    if master_tables:
+        master = pd.concat(master_tables, ignore_index=True)
+        master.to_csv(OUTPUT_DIR / "Great_Race_2025_FULL_MASTER.csv", index=False)
+        master.to_parquet(OUTPUT_DIR / "Great_Race_2025_FULL_MASTER.parquet", index=False)
 
-        print("\nMaster files saved:")
-        print(master_csv)
-        print(master_parquet)
+    print("Done.")
 
 
 if __name__ == "__main__":
