@@ -4,8 +4,10 @@ import pandas as pd
 import numpy as np
 import cv2
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+import traceback
+import gc
 
 # ==============================
 # CONFIG
@@ -19,31 +21,37 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Users\Joel\AppData\Local\Programs\T
 
 
 # ==============================
-# PDF RENDER
+# SAFE PDF RENDER
 # ==============================
 
 def render_pdf_to_images(pdf_path, dpi=300):
-    doc = fitz.open(pdf_path)
-    zoom = dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
-
     images = []
+    try:
+        doc = fitz.open(pdf_path)
+        zoom = dpi / 72
+        mat = fitz.Matrix(zoom, zoom)
 
-    for page in doc:
-        pix = page.get_pixmap(matrix=mat)
-        img = np.frombuffer(pix.samples, dtype=np.uint8)
-        img = img.reshape(pix.height, pix.width, pix.n)
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat)
+            img = np.frombuffer(pix.samples, dtype=np.uint8)
+            img = img.reshape(pix.height, pix.width, pix.n)
 
-        if pix.n == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            if pix.n == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-        images.append(img)
+            images.append(img)
+
+        doc.close()
+
+    except Exception as e:
+        print(f"⚠ Render failed: {pdf_path.name}")
+        raise e
 
     return images
 
 
 # ==============================
-# TABLE GRID DETECTION
+# TABLE DETECTION
 # ==============================
 
 def detect_table_cells(image):
@@ -56,38 +64,26 @@ def detect_table_cells(image):
         15, 8
     )
 
-    # Detect horizontal lines
     horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-    detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
-
-    # Detect vertical lines
     vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+
+    detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
     detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
 
-    # Combine
     grid = cv2.add(detect_horizontal, detect_vertical)
 
-    # Find contours
     contours, _ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     cells = []
 
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-
-        # Filter small noise boxes
         if w > 50 and h > 20:
             cells.append((x, y, w, h))
 
-    # Sort top-to-bottom, left-to-right
     cells = sorted(cells, key=lambda b: (b[1], b[0]))
-
     return cells
 
-
-# ==============================
-# OCR EACH CELL
-# ==============================
 
 def ocr_cell(image, box):
     x, y, w, h = box
@@ -108,7 +104,6 @@ def extract_table_from_page(image):
     if not cells:
         return None
 
-    # Cluster rows by Y coordinate
     rows = {}
     for (x, y, w, h) in cells:
         row_key = y // 20
@@ -125,26 +120,56 @@ def extract_table_from_page(image):
 
 
 # ==============================
-# PROCESS STAGE
+# ISOLATED STAGE PROCESSOR
 # ==============================
 
-def process_stage(pdf_path):
+def process_stage_safe(pdf_path):
 
-    print(f"Processing {pdf_path.name}")
+    try:
+        print(f"Processing {pdf_path.name}")
 
-    images = render_pdf_to_images(pdf_path, dpi=DPI)
+        images = render_pdf_to_images(pdf_path, dpi=DPI)
 
-    stage_tables = []
+        stage_tables = []
 
-    for img in images:
-        df = extract_table_from_page(img)
-        if df is not None:
-            stage_tables.append(df)
+        for img in images:
+            df = extract_table_from_page(img)
+            if df is not None:
+                stage_tables.append(df)
 
-    if not stage_tables:
-        return None
+            # aggressively free memory
+            del img
+            gc.collect()
 
-    return pd.concat(stage_tables, ignore_index=True)
+        if not stage_tables:
+            return {"file": pdf_path.name, "status": "no_table", "error": None}
+
+        combined = pd.concat(stage_tables, ignore_index=True)
+
+        stage_name = pdf_path.stem
+
+        combined.to_csv(OUTPUT_DIR / f"{stage_name}_FULL_TABLE.csv", index=False)
+        combined.to_parquet(OUTPUT_DIR / f"{stage_name}_FULL_TABLE.parquet", index=False)
+
+        del combined
+        del stage_tables
+        gc.collect()
+
+        return {"file": pdf_path.name, "status": "success", "error": None}
+
+    except MemoryError:
+        return {
+            "file": pdf_path.name,
+            "status": "memory_error",
+            "error": "Out of memory"
+        }
+
+    except Exception as e:
+        return {
+            "file": pdf_path.name,
+            "status": "error",
+            "error": traceback.format_exc()
+        }
 
 
 # ==============================
@@ -157,31 +182,38 @@ def main():
 
     stage_files = sorted(INPUT_DIR.glob("*.pdf"))
 
-    workers = max(1, multiprocessing.cpu_count() - 1)
-    print(f"Using {workers} workers")
+    if not stage_files:
+        print("No PDFs found.")
+        return
 
-    master_tables = []
+    workers = max(1, multiprocessing.cpu_count() - 1)
+
+    print(f"Using {workers} workers\n")
+
+    results_log = []
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(process_stage, stage_files))
 
-    for pdf_file, df in zip(stage_files, results):
-        if df is None:
-            continue
+        futures = {
+            executor.submit(process_stage_safe, pdf): pdf
+            for pdf in stage_files
+        }
 
-        stage_name = pdf_file.stem
+        for future in as_completed(futures):
+            result = future.result()
+            results_log.append(result)
 
-        df.to_csv(OUTPUT_DIR / f"{stage_name}_FULL_TABLE.csv", index=False)
-        df.to_parquet(OUTPUT_DIR / f"{stage_name}_FULL_TABLE.parquet", index=False)
+            if result["status"] == "success":
+                print(f"✓ {result['file']} completed")
+            else:
+                print(f"⚠ {result['file']} → {result['status']}")
 
-        master_tables.append(df)
+    # Save processing log
+    log_df = pd.DataFrame(results_log)
+    log_df.to_csv(OUTPUT_DIR / "processing_log.csv", index=False)
 
-    if master_tables:
-        master = pd.concat(master_tables, ignore_index=True)
-        master.to_csv(OUTPUT_DIR / "Great_Race_2025_FULL_MASTER.csv", index=False)
-        master.to_parquet(OUTPUT_DIR / "Great_Race_2025_FULL_MASTER.parquet", index=False)
-
-    print("Done.")
+    print("\nProcessing complete.")
+    print("Log saved to processing_log.csv")
 
 
 if __name__ == "__main__":
