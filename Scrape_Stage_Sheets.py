@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import cv2
 import re
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 # ==============================
@@ -13,18 +15,18 @@ from pathlib import Path
 INPUT_DIR = Path(".\\Stage Notes")
 OUTPUT_DIR = Path(".\\Stage Notes Output")
 DPI = 300
-ROW_BIN_PIXELS = 40
+ROW_BIN_PIXELS = 35
+MIN_CONFIDENCE = 50  # Filter low-confidence OCR tokens
 
-# Uncomment if needed (Windows)
 pytesseract.pytesseract.tesseract_cmd = r"C:\Users\Joel\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 
 # ==============================
-# PDF RENDER (NO POPPLER)
+# PDF RENDER
 # ==============================
 
 def render_pdf_to_images(pdf_path, dpi=300):
     doc = fitz.open(pdf_path)
-    zoom = dpi / 72  # 72 is default PDF DPI
+    zoom = dpi / 72
     mat = fitz.Matrix(zoom, zoom)
 
     images = []
@@ -34,7 +36,7 @@ def render_pdf_to_images(pdf_path, dpi=300):
         img = np.frombuffer(pix.samples, dtype=np.uint8)
         img = img.reshape(pix.height, pix.width, pix.n)
 
-        if pix.n == 4:  # remove alpha channel
+        if pix.n == 4:
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
         images.append(img)
@@ -48,13 +50,12 @@ def render_pdf_to_images(pdf_path, dpi=300):
 
 def preprocess(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.adaptiveThreshold(
+    return cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
         31, 2
     )
-    return thresh
 
 
 def time_to_seconds(time_str):
@@ -67,8 +68,6 @@ def time_to_seconds(time_str):
 def extract_page(image):
 
     h, w = image.shape
-
-    # Column layout tuned to your stage sheet
     col_A = (0, int(w * 0.45))
     col_C = (int(w * 0.45), int(w * 0.80))
 
@@ -80,6 +79,8 @@ def extract_page(image):
 
     data = data.dropna(subset=["text"])
     data = data[data["text"].str.strip() != ""]
+    data = data[data["conf"] > MIN_CONFIDENCE]
+
     data["row_bin"] = (data["top"] // ROW_BIN_PIXELS).astype(int)
 
     rows = []
@@ -119,10 +120,6 @@ def extract_page(image):
     return rows
 
 
-# ==============================
-# STAGE PROCESSOR
-# ==============================
-
 def extract_stage(pdf_path):
 
     print(f"\nProcessing: {pdf_path.name}")
@@ -145,7 +142,6 @@ def extract_stage(pdf_path):
 
     df = df.sort_values("Leg").reset_index(drop=True)
 
-    # Validate cumulative monotonicity
     if df["Cumulative_Time_sec"].notna().all():
         if not df["Cumulative_Time_sec"].is_monotonic_increasing:
             print("  ⚠ Warning: cumulative time not monotonic.")
@@ -154,7 +150,30 @@ def extract_stage(pdf_path):
 
 
 # ==============================
-# BATCH PROCESSOR
+# MULTIPROCESSING WRAPPER
+# ==============================
+
+def process_single_stage(pdf_path):
+
+    df = extract_stage(pdf_path)
+
+    if df is None:
+        return None
+
+    stage_name = pdf_path.stem
+    df["Stage"] = stage_name
+
+    csv_path = OUTPUT_DIR / f"{stage_name}_clean.csv"
+    parquet_path = OUTPUT_DIR / f"{stage_name}_clean.parquet"
+
+    df.to_csv(csv_path, index=False)
+    df.to_parquet(parquet_path, index=False)
+
+    return df
+
+
+# ==============================
+# MAIN
 # ==============================
 
 def main():
@@ -164,33 +183,38 @@ def main():
     stage_files = sorted(INPUT_DIR.glob("*.pdf"))
 
     if not stage_files:
-        print("No PDFs found in input folder.")
+        print("No PDFs found.")
         return
+
+    total_cores = multiprocessing.cpu_count()
+    workers = max(1, total_cores - 1)
+
+    print(f"Found {len(stage_files)} PDFs")
+    print(f"CPU cores available: {total_cores}")
+    print(f"Using {workers} worker processes\n")
 
     master_df_list = []
 
-    for pdf_file in stage_files:
-        df = extract_stage(pdf_file)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
 
-        if df is None:
-            continue
+        futures = {
+            executor.submit(process_single_stage, pdf): pdf
+            for pdf in stage_files
+        }
 
-        stage_name = pdf_file.stem
-        df["Stage"] = stage_name
+        for future in as_completed(futures):
+            pdf_file = futures[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    master_df_list.append(result)
+                    print(f"✓ Completed: {pdf_file.name}")
+                else:
+                    print(f"⚠ No data: {pdf_file.name}")
+            except Exception as e:
+                print(f"✗ Failed: {pdf_file.name}")
+                print(e)
 
-        # Save per stage
-        csv_path = OUTPUT_DIR / f"{stage_name}_clean.csv"
-        parquet_path = OUTPUT_DIR / f"{stage_name}_clean.parquet"
-
-        df.to_csv(csv_path, index=False)
-        df.to_parquet(parquet_path, index=False)
-
-        print(f"  Saved: {csv_path.name}")
-        print(f"  Saved: {parquet_path.name}")
-
-        master_df_list.append(df)
-
-    # Combine master
     if master_df_list:
         master_df = pd.concat(master_df_list, ignore_index=True)
 
@@ -206,4 +230,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
