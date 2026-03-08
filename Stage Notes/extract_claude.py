@@ -36,7 +36,7 @@ from pathlib import Path
 # Load .env file if present (before any API clients are initialized)
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent / ".env")
+    load_dotenv(Path(__file__).parent.parent / ".env")
 except ImportError:
     pass
 
@@ -50,9 +50,9 @@ log = logging.getLogger(__name__)
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE          = Path(__file__).parent
-STAGE_DIR     = BASE / "Stage Notes"
-OUTPUT_DIR    = BASE / "Output"
-CACHE_DIR     = OUTPUT_DIR / "claude_cache"
+STAGE_DIR     = BASE / "raw_data"
+OUTPUT_DIR    = BASE
+CACHE_DIR     = BASE / "claude_cache"
 INST_PARQUET  = OUTPUT_DIR / "stage_instructions.parquet"
 LEG_PARQUET   = OUTPUT_DIR / "leg_characteristics.parquet"
 POPPLER_PATH  = r"C:\Program Files (x86)\poppler\Library\bin"
