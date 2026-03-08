@@ -143,20 +143,35 @@ def segment_exercise_runs(df: pd.DataFrame, lat_thresh: float,
 
 def find_crossing_dist(grp: pd.DataFrame, trap_lon: float, going_west: bool) -> float | None:
     """
-    Return the cumulative odometer distance (mi) at which the run crosses trap_lon.
-    For westbound runs longitude decreases; for eastbound it increases.
-    Uses linear interpolation between the two bracketing GPS samples.
-    Returns None if the trap is never crossed.
+    Return the cumulative odometer distance (mi) at which the run crosses the
+    perpendicular to the trap line at the specified trap endpoint (trap_lon).
+
+    The trap is treated as an oblique line (not pure east-west) using the
+    module-level geometry (_TRAP_UX, _TRAP_UY, _MI_PER_DEG_LON, etc.).
+    The "crossing" is where the GPS track's signed projection along the trap
+    direction past the trap endpoint changes sign — i.e. the car passes the
+    gate perpendicular to the trap at that endpoint.
+
+    Returns None if the crossing is never reached.
     """
-    lon = grp["Longitude"].to_numpy()
+    lat  = grp["Latitude"].to_numpy()
+    lon  = grp["Longitude"].to_numpy()
     dist = grp["Distance (mi)"].to_numpy()
 
+    # Identify which endpoint we are looking for
+    trap_lat = trap_east_lat if trap_lon >= (trap_east + trap_west) / 2 else trap_west_lat
+
+    # Signed projection along the trap direction from the target endpoint.
+    # Positive = car is on the east side; negative = west side.
+    s = (((lon - trap_lon) * _MI_PER_DEG_LON * _TRAP_UX) +
+         ((lat - trap_lat) * _MI_PER_DEG_LAT * _TRAP_UY))
+
     if going_west:
-        # Looking for first point where lon <= trap_lon (crossed from east)
-        mask = lon <= trap_lon
+        # Westbound: starts east of this endpoint (s > 0), crosses when s <= 0
+        mask = s <= 0
     else:
-        # Looking for first point where lon >= trap_lon (crossed from west)
-        mask = lon >= trap_lon
+        # Eastbound: starts west of this endpoint (s < 0), crosses when s >= 0
+        mask = s >= 0
 
     if not mask.any():
         return None
@@ -165,10 +180,10 @@ def find_crossing_dist(grp: pd.DataFrame, trap_lon: float, going_west: bool) -> 
     if idx == 0:
         return float(dist[0])
 
-    # Linear interpolation
-    lon0, lon1 = lon[idx - 1], lon[idx]
+    # Linear interpolation between the bracketing samples
+    s0, s1 = s[idx - 1], s[idx]
     d0, d1 = dist[idx - 1], dist[idx]
-    frac = (trap_lon - lon0) / (lon1 - lon0) if lon1 != lon0 else 0.0
+    frac = (-s0) / (s1 - s0) if s1 != s0 else 0.0
     return float(d0 + frac * (d1 - d0))
 
 
@@ -258,6 +273,44 @@ with st.sidebar:
         "West trap lon", _lon_min, _lon_max, _trap_west_def, step=0.0005, format="%.4f",
         help="Western boundary of the measured distance (lower/more-negative lon)."
     )
+
+# ── Precise trap geometry ──────────────────────────────────────────────────────
+# The trap is exactly 5280 ft (1 mile).  We estimate each endpoint's latitude
+# from the at-rest GPS cluster at that trap so that crossing detection uses
+# the actual (slightly oblique) trap line rather than a pure longitude gate.
+
+TRAP_DIST_MI = 1.0   # 5280 ft exactly
+
+_fallback_lat = 29.337   # used if at-rest data is insufficient
+if len(_rest) >= 6:
+    _e_rest = _rest[_rest["Longitude"] > _mid]
+    _w_rest = _rest[_rest["Longitude"] <= _mid]
+    trap_east_lat = float(np.median(_e_rest["Latitude"])) if len(_e_rest) >= 2 else _fallback_lat
+    trap_west_lat = float(np.median(_w_rest["Latitude"])) if len(_w_rest) >= 2 else _fallback_lat
+else:
+    trap_east_lat = trap_west_lat = _fallback_lat
+
+# Convert the trap endpoints to approximate Cartesian (x east, y north) in miles
+_trap_ref_lat_rad = np.radians((trap_east_lat + trap_west_lat) / 2)
+_MI_PER_DEG_LON   = 69.172 * float(np.cos(_trap_ref_lat_rad))
+_MI_PER_DEG_LAT   = 69.0
+_dx = (trap_east - trap_west) * _MI_PER_DEG_LON   # miles east
+_dy = (trap_east_lat - trap_west_lat) * _MI_PER_DEG_LAT  # miles north
+_trap_chord = float(np.sqrt(_dx**2 + _dy**2))
+
+# Trap unit vector (west → east), Cartesian miles
+if _trap_chord > 0:
+    _TRAP_UX, _TRAP_UY = _dx / _trap_chord, _dy / _trap_chord
+else:
+    _TRAP_UX, _TRAP_UY = 1.0, 0.0
+
+with st.sidebar:
+    st.caption(
+        f"Trap lats estimated from at-rest GPS — "
+        f"East: **{trap_east_lat:.5f}**, West: **{trap_west_lat:.5f}** | "
+        f"Chord: **{_trap_chord * 5280:.0f} ft** (locked to 1.0 mi for calculations)"
+    )
+
 runs = segment_exercise_runs(df_raw, lat_threshold, min_speed, min_rows,
                              trap_east=trap_east, trap_west=trap_west)
 
@@ -522,12 +575,10 @@ with tab_overview:
         ex_lon = trap_west if gw else trap_east
         en_d   = find_crossing_dist(grp, en_lon, gw)
         ex_d   = find_crossing_dist(grp, ex_lon, gw)
-        _lat_r = float(np.radians(r["data"]["Latitude"].mean()))
-        _geo   = abs(trap_east - trap_west) * 69.172 * float(np.cos(_lat_r))
         if en_d is None and ex_d is not None:
-            en_d = ex_d - _geo
+            en_d = ex_d - TRAP_DIST_MI
         if ex_d is None and en_d is not None:
-            ex_d = en_d + _geo
+            ex_d = en_d + TRAP_DIST_MI
 
         if en_d is not None and ex_d is not None:
             d_lo, d_hi = min(en_d, ex_d), max(en_d, ex_d)
@@ -633,33 +684,16 @@ with tab_overview:
         f"Exit distance uses geometric fallback when GPS data ends before exit trap."
     )
     fig_trap = go.Figure()
-    trap_lengths = []
     for i, r in enumerate(runs):
         grp = r["data"].copy()
         going_west = r["direction"] == "West"
-        # Entry trap: first boundary the car crosses entering the measured section
         entry_lon = trap_east if going_west else trap_west
-        exit_lon  = trap_west if going_west else trap_east
 
         entry_dist = find_crossing_dist(grp, entry_lon, going_west)
-        exit_dist  = find_crossing_dist(grp, exit_lon,  going_west)
-
-        # Geometric fallback for missing trap crossing (same logic as detail tab)
-        _lat_rad = float(np.radians(r["data"]["Latitude"].mean()))
-        _mi_per_deg = 69.172 * float(np.cos(_lat_rad))
-        _geo_trap_len = abs(trap_east - trap_west) * _mi_per_deg
-        if entry_dist is None and exit_dist is not None:
-            entry_dist = exit_dist - _geo_trap_len
-        if exit_dist is None and entry_dist is not None:
-            exit_dist = entry_dist + _geo_trap_len
-
         if entry_dist is None:
             continue
 
         d_aligned = grp["Distance (mi)"] - entry_dist
-
-        trap_lengths.append(abs(exit_dist - entry_dist))
-
         fig_trap.add_trace(go.Scatter(
             x=d_aligned,
             y=grp["Speed (mph)"],
@@ -669,18 +703,15 @@ with tab_overview:
             opacity=0.8,
         ))
 
-    # Mark trap boundaries
+    # Mark trap boundaries — exit is always exactly TRAP_DIST_MI from entry
     fig_trap.add_vline(x=0, line_dash="dash", line_color="green",
                        annotation_text="Trap entry", annotation_position="top right")
-    if trap_lengths:
-        med_len = float(np.median(trap_lengths))
-        fig_trap.add_vline(x=med_len, line_dash="dash", line_color="red",
-                           annotation_text=f"Trap exit (~{med_len:.3f} mi)",
-                           annotation_position="top left")
-        # Shade the measured section
-        fig_trap.add_vrect(x0=0, x1=med_len, fillcolor="rgba(0,200,0,0.06)",
-                           line_width=0, annotation_text="Measured section",
-                           annotation_position="top left")
+    fig_trap.add_vline(x=TRAP_DIST_MI, line_dash="dash", line_color="red",
+                       annotation_text=f"Trap exit ({TRAP_DIST_MI:.3f} mi / 5280 ft)",
+                       annotation_position="top left")
+    fig_trap.add_vrect(x0=0, x1=TRAP_DIST_MI, fillcolor="rgba(0,200,0,0.06)",
+                       line_width=0, annotation_text="Measured section",
+                       annotation_position="top left")
 
     fig_trap.update_layout(
         xaxis_title="Distance from trap entry (mi)  [negative = run-in, positive = run-out]",
@@ -791,15 +822,11 @@ with tab_detail:
     entry_d_raw = find_crossing_dist(grp, entry_lon_r, going_west)
     exit_d_raw  = find_crossing_dist(grp, exit_lon_r,  going_west)
 
-    # Geometric fallback when GPS data doesn't reach a trap crossing.
-    # 1 degree longitude ≈ 69.172 × cos(lat) miles.
-    _ex_lat_rad = float(np.radians(r["data"]["Latitude"].mean()))
-    _mi_per_deg_lon = 69.172 * float(np.cos(_ex_lat_rad))
-    _trap_dist_mi   = abs(trap_east - trap_west) * _mi_per_deg_lon
+    # Geometric fallback: trap is exactly TRAP_DIST_MI (5280 ft = 1 mile).
     if entry_d_raw is None and exit_d_raw is not None:
-        entry_d_raw = exit_d_raw - _trap_dist_mi
+        entry_d_raw = exit_d_raw - TRAP_DIST_MI
     if exit_d_raw is None and entry_d_raw is not None:
-        exit_d_raw = entry_d_raw + _trap_dist_mi
+        exit_d_raw = entry_d_raw + TRAP_DIST_MI
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1111,10 +1138,9 @@ with tab_detail:
 
             entry_d_p = find_crossing_dist(grp_p, entry_lon_p, gw_p)
             exit_d_p  = find_crossing_dist(grp_p, exit_lon_p,  gw_p)
-            # Geometric fallback: many runs end before their GPS crosses exit lon
+            # Geometric fallback: trap is exactly TRAP_DIST_MI (5280 ft = 1 mile)
             if exit_d_p is None and entry_d_p is not None:
-                _lat_rad = float(np.radians(grp_p["Latitude"].mean()))
-                exit_d_p = entry_d_p + abs(trap_east - trap_west) * 69.172 * float(np.cos(_lat_rad))
+                exit_d_p = entry_d_p + TRAP_DIST_MI
             if exit_d_p is None:
                 continue
 

@@ -1,6 +1,7 @@
 """
-Team Ownby – Great Race 2025 Performance Analysis
-Car #123 · 1961 Mercedes-Benz 190 SL · Crew: Ownby/Wallace · Division: R
+Great Race 2025 — Team Performance Analysis
+Select any team from the sidebar to explore their stage results, leg-level penalties,
+early/late bias, and division comparison.
 """
 import streamlit as st
 import pandas as pd
@@ -9,12 +10,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 
-st.set_page_config(page_title="Team Ownby Analysis", layout="wide", page_icon="🏁")
+st.set_page_config(page_title="Great Race 2025 — Team Analysis", layout="wide", page_icon="🏁")
 
 PARQUET = Path(__file__).parent / "long_format_times.parquet"
-OWNBY_CAR = 123
 
-# Stage route descriptions (from stage notes PDFs)
+# Stage route descriptions
 STAGE_LABELS = {
     0: "Trophy Run – St. Paul, MN",
     1: "St. Paul to Rochester, MN",
@@ -33,13 +33,41 @@ STAGE_LABELS = {
 @st.cache_data
 def load_data():
     df = pd.read_parquet(PARQUET)
-    # Exclude discarded legs from scoring analysis
     return df[~df["Discarded"]].copy()
 
 
 df = load_data()
-ownby = df[df["CAR"] == OWNBY_CAR].copy()
-r_div = df[df["DIV"] == "R"].copy()
+
+# ─── Team selector ─────────────────────────────────────────────────────────────
+
+# Build a sorted list of (CAR, label) tuples
+car_info = (
+    df.drop_duplicates("CAR")[["CAR", "YEAR", "DIV", "CREW"]]
+    .sort_values("CAR")
+)
+car_options = car_info["CAR"].tolist()
+car_labels = {
+    row["CAR"]: f"#{row['CAR']} — {row['CREW']} ({row['YEAR']}, Div {row['DIV']})"
+    for _, row in car_info.iterrows()
+}
+
+with st.sidebar:
+    st.header("Team Selection")
+    selected_car = st.selectbox(
+        "Select team",
+        car_options,
+        format_func=lambda c: car_labels[c],
+    )
+
+# ─── Derive team metadata ───────────────────────────────────────────────────────
+
+team_row = car_info[car_info["CAR"] == selected_car].iloc[0]
+team_crew = team_row["CREW"]
+team_div = team_row["DIV"]
+team_year = team_row["YEAR"]
+
+team_df = df[df["CAR"] == selected_car].copy()
+div_df = df[df["DIV"] == team_div].copy()
 
 # ─── Pre-compute stage summaries ───────────────────────────────────────────────
 
@@ -56,12 +84,12 @@ def stage_totals(data):
 
 
 field_stage = stage_totals(df)
-ownby_stage_totals = stage_totals(ownby)
+team_stage_totals = stage_totals(team_df)
 
-# Add field rank for Ownby per stage
-def add_field_rank(ownby_totals, field_totals):
+
+def add_field_rank(team_totals, field_totals):
     rows = []
-    for _, row in ownby_totals.iterrows():
+    for _, row in team_totals.iterrows():
         stage = row["Stage"]
         others = field_totals[field_totals["Stage"] == stage]["total_penalty"]
         rank = int((others < row["total_penalty"]).sum()) + 1
@@ -71,37 +99,37 @@ def add_field_rank(ownby_totals, field_totals):
     return pd.DataFrame(rows)
 
 
-ownby_ranked = add_field_rank(ownby_stage_totals, field_stage)
-ownby_ranked["early_pct"] = (ownby_ranked["early_count"] / ownby_ranked["legs"] * 100).round(0)
-ownby_ranked["stage_label"] = ownby_ranked["Stage"].map(STAGE_LABELS)
+team_ranked = add_field_rank(team_stage_totals, field_stage)
+team_ranked["early_pct"] = (team_ranked["early_count"] / team_ranked["legs"] * 100).round(0)
+team_ranked["stage_label"] = team_ranked["Stage"].map(STAGE_LABELS)
 
-# Ownby vs field median by (Stage, Leg)
+# Team vs field median by (Stage, Leg)
 field_leg_med = (
     df.groupby(["Stage", "Leg"])["Time"]
     .median()
     .reset_index()
     .rename(columns={"Time": "field_median"})
 )
-leg_compare = ownby[["Stage", "Leg", "Time", "Early"]].merge(field_leg_med, on=["Stage", "Leg"])
+leg_compare = team_df[["Stage", "Leg", "Time", "Early"]].merge(field_leg_med, on=["Stage", "Leg"])
 leg_compare["vs_median"] = leg_compare["Time"] - leg_compare["field_median"]
 leg_compare["stage_leg"] = "S" + leg_compare["Stage"].astype(str) + "-L" + leg_compare["Leg"].astype(str)
 
-# R division season standings
-r_season = (
-    r_div.groupby(["CAR", "CREW"])
+# Division season standings
+div_season = (
+    div_df.groupby(["CAR", "CREW"])
     .agg(total_penalty=("Time", "sum"), early_count=("Early", "sum"), legs=("Leg", "count"))
     .reset_index()
     .sort_values("total_penalty")
     .reset_index(drop=True)
 )
-r_season.index += 1
-r_season["early_pct"] = (r_season["early_count"] / r_season["legs"] * 100).round(1)
+div_season.index += 1
+div_season["early_pct"] = (div_season["early_count"] / div_season["legs"] * 100).round(1)
 
 # ─── Page header ───────────────────────────────────────────────────────────────
 
-st.title("Team Ownby — Great Race 2025 Performance Analysis")
+st.title(f"Great Race 2025 — Team Performance Analysis")
 st.caption(
-    "Car #123 · 1961 Mercedes-Benz 190 SL · Crew: Ownby/Wallace · Division: R (Retrochallenge) · "
+    f"Car #{selected_car} · {team_year} · Crew: {team_crew} · Division: {team_div} · "
     "St. Paul, MN → Irmo, SC"
 )
 
@@ -121,11 +149,11 @@ tabs = st.tabs([
 with tabs[0]:
     st.header("Season Overview")
 
-    total_penalty = ownby["Time"].sum()
-    overall_early_pct = ownby["Early"].mean() * 100
-    best = ownby_ranked.loc[ownby_ranked["rank"].idxmin()]
-    worst = ownby_ranked.loc[ownby_ranked["rank"].idxmax()]
-    n_stages = len(ownby_ranked)
+    total_penalty = team_df["Time"].sum()
+    overall_early_pct = team_df["Early"].mean() * 100
+    best = team_ranked.loc[team_ranked["rank"].idxmin()]
+    worst = team_ranked.loc[team_ranked["rank"].idxmax()]
+    n_stages = len(team_ranked)
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Stages Competed", n_stages)
@@ -143,7 +171,7 @@ with tabs[0]:
     with col_left:
         st.subheader("Field Rank by Stage")
         fig_rank = px.line(
-            ownby_ranked.sort_values("Stage"),
+            team_ranked.sort_values("Stage"),
             x="Stage", y="rank", markers=True,
             title="Field Rank by Stage (lower = better)",
             labels={"rank": "Rank", "Stage": "Stage"},
@@ -156,7 +184,7 @@ with tabs[0]:
     with col_right:
         st.subheader("Total Penalty by Stage (seconds)")
         fig_pen = px.bar(
-            ownby_ranked.sort_values("Stage"),
+            team_ranked.sort_values("Stage"),
             x="Stage", y="total_penalty",
             title="Total Stage Penalty (s)",
             labels={"total_penalty": "Penalty (s)", "Stage": "Stage"},
@@ -167,7 +195,7 @@ with tabs[0]:
         st.plotly_chart(fig_pen, use_container_width=True)
 
     st.subheader("Stage-by-Stage Summary")
-    disp = ownby_ranked[[
+    disp = team_ranked[[
         "Stage", "stage_label", "total_penalty", "legs",
         "rank", "field_size", "percentile", "early_pct"
     ]].rename(columns={
@@ -188,20 +216,19 @@ with tabs[0]:
 with tabs[1]:
     st.header("Stage Breakdown")
 
-    stage_options = sorted(ownby["Stage"].unique())
+    stage_options = sorted(team_df["Stage"].unique())
     stage_sel = st.selectbox(
         "Select Stage",
         stage_options,
         format_func=lambda s: f"Stage {s} — {STAGE_LABELS.get(s, '')}",
     )
 
-    ownby_s = ownby[ownby["Stage"] == stage_sel]
+    team_s = team_df[team_df["Stage"] == stage_sel]
     field_s = df[df["Stage"] == stage_sel]
 
-    # Stage rank context
-    stage_row = ownby_ranked[ownby_ranked["Stage"] == stage_sel].iloc[0]
+    stage_row = team_ranked[team_ranked["Stage"] == stage_sel].iloc[0]
     st.info(
-        f"Stage {stage_sel}: Ownby ranked **#{int(stage_row['rank'])} of "
+        f"Stage {stage_sel}: {team_crew} ranked **#{int(stage_row['rank'])} of "
         f"{int(stage_row['field_size'])}** with **{stage_row['total_penalty']:.0f}s** total penalty. "
         f"Early on **{stage_row['early_pct']:.0f}%** of legs."
     )
@@ -209,9 +236,9 @@ with tabs[1]:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("Ownby Leg Penalties")
+        st.subheader(f"{team_crew} Leg Penalties")
         fig_legs = px.bar(
-            ownby_s.sort_values("Leg"),
+            team_s.sort_values("Leg"),
             x="Leg", y="Time",
             color="Early",
             color_discrete_map={True: "#d62728", False: "#1f77b4"},
@@ -222,11 +249,10 @@ with tabs[1]:
         st.plotly_chart(fig_legs, use_container_width=True)
 
     with col2:
-        # Field distribution for Ownby's worst leg this stage
-        if len(ownby_s) > 0:
-            worst_leg_num = int(ownby_s.loc[ownby_s["Time"].idxmax(), "Leg"])
+        if len(team_s) > 0:
+            worst_leg_num = int(team_s.loc[team_s["Time"].idxmax(), "Leg"])
             field_leg_data = field_s[field_s["Leg"] == worst_leg_num]
-            ownby_pen = float(ownby_s[ownby_s["Leg"] == worst_leg_num]["Time"].iloc[0])
+            team_pen = float(team_s[team_s["Leg"] == worst_leg_num]["Time"].iloc[0])
 
             st.subheader(f"Field Distribution — Worst Leg ({worst_leg_num})")
             fig_dist = px.histogram(
@@ -235,14 +261,13 @@ with tabs[1]:
                 labels={"Time": "Penalty (s)"},
             )
             fig_dist.add_vline(
-                x=ownby_pen, line_dash="dash", line_color="red",
-                annotation_text=f"Ownby: {ownby_pen:.0f}s",
+                x=team_pen, line_dash="dash", line_color="red",
+                annotation_text=f"{team_crew}: {team_pen:.0f}s",
                 annotation_position="top right",
             )
             fig_dist.update_layout(template="plotly_white")
             st.plotly_chart(fig_dist, use_container_width=True)
 
-    # Full competitor table
     st.subheader(f"All Competitors — Stage {stage_sel}")
     stage_comp = (
         field_s.groupby(["CAR", "YEAR", "DIV", "CREW"])
@@ -254,15 +279,15 @@ with tabs[1]:
     stage_comp.index += 1
     stage_comp["early_pct"] = (stage_comp["early_count"] / stage_comp["legs"] * 100).round(0)
 
-    def highlight_ownby(row):
-        color = "background-color: #ffe0e0" if row["CAR"] == OWNBY_CAR else ""
+    def highlight_team(row):
+        color = "background-color: #ffe0e0" if row["CAR"] == selected_car else ""
         return [color] * len(row)
 
     disp_comp = stage_comp[["CAR", "YEAR", "DIV", "CREW", "total_penalty", "early_pct"]].rename(
         columns={"total_penalty": "Penalty (s)", "early_pct": "% Early"}
     )
     st.dataframe(
-        disp_comp.style.apply(highlight_ownby, axis=1),
+        disp_comp.style.apply(highlight_team, axis=1),
         use_container_width=True,
     )
 
@@ -273,12 +298,11 @@ with tabs[1]:
 with tabs[2]:
     st.header("Leg-Level Analysis")
 
-    # Heatmap: Stage × Leg
-    st.subheader("Penalty Heatmap — Stage × Leg (seconds)")
-    heat_data = ownby.pivot_table(index="Stage", columns="Leg", values="Time", aggfunc="mean")
+    st.subheader(f"Penalty Heatmap — Stage × Leg (seconds)")
+    heat_data = team_df.pivot_table(index="Stage", columns="Leg", values="Time", aggfunc="mean")
     fig_heat = px.imshow(
         heat_data,
-        title="Ownby Penalty (s) — Stage × Leg",
+        title=f"{team_crew} Penalty (s) — Stage × Leg",
         labels={"color": "Penalty (s)"},
         color_continuous_scale="Reds",
         text_auto=".0f",
@@ -286,22 +310,20 @@ with tabs[2]:
     fig_heat.update_layout(template="plotly_white")
     st.plotly_chart(fig_heat, use_container_width=True)
 
-    # Ownby vs field median
-    st.subheader("Ownby vs. Field Median per Leg")
+    st.subheader(f"{team_crew} vs. Field Median per Leg")
     fig_vs = px.bar(
         leg_compare.sort_values(["Stage", "Leg"]),
         x="stage_leg",
         y="vs_median",
         color="Early",
         color_discrete_map={True: "#d62728", False: "#1f77b4"},
-        title="Ownby Penalty vs. Field Median  (positive = worse than median, red = early)",
+        title=f"{team_crew} Penalty vs. Field Median  (positive = worse than median, red = early)",
         labels={"vs_median": "Delta vs Median (s)", "stage_leg": "Stage-Leg", "Early": "Arrived Early"},
     )
     fig_vs.add_hline(y=0, line_dash="dash", line_color="gray")
     fig_vs.update_layout(template="plotly_white")
     st.plotly_chart(fig_vs, use_container_width=True)
 
-    # Worst legs table
     col_a, col_b = st.columns(2)
     with col_a:
         st.subheader("10 Worst Legs vs. Field Median")
@@ -310,7 +332,7 @@ with tabs[2]:
             .head(10)[["stage_leg", "Stage", "Leg", "Time", "field_median", "vs_median", "Early"]]
             .rename(columns={
                 "stage_leg": "Stage-Leg",
-                "Time": "Ownby (s)",
+                "Time": "Team (s)",
                 "field_median": "Median (s)",
                 "vs_median": "Delta (s)",
                 "Early": "Early",
@@ -325,7 +347,7 @@ with tabs[2]:
             .head(10)[["stage_leg", "Stage", "Leg", "Time", "field_median", "vs_median", "Early"]]
             .rename(columns={
                 "stage_leg": "Stage-Leg",
-                "Time": "Ownby (s)",
+                "Time": "Team (s)",
                 "field_median": "Median (s)",
                 "vs_median": "Delta (s)",
                 "Early": "Early",
@@ -333,10 +355,9 @@ with tabs[2]:
         )
         st.dataframe(best10, use_container_width=True, hide_index=True)
 
-    # Leg number pattern
     st.subheader("Penalty by Leg Number (across all stages)")
     leg_avg = (
-        ownby.groupby("Leg")
+        team_df.groupby("Leg")
         .agg(avg_penalty=("Time", "mean"), early_rate=("Early", "mean"), count=("Leg", "count"))
         .reset_index()
     )
@@ -346,12 +367,12 @@ with tabs[2]:
     leg_avg = leg_avg.merge(field_leg_avg, on="Leg")
     leg_avg_melt = leg_avg.melt(id_vars="Leg", value_vars=["avg_penalty", "field_avg"],
                                 var_name="Who", value_name="Avg Penalty (s)")
-    leg_avg_melt["Who"] = leg_avg_melt["Who"].map({"avg_penalty": "Ownby", "field_avg": "Field Avg"})
+    leg_avg_melt["Who"] = leg_avg_melt["Who"].map({"avg_penalty": team_crew, "field_avg": "Field Avg"})
     fig_leg_num = px.bar(
         leg_avg_melt, x="Leg", y="Avg Penalty (s)", color="Who",
         barmode="group",
-        color_discrete_map={"Ownby": "#d62728", "Field Avg": "#aec7e8"},
-        title="Average Penalty by Leg Number — Ownby vs. Field",
+        color_discrete_map={team_crew: "#d62728", "Field Avg": "#aec7e8"},
+        title=f"Average Penalty by Leg Number — {team_crew} vs. Field",
     )
     fig_leg_num.update_layout(template="plotly_white")
     st.plotly_chart(fig_leg_num, use_container_width=True)
@@ -370,11 +391,11 @@ with tabs[3]:
         "speed is reading *lower* than the actual ground speed."
     )
 
-    early_count = int(ownby["Early"].sum())
-    late_count = int((~ownby["Early"]).sum())
-    total_legs = len(ownby)
-    avg_pen_early = ownby.loc[ownby["Early"], "Time"].mean()
-    avg_pen_late = ownby.loc[~ownby["Early"], "Time"].mean()
+    early_count = int(team_df["Early"].sum())
+    late_count = int((~team_df["Early"]).sum())
+    total_legs = len(team_df)
+    avg_pen_early = team_df.loc[team_df["Early"], "Time"].mean()
+    avg_pen_late = team_df.loc[~team_df["Early"], "Time"].mean()
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Early Legs", f"{early_count} / {total_legs}", f"{early_count/total_legs*100:.0f}%")
@@ -397,7 +418,7 @@ with tabs[3]:
 
     with col2:
         stage_early = (
-            ownby.groupby("Stage")
+            team_df.groupby("Stage")
             .agg(early_legs=("Early", "sum"), total_legs_=("Early", "count"))
             .reset_index()
         )
@@ -413,10 +434,9 @@ with tabs[3]:
         fig_eb.update_layout(template="plotly_white", coloraxis_showscale=False)
         st.plotly_chart(fig_eb, use_container_width=True)
 
-    # Early-leg penalty distribution vs late
     st.subheader("Penalty Distribution: Early vs. Late Legs")
     fig_box = px.box(
-        ownby, x="Early", y="Time",
+        team_df, x="Early", y="Time",
         color="Early",
         color_discrete_map={True: "#d62728", False: "#1f77b4"},
         title="Penalty (s) Distribution by Arrival Type",
@@ -427,15 +447,14 @@ with tabs[3]:
     fig_box.update_layout(template="plotly_white", showlegend=False)
     st.plotly_chart(fig_box, use_container_width=True)
 
-    # Where does Ownby sit in the field for early rate?
-    st.subheader("Early Arrival Rate: Ownby vs. All Competitors")
+    st.subheader(f"Early Arrival Rate: {team_crew} vs. All Competitors")
     field_early_rates = (
         df.groupby(["CAR", "CREW"])
         .agg(early_rate=("Early", "mean"))
         .reset_index()
     )
     field_early_rates["early_pct"] = field_early_rates["early_rate"] * 100
-    ownby_er = float(field_early_rates[field_early_rates["CAR"] == OWNBY_CAR]["early_pct"].iloc[0])
+    team_er = float(field_early_rates[field_early_rates["CAR"] == selected_car]["early_pct"].iloc[0])
 
     fig_er = px.histogram(
         field_early_rates, x="early_pct", nbins=25,
@@ -443,15 +462,15 @@ with tabs[3]:
         labels={"early_pct": "% Legs Arriving Early"},
     )
     fig_er.add_vline(
-        x=ownby_er, line_dash="dash", line_color="red",
-        annotation_text=f"Ownby: {ownby_er:.0f}%",
+        x=team_er, line_dash="dash", line_color="red",
+        annotation_text=f"{team_crew}: {team_er:.0f}%",
         annotation_position="top right",
     )
     fig_er.update_layout(template="plotly_white")
     st.plotly_chart(fig_er, use_container_width=True)
     st.caption(
-        f"Ownby's early rate of {ownby_er:.0f}% places them in the "
-        f"{'upper' if ownby_er > field_early_rates['early_pct'].median() else 'lower'} "
+        f"{team_crew}'s early rate of {team_er:.0f}% places them in the "
+        f"{'upper' if team_er > field_early_rates['early_pct'].median() else 'lower'} "
         f"half of the field for early arrivals. Field median: "
         f"{field_early_rates['early_pct'].median():.0f}%."
     )
@@ -461,36 +480,41 @@ with tabs[3]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tabs[4]:
-    st.header("R Division Comparison")
+    st.header(f"Division {team_div} Comparison")
 
-    # R division stage totals
-    r_stage_totals = stage_totals(r_div)
-    r_stage_totals["r_rank"] = (
-        r_stage_totals.groupby("Stage")["total_penalty"]
+    div_stage_totals = stage_totals(div_df)
+    div_stage_totals["div_rank"] = (
+        div_stage_totals.groupby("Stage")["total_penalty"]
         .rank(method="min")
         .astype(int)
     )
-    ownby_r_rank = r_stage_totals[r_stage_totals["CAR"] == OWNBY_CAR].copy()
+    team_div_rank = div_stage_totals[div_stage_totals["CAR"] == selected_car].copy()
 
-    n_r = len(r_season)
-    ownby_r_pos = int(r_season[r_season["CAR"] == OWNBY_CAR].index[0])
+    n_div = len(div_season)
+    team_div_pos = int(div_season[div_season["CAR"] == selected_car].index[0])
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("R Division Competitors", n_r)
-    col2.metric("Ownby Season Rank (R Div)", f"#{ownby_r_pos} of {n_r}")
-    col3.metric("Gap to R Division Leader",
-                f"{r_season.iloc[0]['total_penalty'] - r_season[r_season['CAR']==OWNBY_CAR].iloc[0]['total_penalty']:.0f}s",
-                delta_color="inverse")
+    col1.metric(f"Div {team_div} Competitors", n_div)
+    col2.metric(f"{team_crew} Season Rank (Div {team_div})", f"#{team_div_pos} of {n_div}")
+
+    leader_row = div_season.iloc[0]
+    team_div_penalty = div_season[div_season["CAR"] == selected_car].iloc[0]["total_penalty"]
+    gap = team_div_penalty - leader_row["total_penalty"]
+    col3.metric(
+        f"Gap to Div {team_div} Leader",
+        f"{gap:.0f}s",
+        delta_color="inverse",
+    )
 
     col_l, col_r = st.columns(2)
 
     with col_l:
-        st.subheader("Ownby R Division Rank by Stage")
+        st.subheader(f"{team_crew} Div {team_div} Rank by Stage")
         fig_rr = px.line(
-            ownby_r_rank.sort_values("Stage"),
-            x="Stage", y="r_rank", markers=True,
-            title="R Division Rank by Stage (lower = better)",
-            labels={"r_rank": "R Division Rank", "Stage": "Stage"},
+            team_div_rank.sort_values("Stage"),
+            x="Stage", y="div_rank", markers=True,
+            title=f"Div {team_div} Rank by Stage (lower = better)",
+            labels={"div_rank": f"Div {team_div} Rank", "Stage": "Stage"},
         )
         fig_rr.update_yaxes(autorange="reversed")
         fig_rr.update_traces(line_color="#d62728", marker_size=10)
@@ -498,46 +522,52 @@ with tabs[4]:
         st.plotly_chart(fig_rr, use_container_width=True)
 
     with col_r:
-        st.subheader("R Division: Stage Penalty Comparison")
-        r_stage_avg = (
-            r_stage_totals.groupby("Stage")
+        st.subheader(f"Div {team_div}: Stage Penalty Comparison")
+        div_stage_avg = (
+            div_stage_totals.groupby("Stage")
             .agg(div_avg=("total_penalty", "mean"), div_min=("total_penalty", "min"))
             .reset_index()
         )
-        ownby_stage_r = r_stage_totals[r_stage_totals["CAR"] == OWNBY_CAR][["Stage", "total_penalty"]].rename(
-            columns={"total_penalty": "Ownby"}
+        team_stage_r = div_stage_totals[div_stage_totals["CAR"] == selected_car][["Stage", "total_penalty"]].rename(
+            columns={"total_penalty": team_crew}
         )
-        r_comp = r_stage_avg.merge(ownby_stage_r, on="Stage")
-        r_melt = r_comp.melt(id_vars="Stage", value_vars=["Ownby", "div_avg", "div_min"],
+        r_comp = div_stage_avg.merge(team_stage_r, on="Stage")
+        r_melt = r_comp.melt(id_vars="Stage", value_vars=[team_crew, "div_avg", "div_min"],
                              var_name="Series", value_name="Penalty (s)")
         r_melt["Series"] = r_melt["Series"].map({
-            "Ownby": "Ownby", "div_avg": "R Div Avg", "div_min": "R Div Best"
+            team_crew: team_crew,
+            "div_avg": f"Div {team_div} Avg",
+            "div_min": f"Div {team_div} Best",
         })
         fig_rc = px.line(
             r_melt, x="Stage", y="Penalty (s)", color="Series",
             markers=True,
-            color_discrete_map={"Ownby": "#d62728", "R Div Avg": "#ff7f0e", "R Div Best": "#2ca02c"},
-            title="Ownby vs. R Division (avg & best) per Stage",
+            color_discrete_map={
+                team_crew: "#d62728",
+                f"Div {team_div} Avg": "#ff7f0e",
+                f"Div {team_div} Best": "#2ca02c",
+            },
+            title=f"{team_crew} vs. Div {team_div} (avg & best) per Stage",
         )
         fig_rc.update_layout(template="plotly_white")
         st.plotly_chart(fig_rc, use_container_width=True)
 
-    st.subheader("R Division Season Standings")
+    st.subheader(f"Division {team_div} Season Standings")
 
-    def highlight_ownby(row):
-        color = "background-color: #ffe0e0" if row["CAR"] == OWNBY_CAR else ""
+    def highlight_team_div(row):
+        color = "background-color: #ffe0e0" if row["CAR"] == selected_car else ""
         return [color] * len(row)
 
-    r_disp = r_season[["CAR", "CREW", "total_penalty", "early_pct"]].rename(
+    div_disp = div_season[["CAR", "CREW", "total_penalty", "early_pct"]].rename(
         columns={"total_penalty": "Total Penalty (s)", "CREW": "Crew", "early_pct": "% Early"}
     )
-    st.dataframe(r_disp.style.apply(highlight_ownby, axis=1), use_container_width=True)
+    st.dataframe(div_disp.style.apply(highlight_team_div, axis=1), use_container_width=True)
 
-    st.subheader("Early Arrival Rate — R Division")
+    st.subheader(f"Early Arrival Rate — Division {team_div}")
     fig_re = px.bar(
-        r_season.sort_values("early_pct", ascending=False),
+        div_season.sort_values("early_pct", ascending=False),
         x="CREW", y="early_pct",
-        title="% Legs Arriving Early — R Division",
+        title=f"% Legs Arriving Early — Division {team_div}",
         labels={"early_pct": "% Early", "CREW": "Crew"},
         color="CAR",
         color_discrete_sequence=px.colors.qualitative.Set2,
@@ -550,121 +580,123 @@ with tabs[4]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tabs[5]:
-    st.header("Areas to Focus On — Actionable Recommendations")
+    st.header(f"Areas to Focus On — {team_crew}")
 
-    # Compute dynamic stats for recommendations
-    early_pct_all = ownby["Early"].mean() * 100
-    avg_pen_all = ownby["Time"].mean()
-    avg_pen_early_legs = ownby.loc[ownby["Early"], "Time"].mean()
+    early_pct_all = team_df["Early"].mean() * 100
+    avg_pen_all = team_df["Time"].mean()
+    avg_pen_early_legs = team_df.loc[team_df["Early"], "Time"].mean()
     worst3 = leg_compare.sort_values("vs_median", ascending=False).head(3)
-    best_stage_row = ownby_ranked.loc[ownby_ranked["rank"].idxmin()]
-    consistent_early = list(ownby_ranked[ownby_ranked["early_pct"] >= 80]["Stage"].astype(int))
-    penalty_std = ownby.groupby("Stage")["Time"].sum().std()
+    best_stage_row = team_ranked.loc[team_ranked["rank"].idxmin()]
+    consistent_early_stages = list(team_ranked[team_ranked["early_pct"] >= 80]["Stage"].astype(int))
+    penalty_std = team_df.groupby("Stage")["Time"].sum().std()
 
-    # R div stats
-    best_r_crew = r_season.iloc[0]["CREW"]
-    best_r_penalty = r_season.iloc[0]["total_penalty"]
-    ownby_r_penalty = r_season[r_season["CAR"] == OWNBY_CAR].iloc[0]["total_penalty"]
-    r_gap = ownby_r_penalty - best_r_penalty
-    ownby_r_pos_num = int(r_season[r_season["CAR"] == OWNBY_CAR].index[0])
+    best_div_crew = leader_row["CREW"]
+    best_div_penalty = leader_row["total_penalty"]
+    r_gap = team_div_penalty - best_div_penalty
+    leg1_early = team_df[team_df["Leg"] == 1]["Early"].mean() * 100
 
-    leg1_early = ownby[ownby["Leg"] == 1]["Early"].mean() * 100
-
-    # ─── Priority 1 ──────────────────────────────────────────────────────────
-    st.subheader("Priority 1 — Speedometer Calibration (Running Too Fast)")
-    st.error(
-        f"**{early_pct_all:.0f}%** of all legs, Ownby arrived at the checkpoint EARLY. "
-        "This is not a random result — it's a systematic bias. The car is consistently traveling "
-        "faster than the target speed, meaning the speedometer reads **lower than actual ground speed**.\n\n"
-        "**What the navigator's own notes confirm:** The stage notes show accumulated corrections "
-        "of -2.9s, -3.7s, -4.3s, -7s at interim waypoints throughout Stage 1. The navigator was "
-        "constantly fighting an early-running car by calculating makeup adjustments.\n\n"
-        "**The root cause:** When the car holds 50 MPH on the speedometer, it is actually doing "
-        "~51–52 MPH over ground. This compounds over a 38-minute leg into 16+ seconds early.\n\n"
-        "**Actions:**\n"
-        "- During the daily calibration run, dial the speedometer *up* — if 1 mile takes 1m12s at "
-        "indicated 50 MPH, the corrected factor should be adjusted to reflect actual travel time.\n"
-        "- As an immediate on-course fix: target **1–2 MPH below** every posted speed throughout "
-        "each leg to absorb the systematic overspeed.\n"
-        "- The navigator should track cumulative error starting from zero at each leg start, "
-        "and give small speed corrections (e.g. 'slow down 5 seconds over next 2 miles') "
-        "rather than waiting until a waypoint is already past-early."
-    )
-
-    if consistent_early:
+    # ─── Priority 1 — Speed/Timing Bias ──────────────────────────────────────
+    st.subheader("Priority 1 — Speed/Timing Bias")
+    if early_pct_all >= 60:
+        st.error(
+            f"**{early_pct_all:.0f}%** of all legs, {team_crew} arrived at the checkpoint EARLY. "
+            "This is a systematic fast-running bias — the car is consistently traveling faster than "
+            "the target speed, suggesting the speedometer reads **lower than actual ground speed**.\n\n"
+            "**Actions:**\n"
+            "- During daily calibration, dial the speedometer correction factor upward.\n"
+            "- As an on-course fix: target **1–2 MPH below** every posted speed to absorb the overspeed.\n"
+            "- Navigator should track cumulative error from leg start and issue small speed corrections "
+            "proactively rather than after reaching a waypoint early."
+        )
+        if consistent_early_stages:
+            st.warning(
+                f"Stages where {team_crew} was early on 80%+ of legs: **{consistent_early_stages}** — "
+                "calibration correction is most critical on these days."
+            )
+    elif early_pct_all <= 40:
         st.warning(
-            f"Stages where Ownby was early on 80%+ of legs: **{consistent_early}** — "
-            "the calibration problem is most acute on these days."
+            f"**{100 - early_pct_all:.0f}%** of all legs, {team_crew} arrived LATE. "
+            "This suggests the car may be running slower than target speed — the speedometer "
+            "could be reading higher than actual ground speed, or the crew is intentionally "
+            "conservative.\n\n"
+            "**Actions:**\n"
+            "- Check speedometer calibration: if indicated speed is high vs. actual, "
+            "increase target MPH slightly.\n"
+            "- Review late legs to identify whether the cause is traffic, stops, or pacing."
+        )
+    else:
+        st.success(
+            f"{team_crew} has a reasonably balanced arrival pattern ({early_pct_all:.0f}% early). "
+            "Focus on reducing peak penalties rather than correcting a directional bias."
         )
 
-    # ─── Priority 2 ──────────────────────────────────────────────────────────
+    # ─── Priority 2 — Worst Specific Legs ────────────────────────────────────
     st.subheader("Priority 2 — Worst Specific Legs")
     for _, r in worst3.iterrows():
         direction = "early" if r["Early"] else "late"
         st.write(
             f"- **Stage {int(r['Stage'])}, Leg {int(r['Leg'])}** ({r['stage_leg']}): "
-            f"Ownby {r['Time']:.0f}s · Field median {r['field_median']:.0f}s · "
+            f"{team_crew} {r['Time']:.0f}s · Field median {r['field_median']:.0f}s · "
             f"**+{r['vs_median']:.0f}s above median** — arrived {direction}"
         )
     st.info(
         "Review the stage notes PDF pages for these specific legs. Look for:\n"
         "- Speed limit drops that were missed or delayed\n"
-        "- Stop signs / traffic light stops that were shorter than expected\n"
-        "- Highway sections where the car accelerated above target without noticing\n\n"
-        "The navigator's handwritten corrections on those pages will pinpoint exactly "
-        "where in the leg the time was gained."
+        "- Stop signs / traffic light stops that were shorter or longer than expected\n"
+        "- Highway sections where speed deviated from target without correction\n\n"
+        "Handwritten navigator corrections on those pages will pinpoint where in the leg "
+        "the time was gained or lost."
     )
 
-    # ─── Priority 3 ──────────────────────────────────────────────────────────
+    # ─── Priority 3 — Leg 1 Start Discipline ─────────────────────────────────
     st.subheader("Priority 3 — Leg 1 Start Discipline")
     st.write(
-        f"On first legs (Leg 1) across all stages, Ownby arrived early **{leg1_early:.0f}%** "
+        f"On first legs (Leg 1) across all stages, {team_crew} arrived early **{leg1_early:.0f}%** "
         "of the time. The CDT countdown start is a high-stress moment where it's easy to "
-        "over-accelerate immediately after the clock starts.\n\n"
+        "over- or under-accelerate immediately after the clock starts.\n\n"
         "**Action:** After pressing the CDT start button, hold the car at target speed for a "
-        "full 30 seconds before making any adjustments. Resist the urge to accelerate to "
-        "'make up' any perceived gap from the start."
+        "full 30 seconds before making any adjustments."
     )
 
-    # ─── Priority 4 ──────────────────────────────────────────────────────────
+    # ─── Priority 4 — Replicate Best Stage ───────────────────────────────────
     st.subheader("Priority 4 — Replicate the Best Stage")
     st.write(
-        f"Best stage was **Stage {int(best_stage_row['Stage'])}** with rank "
+        f"Best stage was **Stage {int(best_stage_row['Stage'])}** — ranked "
         f"**#{int(best_stage_row['rank'])} of {int(best_stage_row['field_size'])}** "
-        f"and only {best_stage_row['total_penalty']:.0f}s total penalty. "
+        f"with only {best_stage_row['total_penalty']:.0f}s total penalty. "
         f"The navigator's notes from that stage are the most valuable reference material "
-        f"for what the crew did correctly — particularly around speed maintenance and "
-        f"correction technique."
+        f"for what the crew did correctly."
     )
-
     if not np.isnan(penalty_std):
         st.write(
             f"Stage-to-stage penalty standard deviation: **{penalty_std:.1f}s** — "
             "this is the consistency gap between best and worst days."
         )
 
-    # ─── Priority 5 ──────────────────────────────────────────────────────────
-    st.subheader("Priority 5 — R Division Competitive Gap")
+    # ─── Priority 5 — Division Competitive Gap ───────────────────────────────
+    st.subheader(f"Priority 5 — Division {team_div} Competitive Gap")
     st.write(
-        f"Ownby is currently **#{ownby_r_pos_num} of {n_r}** in R division. "
-        f"Division leader ({best_r_crew}) has accumulated **{best_r_penalty:.0f}s** total penalty "
-        f"vs. Ownby's **{ownby_r_penalty:.0f}s** — a gap of **{r_gap:.0f}s** over the full race.\n\n"
-        "Most of that gap is recoverable from the calibration fix alone. "
-        f"If Ownby reduced their average leg penalty from "
-        f"**{avg_pen_all:.1f}s to ~{max(avg_pen_all*0.5, 2):.0f}s** per leg, "
+        f"{team_crew} is currently **#{team_div_pos} of {n_div}** in Division {team_div}. "
+        f"Division leader ({best_div_crew}) has accumulated **{best_div_penalty:.0f}s** total penalty "
+        f"vs. {team_crew}'s **{team_div_penalty:.0f}s** — a gap of **{r_gap:.0f}s** over the full race.\n\n"
+        f"If {team_crew} reduced their average leg penalty from "
+        f"**{avg_pen_all:.1f}s to ~{max(avg_pen_all * 0.5, 2):.0f}s** per leg, "
         f"the total savings across {total_legs} legs would be approximately "
-        f"**{(avg_pen_all - max(avg_pen_all*0.5, 2)) * total_legs:.0f}s**."
+        f"**{(avg_pen_all - max(avg_pen_all * 0.5, 2)) * total_legs:.0f}s**."
     )
 
     # ─── Summary table ───────────────────────────────────────────────────────
     st.divider()
     st.subheader("Priority Summary")
-    st.markdown("""
+    bias_type = "Running consistently too fast" if early_pct_all >= 60 else (
+        "Running consistently too slow" if early_pct_all <= 40 else "Balanced — reduce peak penalties"
+    )
+    st.markdown(f"""
 | Priority | Focus Area | Root Cause | Expected Impact |
 |---|---|---|---|
-| 1 | Speedometer calibration — running consistently too fast | Speedometer reads low vs. ground speed | High — affects every single leg |
-| 2 | Worst specific legs (see Leg Analysis tab) | Missed speed changes / stop timing | Medium — targeted 10–20s savings |
-| 3 | Leg 1 start discipline — over-acceleration at CDT start | Pressure at stage start | Medium — first leg sets tone |
+| 1 | Speed/timing bias | {bias_type} | High — affects every single leg |
+| 2 | Worst specific legs (see Leg Analysis tab) | Missed speed changes / stop timing | Medium — targeted savings |
+| 3 | Leg 1 start discipline | Pressure at stage start | Medium — first leg sets tone |
 | 4 | Replicate best-stage technique | Inconsistent correction method | Low-medium — reduce variance |
-| 5 | Close R division gap | Compound of above | High if calibration fixed |
+| 5 | Close Div {team_div} gap | Compound of above | High if bias corrected |
 """)
