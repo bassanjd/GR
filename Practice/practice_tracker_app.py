@@ -1547,12 +1547,11 @@ with tab_accel:
 
             ss_sel = [r for r in all_ss if r["target_speed"] == sel_ss_tgt]
 
-            # Two charts: speed vs distance, accel vs speed (reveals shift points)
             fig_acc = make_subplots(
-                rows=2, cols=2, shared_xaxes=False,
-                column_titles=["Speed & Acceleration vs Distance", "Acceleration vs Speed (shift consistency)"],
-                row_titles=["Speed (mph)", "Accel (ft/s²)"],
-                vertical_spacing=0.10, horizontal_spacing=0.08,
+                rows=3, cols=2, shared_xaxes=False,
+                column_titles=["vs Distance from Entry", "vs Speed (shift consistency)"],
+                row_titles=["Speed (mph)", "Accel (ft/s²)", "Jerk (ft/s³)"],
+                vertical_spacing=0.08, horizontal_spacing=0.08,
             )
 
             for idx, r_p in enumerate(ss_sel):
@@ -1563,9 +1562,10 @@ with tab_accel:
                 if en_d is None:
                     continue
 
-                d_p  = grp_p["Distance (mi)"].to_numpy()
-                v_p  = grp_p["speed_smooth"].to_numpy()
-                a_p  = grp_p["accel_ft_s2"].to_numpy()
+                d_p   = grp_p["Distance (mi)"].to_numpy()
+                v_p   = grp_p["speed_smooth"].to_numpy()
+                a_p   = grp_p["accel_ft_s2"].to_numpy()
+                j_p   = grp_p["jerk_ft_s3"].to_numpy()
                 d_aln = d_p - en_d  # 0 = trap entry
 
                 # Show from first movement to target speed (+ small margin)
@@ -1575,58 +1575,60 @@ with tab_accel:
                 end_idx  = min(end_idx, len(v_p) - 1)
                 sl       = slice(mv_idx, end_idx + 1)
 
-                color     = _colors[idx % len(_colors)]
-                lbl       = _run_short_label(r_p)
-                show_leg  = True
+                color = _colors[idx % len(_colors)]
+                lbl   = _run_short_label(r_p)
 
                 # Left column — vs distance
                 fig_acc.add_trace(go.Scatter(
                     x=d_aln[sl], y=v_p[sl], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=show_leg,
-                    legendgroup=lbl,
+                    name=lbl, line=dict(color=color), showlegend=True, legendgroup=lbl,
                 ), row=1, col=1)
                 fig_acc.add_trace(go.Scatter(
                     x=d_aln[sl], y=a_p[sl], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=False,
-                    legendgroup=lbl,
+                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
                 ), row=2, col=1)
+                fig_acc.add_trace(go.Scatter(
+                    x=d_aln[sl], y=j_p[sl], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                ), row=3, col=1)
 
-                # Right column — accel vs speed (only positive accel phase)
+                # Right column — accel & jerk vs speed (rows 2 & 3, matching left column)
                 acc_phase = (v_p[sl] >= 2) & (v_p[sl] <= sel_ss_tgt * 1.02)
                 v_ap  = v_p[sl][acc_phase]
                 a_ap  = a_p[sl][acc_phase]
+                j_ap  = j_p[sl][acc_phase]
                 s_ord = np.argsort(v_ap)
                 fig_acc.add_trace(go.Scatter(
                     x=v_ap[s_ord], y=a_ap[s_ord], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=False,
-                    legendgroup=lbl,
-                ), row=1, col=2)
-                fig_acc.add_trace(go.Scatter(
-                    x=v_ap[s_ord], y=a_ap[s_ord] * 0,  # placeholder to share y-axis scale
-                    showlegend=False, line=dict(color=color, width=0),
-                    legendgroup=lbl,
+                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
                 ), row=2, col=2)
+                fig_acc.add_trace(go.Scatter(
+                    x=v_ap[s_ord], y=j_ap[s_ord], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                ), row=3, col=2)
 
-            # Reference lines — distance charts
+            # Reference lines — left column
             fig_acc.add_hline(y=sel_ss_tgt, line_dash="dot", line_color="gray",
                               annotation_text=f"Target {sel_ss_tgt} mph",
                               annotation_position="top right", row=1, col=1)
-            fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+            for _r in (2, 3):
+                fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=1)
             fig_acc.add_vline(x=0, line_dash="dash", line_color="green",
                               annotation_text="Entry", row=1, col=1)
             fig_acc.add_vline(x=TRAP_DIST_MI, line_dash="dash", line_color="red",
                               annotation_text="Exit", row=1, col=1)
-            # Reference lines — speed charts
-            fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=1, col=2)
-            fig_acc.add_vline(x=sel_ss_tgt, line_dash="dot", line_color="gray",
-                              annotation_text=f"{sel_ss_tgt} mph", row=1, col=2)
+            # Reference lines — right column (rows 2 & 3)
+            for _r in (2, 3):
+                fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=2)
+                fig_acc.add_vline(x=sel_ss_tgt, line_dash="dot", line_color="gray",
+                                  annotation_text=f"{sel_ss_tgt} mph", row=_r, col=2)
 
-            fig_acc.update_xaxes(title_text="Distance from trap entry (mi)", row=2, col=1)
-            fig_acc.update_xaxes(title_text="Speed (mph)", row=1, col=2)
+            fig_acc.update_xaxes(title_text="Distance from trap entry (mi)", row=3, col=1)
             fig_acc.update_xaxes(title_text="Speed (mph)", row=2, col=2)
+            fig_acc.update_xaxes(title_text="Speed (mph)", row=3, col=2)
             fig_acc.update_layout(
-                height=620,
-                legend=dict(orientation="h", y=-0.10),
+                height=800,
+                legend=dict(orientation="h", y=-0.08),
                 title_text=f"Acceleration to {sel_ss_tgt} mph — {len(ss_sel)} run(s)",
             )
             st.plotly_chart(fig_acc, width='stretch')
@@ -1656,10 +1658,10 @@ with tab_accel:
             sf_sel = [r for r in all_sf if r["target_speed"] == sel_sf_tgt]
 
             fig_dec = make_subplots(
-                rows=2, cols=2, shared_xaxes=False,
-                column_titles=["Speed & Deceleration vs Distance from Exit", "Deceleration vs Speed"],
-                row_titles=["Speed (mph)", "Accel (ft/s²)"],
-                vertical_spacing=0.10, horizontal_spacing=0.08,
+                rows=3, cols=2, shared_xaxes=False,
+                column_titles=["vs Distance from Exit", "vs Speed (braking consistency)"],
+                row_titles=["Speed (mph)", "Accel (ft/s²)", "Jerk (ft/s³)"],
+                vertical_spacing=0.08, horizontal_spacing=0.08,
             )
 
             for idx, r_p in enumerate(sf_sel):
@@ -1677,6 +1679,7 @@ with tab_accel:
                 d_p   = grp_p["Distance (mi)"].to_numpy()
                 v_p   = grp_p["speed_smooth"].to_numpy()
                 a_p   = grp_p["accel_ft_s2"].to_numpy()
+                j_p   = grp_p["jerk_ft_s3"].to_numpy()
                 d_aln = d_p - ex_d   # 0 = exit trap, positive = past exit
 
                 # Show from slightly before exit until car stops
@@ -1690,41 +1693,50 @@ with tab_accel:
                 # Left — vs distance from exit
                 fig_dec.add_trace(go.Scatter(
                     x=d_aln[sl_mask], y=v_p[sl_mask], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=True,
-                    legendgroup=lbl,
+                    name=lbl, line=dict(color=color), showlegend=True, legendgroup=lbl,
                 ), row=1, col=1)
                 fig_dec.add_trace(go.Scatter(
                     x=d_aln[sl_mask], y=a_p[sl_mask], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=False,
-                    legendgroup=lbl,
+                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
                 ), row=2, col=1)
+                fig_dec.add_trace(go.Scatter(
+                    x=d_aln[sl_mask], y=j_p[sl_mask], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                ), row=3, col=1)
 
-                # Right — decel vs speed (sorted descending for readability)
+                # Right — accel & jerk vs speed (rows 2 & 3, matching left column)
                 dec_mask = (v_p[sl_mask] >= 1) & (a_p[sl_mask] <= 0)
-                v_dp     = v_p[sl_mask][dec_mask]
-                a_dp     = a_p[sl_mask][dec_mask]
-                s_ord    = np.argsort(-v_dp)   # descending speed
+                v_dp  = v_p[sl_mask][dec_mask]
+                a_dp  = a_p[sl_mask][dec_mask]
+                j_dp  = j_p[sl_mask][dec_mask]
+                s_ord = np.argsort(-v_dp)
                 fig_dec.add_trace(go.Scatter(
                     x=v_dp[s_ord], y=a_dp[s_ord], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=False,
-                    legendgroup=lbl,
-                ), row=1, col=2)
+                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                ), row=2, col=2)
+                fig_dec.add_trace(go.Scatter(
+                    x=v_dp[s_ord], y=j_dp[s_ord], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                ), row=3, col=2)
 
             fig_dec.add_hline(y=sel_sf_tgt, line_dash="dot", line_color="gray",
                               annotation_text=f"Target {sel_sf_tgt} mph",
                               annotation_position="top right", row=1, col=1)
-            fig_dec.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+            for _r in (2, 3):
+                fig_dec.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=1)
             fig_dec.add_vline(x=0, line_dash="dash", line_color="red",
                               annotation_text="Exit trap", row=1, col=1)
-            fig_dec.add_vline(x=sel_sf_tgt, line_dash="dot", line_color="gray",
-                              annotation_text=f"{sel_sf_tgt} mph", row=1, col=2)
-            fig_dec.add_hline(y=0, line_dash="dot", line_color="gray", row=1, col=2)
+            for _r in (2, 3):
+                fig_dec.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=2)
+                fig_dec.add_vline(x=sel_sf_tgt, line_dash="dot", line_color="gray",
+                                  annotation_text=f"{sel_sf_tgt} mph", row=_r, col=2)
 
-            fig_dec.update_xaxes(title_text="Distance from exit trap (mi)", row=2, col=1)
-            fig_dec.update_xaxes(title_text="Speed (mph)", row=1, col=2)
+            fig_dec.update_xaxes(title_text="Distance from exit trap (mi)", row=3, col=1)
+            fig_dec.update_xaxes(title_text="Speed (mph)", row=2, col=2)
+            fig_dec.update_xaxes(title_text="Speed (mph)", row=3, col=2)
             fig_dec.update_layout(
-                height=620,
-                legend=dict(orientation="h", y=-0.10),
+                height=800,
+                legend=dict(orientation="h", y=-0.08),
                 title_text=f"Deceleration from {sel_sf_tgt} mph — {len(sf_sel)} run(s)",
             )
             st.plotly_chart(fig_dec, width='stretch')
