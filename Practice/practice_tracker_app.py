@@ -433,8 +433,8 @@ def run_finish_type(r: dict) -> str:
     return "Unknown"
 
 
-tab_map, tab_overview, tab_detail, tab_transit, tab_settings = st.tabs(
-    ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis", "Settings"]
+tab_map, tab_overview, tab_detail, tab_transit, tab_accel, tab_settings = st.tabs(
+    ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis", "Accel/Decel", "Settings"]
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -529,7 +529,7 @@ with tab_map:
         ))
 
         fig_map.update_layout(height=580, margin=dict(l=0, r=0, t=40, b=0))
-        st.plotly_chart(fig_map, use_container_width=True)
+        st.plotly_chart(fig_map, width='stretch')
 
     with col_stats:
         st.metric("Total distance", f"{df_raw['Distance (mi)'].max():.1f} mi")
@@ -707,7 +707,7 @@ with tab_overview:
         legend=dict(orientation="v", x=1.01, font_size=11),
         margin=dict(r=180),
     )
-    st.plotly_chart(fig_all, use_container_width=True)
+    st.plotly_chart(fig_all, width='stretch')
 
     st.divider()
 
@@ -755,7 +755,7 @@ with tab_overview:
         legend=dict(orientation="v", x=1.01, font_size=11),
         margin=dict(r=180),
     )
-    st.plotly_chart(fig_trap, use_container_width=True)
+    st.plotly_chart(fig_trap, width='stretch')
 
     st.divider()
 
@@ -777,7 +777,7 @@ with tab_overview:
         height=380,
         showlegend=False,
     )
-    st.plotly_chart(accel_fig, use_container_width=True)
+    st.plotly_chart(accel_fig, width='stretch')
 
     st.subheader("Jerk Distribution by Run (measured section only)")
     jerk_fig = go.Figure()
@@ -796,7 +796,7 @@ with tab_overview:
         height=380,
         showlegend=False,
     )
-    st.plotly_chart(jerk_fig, use_container_width=True)
+    st.plotly_chart(jerk_fig, width='stretch')
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tab 3 — Run detail
@@ -990,7 +990,7 @@ with tab_transit:
         row=3, col=1,
     )
     fig_tr.update_layout(height=820, legend=dict(orientation="h", y=-0.06))
-    st.plotly_chart(fig_tr, use_container_width=True)
+    st.plotly_chart(fig_tr, width='stretch')
 
 # ── Idealized Run comparison — continues inside the Run Detail tab ─────────────
 with tab_detail:
@@ -1444,7 +1444,7 @@ with tab_detail:
     fig_ideal.update_yaxes(title_text="ft/s³", range=_jerk_range,  row=4, col=1)
     fig_ideal.update_yaxes(title_text="Δ mph", range=_res_range,   row=5, col=1)
     fig_ideal.update_layout(height=1100, legend=dict(orientation="h", y=-0.04))
-    st.plotly_chart(fig_ideal, use_container_width=True)
+    st.plotly_chart(fig_ideal, width='stretch')
 
     # ── Comparison metrics table (measured section only) ──────────────────────
     st.subheader("Measured Section: Actual vs Ideal")
@@ -1516,7 +1516,226 @@ where abrupt throttle/brake inputs cause overshoot.
                      use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Tab 5 — Settings
+# Tab 5 — Accel / Decel Analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_accel:
+    if not runs:
+        st.info("No exercise runs found.")
+    else:
+        _colors = px.colors.qualitative.Plotly
+
+        def _run_short_label(r_p: dict) -> str:
+            idx = runs.index(r_p)
+            return f"R{idx+1} {r_p['direction']} {r_p['start_time']} (~{r_p['target_speed']} mph)"
+
+        def _get_grp(r_p: dict) -> pd.DataFrame:
+            g = r_p.get("_grp_with_derivs")
+            return g if g is not None else compute_derivatives(r_p["data"].copy(), smooth_window)
+
+        # ── Acceleration ─────────────────────────────────────────────────────
+        st.subheader("Acceleration — Standing Starts")
+        all_ss = [r for r in runs if run_start_type(r) == "Standing"]
+
+        if not all_ss:
+            st.info("No standing-start runs found.")
+        else:
+            ss_targets = sorted({r["target_speed"] for r in all_ss})
+            sel_ss_tgt = st.selectbox(
+                "Target speed (acceleration)",
+                ss_targets, format_func=lambda x: f"{x} mph", key="acc_tgt",
+            ) if len(ss_targets) > 1 else ss_targets[0]
+
+            ss_sel = [r for r in all_ss if r["target_speed"] == sel_ss_tgt]
+
+            # Two charts: speed vs distance, accel vs speed (reveals shift points)
+            fig_acc = make_subplots(
+                rows=2, cols=2, shared_xaxes=False,
+                column_titles=["Speed & Acceleration vs Distance", "Acceleration vs Speed (shift consistency)"],
+                row_titles=["Speed (mph)", "Accel (ft/s²)"],
+                vertical_spacing=0.10, horizontal_spacing=0.08,
+            )
+
+            for idx, r_p in enumerate(ss_sel):
+                grp_p   = _get_grp(r_p)
+                gw_p    = r_p["direction"] == "West"
+                en_lon  = trap_east if gw_p else trap_west
+                en_d    = find_crossing_dist(grp_p, en_lon, gw_p)
+                if en_d is None:
+                    continue
+
+                d_p  = grp_p["Distance (mi)"].to_numpy()
+                v_p  = grp_p["speed_smooth"].to_numpy()
+                a_p  = grp_p["accel_ft_s2"].to_numpy()
+                d_aln = d_p - en_d  # 0 = trap entry
+
+                # Show from first movement to target speed (+ small margin)
+                mv_idx   = int(np.argmax(v_p >= 1.0)) if (v_p >= 1.0).any() else 0
+                tgt_mask = v_p >= sel_ss_tgt * 0.97
+                end_idx  = int(np.argmax(tgt_mask)) + 15 if tgt_mask.any() else len(v_p) - 1
+                end_idx  = min(end_idx, len(v_p) - 1)
+                sl       = slice(mv_idx, end_idx + 1)
+
+                color     = _colors[idx % len(_colors)]
+                lbl       = _run_short_label(r_p)
+                show_leg  = True
+
+                # Left column — vs distance
+                fig_acc.add_trace(go.Scatter(
+                    x=d_aln[sl], y=v_p[sl], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=show_leg,
+                    legendgroup=lbl,
+                ), row=1, col=1)
+                fig_acc.add_trace(go.Scatter(
+                    x=d_aln[sl], y=a_p[sl], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=False,
+                    legendgroup=lbl,
+                ), row=2, col=1)
+
+                # Right column — accel vs speed (only positive accel phase)
+                acc_phase = (v_p[sl] >= 2) & (v_p[sl] <= sel_ss_tgt * 1.02)
+                v_ap  = v_p[sl][acc_phase]
+                a_ap  = a_p[sl][acc_phase]
+                s_ord = np.argsort(v_ap)
+                fig_acc.add_trace(go.Scatter(
+                    x=v_ap[s_ord], y=a_ap[s_ord], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=False,
+                    legendgroup=lbl,
+                ), row=1, col=2)
+                fig_acc.add_trace(go.Scatter(
+                    x=v_ap[s_ord], y=a_ap[s_ord] * 0,  # placeholder to share y-axis scale
+                    showlegend=False, line=dict(color=color, width=0),
+                    legendgroup=lbl,
+                ), row=2, col=2)
+
+            # Reference lines — distance charts
+            fig_acc.add_hline(y=sel_ss_tgt, line_dash="dot", line_color="gray",
+                              annotation_text=f"Target {sel_ss_tgt} mph",
+                              annotation_position="top right", row=1, col=1)
+            fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+            fig_acc.add_vline(x=0, line_dash="dash", line_color="green",
+                              annotation_text="Entry", row=1, col=1)
+            fig_acc.add_vline(x=TRAP_DIST_MI, line_dash="dash", line_color="red",
+                              annotation_text="Exit", row=1, col=1)
+            # Reference lines — speed charts
+            fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=1, col=2)
+            fig_acc.add_vline(x=sel_ss_tgt, line_dash="dot", line_color="gray",
+                              annotation_text=f"{sel_ss_tgt} mph", row=1, col=2)
+
+            fig_acc.update_xaxes(title_text="Distance from trap entry (mi)", row=2, col=1)
+            fig_acc.update_xaxes(title_text="Speed (mph)", row=1, col=2)
+            fig_acc.update_xaxes(title_text="Speed (mph)", row=2, col=2)
+            fig_acc.update_layout(
+                height=620,
+                legend=dict(orientation="h", y=-0.10),
+                title_text=f"Acceleration to {sel_ss_tgt} mph — {len(ss_sel)} run(s)",
+            )
+            st.plotly_chart(fig_acc, width='stretch')
+
+            # ── Gear shift summary ────────────────────────────────────────────
+            st.caption(
+                "Gear shifts appear as **dips in the acceleration curve**. "
+                "If shifts are consistent, the dips in the right-hand chart will overlap at the same speed. "
+                "Braking spikes at the end appear as sharp negative acceleration."
+            )
+
+        st.divider()
+
+        # ── Deceleration ─────────────────────────────────────────────────────
+        st.subheader("Deceleration — Standing Stops")
+        all_sf = [r for r in runs if run_finish_type(r) == "Standing"]
+
+        if not all_sf:
+            st.info("No standing-finish runs found.")
+        else:
+            sf_targets = sorted({r["target_speed"] for r in all_sf})
+            sel_sf_tgt = st.selectbox(
+                "Target speed (deceleration)",
+                sf_targets, format_func=lambda x: f"{x} mph", key="dec_tgt",
+            ) if len(sf_targets) > 1 else sf_targets[0]
+
+            sf_sel = [r for r in all_sf if r["target_speed"] == sel_sf_tgt]
+
+            fig_dec = make_subplots(
+                rows=2, cols=2, shared_xaxes=False,
+                column_titles=["Speed & Deceleration vs Distance from Exit", "Deceleration vs Speed"],
+                row_titles=["Speed (mph)", "Accel (ft/s²)"],
+                vertical_spacing=0.10, horizontal_spacing=0.08,
+            )
+
+            for idx, r_p in enumerate(sf_sel):
+                grp_p    = _get_grp(r_p)
+                gw_p     = r_p["direction"] == "West"
+                en_lon   = trap_east if gw_p else trap_west
+                ex_lon   = trap_west if gw_p else trap_east
+                en_d     = find_crossing_dist(grp_p, en_lon, gw_p)
+                ex_d     = find_crossing_dist(grp_p, ex_lon, gw_p)
+                if ex_d is None and en_d is not None:
+                    ex_d = en_d + TRAP_DIST_MI
+                if ex_d is None:
+                    continue
+
+                d_p   = grp_p["Distance (mi)"].to_numpy()
+                v_p   = grp_p["speed_smooth"].to_numpy()
+                a_p   = grp_p["accel_ft_s2"].to_numpy()
+                d_aln = d_p - ex_d   # 0 = exit trap, positive = past exit
+
+                # Show from slightly before exit until car stops
+                sl_mask = (d_aln >= -0.05) & (v_p >= 0)
+                if sl_mask.sum() < 3:
+                    continue
+
+                color = _colors[idx % len(_colors)]
+                lbl   = _run_short_label(r_p)
+
+                # Left — vs distance from exit
+                fig_dec.add_trace(go.Scatter(
+                    x=d_aln[sl_mask], y=v_p[sl_mask], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=True,
+                    legendgroup=lbl,
+                ), row=1, col=1)
+                fig_dec.add_trace(go.Scatter(
+                    x=d_aln[sl_mask], y=a_p[sl_mask], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=False,
+                    legendgroup=lbl,
+                ), row=2, col=1)
+
+                # Right — decel vs speed (sorted descending for readability)
+                dec_mask = (v_p[sl_mask] >= 1) & (a_p[sl_mask] <= 0)
+                v_dp     = v_p[sl_mask][dec_mask]
+                a_dp     = a_p[sl_mask][dec_mask]
+                s_ord    = np.argsort(-v_dp)   # descending speed
+                fig_dec.add_trace(go.Scatter(
+                    x=v_dp[s_ord], y=a_dp[s_ord], mode="lines",
+                    name=lbl, line=dict(color=color), showlegend=False,
+                    legendgroup=lbl,
+                ), row=1, col=2)
+
+            fig_dec.add_hline(y=sel_sf_tgt, line_dash="dot", line_color="gray",
+                              annotation_text=f"Target {sel_sf_tgt} mph",
+                              annotation_position="top right", row=1, col=1)
+            fig_dec.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+            fig_dec.add_vline(x=0, line_dash="dash", line_color="red",
+                              annotation_text="Exit trap", row=1, col=1)
+            fig_dec.add_vline(x=sel_sf_tgt, line_dash="dot", line_color="gray",
+                              annotation_text=f"{sel_sf_tgt} mph", row=1, col=2)
+            fig_dec.add_hline(y=0, line_dash="dot", line_color="gray", row=1, col=2)
+
+            fig_dec.update_xaxes(title_text="Distance from exit trap (mi)", row=2, col=1)
+            fig_dec.update_xaxes(title_text="Speed (mph)", row=1, col=2)
+            fig_dec.update_layout(
+                height=620,
+                legend=dict(orientation="h", y=-0.10),
+                title_text=f"Deceleration from {sel_sf_tgt} mph — {len(sf_sel)} run(s)",
+            )
+            st.plotly_chart(fig_dec, width='stretch')
+            st.caption(
+                "Braking consistency: the deceleration vs speed curves (right) should overlap "
+                "if the driver applies the brakes at the same rate each run. "
+                "Braking application point shows as the distance at which speed begins to drop."
+            )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tab 6 — Settings
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_settings:
     if not pq_files:
