@@ -268,8 +268,8 @@ def run_start_type(r: dict) -> str:
     return "Flying" if v_entry >= 0.5 * r["target_speed"] else "Standing"
 
 
-tab_map, tab_overview, tab_detail, tab_transit, tab_ideal = st.tabs(
-    ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis", "Idealized Run"]
+tab_map, tab_overview, tab_detail, tab_transit = st.tabs(
+    ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis"]
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -609,131 +609,28 @@ with tab_detail:
     c5.metric("Max |jerk|", f"{max_jerk:.2f} ft/s3")
     c6.metric("Distance", f"{r['distance_mi']:.3f} mi")
 
-    x_choice = st.radio("X axis", ["Time (s from run start)", "Distance (mi from run start)"],
-                        horizontal=True)
-    x_col = "t_rel" if "Time" in x_choice else "d_rel_mi"
-    x_label = "Time from run start (s)" if "Time" in x_choice else "Distance from run start (mi)"
+    use_time = st.radio(
+        "X axis", ["Distance from trap entry", "Time from trap entry"],
+        horizontal=True,
+    ) == "Time from trap entry"
 
     # ── Trap crossing positions for this run ──────────────────────────────────
-    going_west = r["direction"] == "West"
+    going_west  = r["direction"] == "West"
     entry_lon_r = trap_east if going_west else trap_west
     exit_lon_r  = trap_west if going_west else trap_east
-
     entry_d_raw = find_crossing_dist(grp, entry_lon_r, going_west)
     exit_d_raw  = find_crossing_dist(grp, exit_lon_r,  going_west)
 
-    def d_raw_to_x(d_raw):
-        """Convert a cumulative odometer distance to the active x-axis value."""
-        if d_raw is None:
-            return None
-        if "Distance" in x_choice:
-            return d_raw - d0
-        # For time x-axis: interpolate t_rel at the given odometer distance
-        d_arr = grp["Distance (mi)"].to_numpy()
-        t_arr = grp["t_rel"].to_numpy()
-        mask = d_arr >= d_raw
-        if not mask.any():
-            return None
-        idx = int(np.argmax(mask))
-        if idx == 0:
-            return float(t_arr[0])
-        dd = d_arr[idx] - d_arr[idx - 1]
-        frac = (d_raw - d_arr[idx - 1]) / dd if dd != 0 else 0.0
-        return float(t_arr[idx - 1] + frac * (t_arr[idx] - t_arr[idx - 1]))
+    # Geometric fallback when GPS data doesn't reach a trap crossing.
+    # 1 degree longitude ≈ 69.172 × cos(lat) miles.
+    _ex_lat_rad = float(np.radians(r["data"]["Latitude"].mean()))
+    _mi_per_deg_lon = 69.172 * float(np.cos(_ex_lat_rad))
+    _trap_dist_mi   = abs(trap_east - trap_west) * _mi_per_deg_lon
+    if entry_d_raw is None and exit_d_raw is not None:
+        entry_d_raw = exit_d_raw - _trap_dist_mi
+    if exit_d_raw is None and entry_d_raw is not None:
+        exit_d_raw = entry_d_raw + _trap_dist_mi
 
-    entry_x = d_raw_to_x(entry_d_raw)
-    exit_x  = d_raw_to_x(exit_d_raw)
-
-    # 3-panel subplot: speed / acceleration / jerk
-    fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.4, 0.3, 0.3],
-        vertical_spacing=0.06,
-        subplot_titles=["Speed (mph)", "Acceleration (ft/s²  |  g)", "Jerk (ft/s³)"],
-    )
-
-    x = grp[x_col]
-
-    # Speed
-    fig.add_trace(go.Scatter(
-        x=x, y=grp["Speed (mph)"],
-        name="Raw speed", mode="lines",
-        line=dict(color="lightsteelblue", width=1), opacity=0.5,
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=x, y=grp["speed_smooth"],
-        name="Smoothed speed", mode="lines",
-        line=dict(color="royalblue", width=2),
-    ), row=1, col=1)
-    fig.add_hline(y=r["target_speed"], line_dash="dash", line_color="gray",
-                  annotation_text=f"Target {r['target_speed']} mph",
-                  annotation_position="top right", row=1, col=1)
-
-    # Acceleration
-    fig.add_trace(go.Scatter(
-        x=x, y=grp["accel_ft_s2"],
-        name="Accel (ft/s²)", mode="lines",
-        line=dict(color="#e76f51", width=2),
-    ), row=2, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
-
-    # Second y-axis annotation for g units alongside ft/s²
-    # (add as scatter on same axis with right-side label via annotation)
-
-    # Jerk
-    fig.add_trace(go.Scatter(
-        x=x, y=grp["jerk_ft_s3"],
-        name="Jerk (ft/s³)", mode="lines",
-        line=dict(color="#2a9d8f", width=2),
-    ), row=3, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="gray", row=3, col=1)
-
-    # Trap entry / exit markers (apply to all subplots simultaneously)
-    if entry_x is not None:
-        fig.add_vline(x=entry_x, line_dash="dash", line_color="green",
-                      annotation_text="Trap entry", annotation_position="top right")
-    if exit_x is not None:
-        fig.add_vline(x=exit_x, line_dash="dash", line_color="red",
-                      annotation_text="Trap exit", annotation_position="top left")
-    if entry_x is not None and exit_x is not None:
-        fig.add_vrect(x0=min(entry_x, exit_x), x1=max(entry_x, exit_x),
-                      fillcolor="rgba(0,200,0,0.06)", line_width=0,
-                      annotation_text="Measured section", annotation_position="top left")
-
-    fig.update_xaxes(title_text=x_label, row=3, col=1)
-    fig.update_yaxes(title_text="mph", row=1, col=1)
-    fig.update_yaxes(title_text="ft/s²", row=2, col=1)
-    fig.update_yaxes(title_text="ft/s³", row=3, col=1)
-    fig.update_layout(height=700, showlegend=True,
-                      legend=dict(orientation="h", y=-0.08))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # g-force reference
-    with st.expander("Reference: g-force scale"):
-        st.markdown("""
-| Acceleration | ft/s² | Example |
-|---|---|---|
-| 0.05 g | 1.6 | Gentle highway merge |
-| 0.10 g | 3.2 | Moderate acceleration |
-| 0.20 g | 6.4 | Spirited driving |
-| 0.30 g | 9.7 | Firm braking |
-| 0.50 g | 16.1 | Hard braking |
-| 1.00 g | 32.2 | Maximum traction limit |
-
-**Jerk** (rate of change of acceleration) matters for ride quality and the
-ability to make smooth speed adjustments — critical in a time-distance rally
-where abrupt throttle/brake inputs cause overshoot.
-        """)
-
-    # Raw data expander
-    with st.expander("Raw data for this run"):
-        show_cols = ["Elapsed time (sec)", "t_rel", "d_rel_mi",
-                     "Speed (mph)", "speed_smooth",
-                     "accel_ft_s2", "accel_g", "jerk_ft_s3",
-                     "Latitude", "Longitude", "Accuracy (ft)"]
-        st.dataframe(grp[[c for c in show_cols if c in grp.columns]].round(4),
-                     use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tab 4 — Transit Analysis
@@ -918,38 +815,17 @@ with tab_transit:
     fig_tr_deriv.update_layout(height=500, legend=dict(orientation="h"))
     st.plotly_chart(fig_tr_deriv, use_container_width=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Tab 5 — Idealized Run
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_ideal:
-    if not runs:
-        st.warning("No exercise runs found. Try adjusting the settings in the sidebar.")
-        st.stop()
+# ── Idealized Run comparison — continues inside the Run Detail tab ─────────────
+with tab_detail:
+    st.divider()
+    st.subheader("Idealized Run Comparison")
 
-    run_labels_ideal = [
-        f"Run {i+1}: {r['direction']}  ~{r['target_speed']} mph  "
-        f"[{run_start_type(r)} start]  ({r['start_elapsed']}–{r['end_elapsed']} s)"
-        for i, r in enumerate(runs)
-    ]
-    sel_idx_i = st.selectbox(
-        "Select run to compare against ideal",
-        range(len(runs)),
-        format_func=lambda i: run_labels_ideal[i],
-        key="ideal_run_sel",
-    )
-    ri = runs[sel_idx_i]
-
-    # ── Set up selected run ────────────────────────────────────────────────────
-    if "_grp_with_derivs" in ri:
-        grp_i = ri["_grp_with_derivs"].copy()
-    else:
-        grp_i = compute_derivatives(ri["data"].copy(), smooth_window)
-
-    going_west_i = ri["direction"] == "West"
-    entry_lon_i  = trap_east if going_west_i else trap_west
-    exit_lon_i   = trap_west if going_west_i else trap_east
-    entry_d_i    = find_crossing_dist(grp_i, entry_lon_i, going_west_i)
-    exit_d_i     = find_crossing_dist(grp_i, exit_lon_i,  going_west_i)
+    # Reuse variables already computed above for the selected run
+    ri           = r
+    grp_i        = grp
+    going_west_i = going_west
+    entry_d_i    = entry_d_raw
+    exit_d_i     = exit_d_raw
 
     # Detect flying vs standstill start based on speed at trap entry
     if entry_d_i is not None:
@@ -963,10 +839,16 @@ with tab_ideal:
     start_type = "Flying start" if is_flying else "Standstill start"
 
     # ── Selected run aligned at trap entry ────────────────────────────────────
+    _d_arr = grp_i["Distance (mi)"].to_numpy()
+    _t_arr = grp_i["Elapsed time (sec)"].to_numpy()
+
     if entry_d_i is not None:
-        d_aligned_i = (grp_i["Distance (mi)"] - entry_d_i).to_numpy()
+        d_aligned_i = (_d_arr - entry_d_i)
+        t_at_entry  = float(np.interp(entry_d_i, _d_arr, _t_arr))
     else:
-        d_aligned_i = (grp_i["Distance (mi)"] - grp_i["Distance (mi)"].iloc[0]).to_numpy()
+        d_aligned_i = (_d_arr - _d_arr[0])
+        t_at_entry  = float(_t_arr[0])
+    t_aligned_i = _t_arr - t_at_entry   # seconds from trap entry
 
     v_actual     = grp_i["speed_smooth"].to_numpy()
     accel_actual = grp_i["accel_ft_s2"].to_numpy()
@@ -986,7 +868,8 @@ with tab_ideal:
             f"with zero acceleration and jerk."
         )
 
-        d_grid      = np.linspace(d_run_min, d_run_max, GRID_N)
+        d_grid         = np.linspace(d_run_min, d_run_max, GRID_N)
+        t_grid         = d_grid / float(ri["target_speed"]) * 3600
         v_ideal_smooth = np.full(GRID_N, float(ri["target_speed"]))
         accel_ideal    = np.zeros(GRID_N)
         jerk_ideal     = np.zeros(GRID_N)
@@ -1119,9 +1002,25 @@ with tab_ideal:
     dt_diff     = np.nan_to_num(dt_diff, nan=0.0)
     cum_time_err = np.cumsum(dt_diff)   # positive = ahead of ideal
 
-    # x values for plotting: the trap-section distance points in original order
+    # x values for plotting: the trap-section points in original order
     d_trap_plot = d_aligned_i[trap_mask]
     cum_time_err_plot = np.interp(d_trap_plot, d_sorted, cum_time_err)
+
+    # ── Unified x-axis (controlled by radio) ─────────────────────────────────
+    x_actual    = t_aligned_i      if use_time else d_aligned_i
+    x_ideal     = t_grid           if use_time else d_grid
+    x_trap_plot = t_aligned_i[trap_mask] if use_time else d_trap_plot
+    x_label_str = ("Time from trap entry (s)"
+                   if use_time else
+                   "Distance from trap entry (mi)  [negative = run-in]")
+
+    # Trap exit x position for vline/vrect
+    if exit_d_i is not None and entry_d_i is not None:
+        _exit_d_aln = exit_d_i - entry_d_i
+        exit_x_plot = float(np.interp(_exit_d_aln, d_aligned_i, t_aligned_i)) \
+                      if use_time else _exit_d_aln
+    else:
+        exit_x_plot = None
 
     # ── 5-panel subplot ───────────────────────────────────────────────────────
     fig_ideal = make_subplots(
@@ -1140,7 +1039,7 @@ with tab_ideal:
 
     # Row 1: Cumulative time error (trap entry → trap exit only)
     fig_ideal.add_trace(go.Scatter(
-        x=d_trap_plot, y=cum_time_err_plot,
+        x=x_trap_plot, y=cum_time_err_plot,
         name="Cumulative time error", mode="lines",
         line=dict(color="crimson", width=2),
         fill="tozeroy",
@@ -1150,14 +1049,14 @@ with tab_ideal:
 
     # Row 2: Speed
     fig_ideal.add_trace(go.Scatter(
-        x=d_aligned_i, y=grp_i["Speed (mph)"],
+        x=x_actual, y=grp_i["Speed (mph)"],
         name="Actual (raw)", mode="lines",
         line=dict(color="lightsteelblue", width=1), opacity=0.5,
     ), row=2, col=1)
     # Peer speed band (standing start only)
     if v_band_lo is not None and v_band_hi is not None:
         fig_ideal.add_trace(go.Scatter(
-            x=np.concatenate([d_grid, d_grid[::-1]]),
+            x=np.concatenate([x_ideal, x_ideal[::-1]]),
             y=np.concatenate([v_band_hi, v_band_lo[::-1]]),
             fill="toself",
             fillcolor="rgba(255,165,0,0.15)",
@@ -1167,12 +1066,12 @@ with tab_ideal:
         ), row=2, col=1)
     ideal_name = "Target speed" if is_flying else "Ideal (median peers)"
     fig_ideal.add_trace(go.Scatter(
-        x=d_grid, y=v_ideal_smooth,
+        x=x_ideal, y=v_ideal_smooth,
         name=ideal_name, mode="lines",
         line=dict(color="orange", width=2.5, dash="dash"),
     ), row=2, col=1)
     fig_ideal.add_trace(go.Scatter(
-        x=d_aligned_i, y=v_actual,
+        x=x_actual, y=v_actual,
         name="Actual (smooth)", mode="lines",
         line=dict(color="royalblue", width=2),
     ), row=2, col=1)
@@ -1184,12 +1083,12 @@ with tab_ideal:
 
     # Row 3: Acceleration
     fig_ideal.add_trace(go.Scatter(
-        x=d_grid, y=accel_ideal,
+        x=x_ideal, y=accel_ideal,
         name="Ideal accel", mode="lines",
         line=dict(color="darkorange", width=2, dash="dash"),
     ), row=3, col=1)
     fig_ideal.add_trace(go.Scatter(
-        x=d_aligned_i, y=accel_actual,
+        x=x_actual, y=accel_actual,
         name="Actual accel", mode="lines",
         line=dict(color="#e76f51", width=2),
     ), row=3, col=1)
@@ -1197,12 +1096,12 @@ with tab_ideal:
 
     # Row 4: Jerk
     fig_ideal.add_trace(go.Scatter(
-        x=d_grid, y=jerk_ideal,
+        x=x_ideal, y=jerk_ideal,
         name="Ideal jerk", mode="lines",
         line=dict(color="darkcyan", width=2, dash="dash"),
     ), row=4, col=1)
     fig_ideal.add_trace(go.Scatter(
-        x=d_aligned_i, y=jerk_actual,
+        x=x_actual, y=jerk_actual,
         name="Actual jerk", mode="lines",
         line=dict(color="#2a9d8f", width=2),
     ), row=4, col=1)
@@ -1210,7 +1109,7 @@ with tab_ideal:
 
     # Row 5: Speed residual
     fig_ideal.add_trace(go.Scatter(
-        x=d_aligned_i, y=speed_residual,
+        x=x_actual, y=speed_residual,
         name="Speed residual", mode="lines",
         line=dict(color="mediumpurple", width=2),
         fill="tozeroy",
@@ -1218,23 +1117,16 @@ with tab_ideal:
     ), row=5, col=1)
     fig_ideal.add_hline(y=0, line_dash="dot", line_color="gray", row=5, col=1)
 
-    # Trap markers on all rows
-    if entry_d_i is not None:
-        fig_ideal.add_vline(x=0, line_dash="dash", line_color="green",
-                            annotation_text="Trap entry",
-                            annotation_position="top right")
-    if exit_d_i is not None:
-        exit_x_i = exit_d_i - entry_d_i
-        fig_ideal.add_vline(x=exit_x_i, line_dash="dash", line_color="red",
-                            annotation_text="Trap exit",
-                            annotation_position="top left")
-        if entry_d_i is not None:
-            fig_ideal.add_vrect(x0=0, x1=exit_x_i,
-                                fillcolor="rgba(0,200,0,0.06)", line_width=0)
+    # Trap markers on all rows (x=0 is always trap entry in both axis modes)
+    fig_ideal.add_vline(x=0, line_dash="dash", line_color="green",
+                        annotation_text="Trap entry", annotation_position="top right")
+    if exit_x_plot is not None:
+        fig_ideal.add_vline(x=exit_x_plot, line_dash="dash", line_color="red",
+                            annotation_text="Trap exit", annotation_position="top left")
+        fig_ideal.add_vrect(x0=0, x1=exit_x_plot,
+                            fillcolor="rgba(0,200,0,0.06)", line_width=0)
 
-    fig_ideal.update_xaxes(
-        title_text="Distance from trap entry (mi)  [negative = run-in]", row=5, col=1
-    )
+    fig_ideal.update_xaxes(title_text=x_label_str, row=5, col=1)
     if len(cum_time_err_plot) > 0:
         _cte_lo = float(np.nanmin(cum_time_err_plot))
         _cte_hi = float(np.nanmax(cum_time_err_plot))
@@ -1345,3 +1237,29 @@ with tab_ideal:
              round(float(np.sqrt(np.nanmean(jerk_ideal_ms**2))), 3)),
     ]
     st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True, hide_index=True)
+
+    # g-force reference
+    with st.expander("Reference: g-force scale"):
+        st.markdown("""
+| Acceleration | ft/s² | Example |
+|---|---|---|
+| 0.05 g | 1.6 | Gentle highway merge |
+| 0.10 g | 3.2 | Moderate acceleration |
+| 0.20 g | 6.4 | Spirited driving |
+| 0.30 g | 9.7 | Firm braking |
+| 0.50 g | 16.1 | Hard braking |
+| 1.00 g | 32.2 | Maximum traction limit |
+
+**Jerk** (rate of change of acceleration) matters for ride quality and the
+ability to make smooth speed adjustments — critical in a time-distance rally
+where abrupt throttle/brake inputs cause overshoot.
+        """)
+
+    # Raw data expander
+    with st.expander("Raw data for this run"):
+        show_cols = ["Elapsed time (sec)", "t_rel", "d_rel_mi",
+                     "Speed (mph)", "speed_smooth",
+                     "accel_ft_s2", "accel_g", "jerk_ft_s3",
+                     "Latitude", "Longitude", "Accuracy (ft)"]
+        st.dataframe(grp[[c for c in show_cols if c in grp.columns]].round(4),
+                     use_container_width=True)
