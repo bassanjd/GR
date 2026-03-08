@@ -66,11 +66,17 @@ def compute_derivatives(df: pd.DataFrame, smooth_window: int) -> pd.DataFrame:
 
 
 def segment_exercise_runs(df: pd.DataFrame, lat_thresh: float,
-                          min_speed: float, min_rows: int) -> list[dict]:
+                          min_speed: float, min_rows: int,
+                          trap_east: float | None = None,
+                          trap_west: float | None = None) -> list[dict]:
     """
     Isolate the southern exercise area and split into individual runs.
     A new run boundary is declared when speed drops below min_speed OR when
     there is a time gap > 30 s between consecutive GPS fixes.
+
+    Target speed: each GPS sample between the traps is rounded to the nearest
+    5 mph; the most frequent (mode) value is used as the target.  Falls back
+    to the mode over the full moving portion when trap positions are unknown.
     """
     south = df[df["Latitude"] < lat_thresh].copy().reset_index(drop=True)
     if south.empty:
@@ -92,13 +98,31 @@ def segment_exercise_runs(df: pd.DataFrame, lat_thresh: float,
         if len(moving) < min_rows:
             continue
         mean_spd = moving["Speed (mph)"].mean()
-        max_spd  = moving["Speed (mph)"].max()
-        # Use steady-state (cruise) portion — majority where speed ≥ 75% of max
-        cruise   = moving[moving["Speed (mph)"] >= 0.75 * max_spd]
-        cruise_spd = cruise["Speed (mph)"].mean() if not cruise.empty else mean_spd
-        target = round(cruise_spd / 5) * 5
+
+        # Determine direction so we know which trap is entry vs exit
         lon_delta = grp["Longitude"].iloc[-1] - grp["Longitude"].iloc[0]
-        direction = "West" if lon_delta < 0 else "East"
+        going_west = lon_delta < 0
+
+        # Restrict to measured section when trap positions are available
+        speed_pool = moving
+        if trap_east is not None and trap_west is not None:
+            en_lon = trap_east if going_west else trap_west
+            ex_lon = trap_west if going_west else trap_east
+            en_d = find_crossing_dist(grp, en_lon, going_west)
+            ex_d = find_crossing_dist(grp, ex_lon, going_west)
+            if en_d is not None and ex_d is not None:
+                d_lo, d_hi = min(en_d, ex_d), max(en_d, ex_d)
+                trap_section = moving[
+                    (moving["Distance (mi)"] >= d_lo) &
+                    (moving["Distance (mi)"] <= d_hi)
+                ]
+                if not trap_section.empty:
+                    speed_pool = trap_section
+
+        # Mode of per-sample speeds rounded to nearest 5 mph
+        rounded = (speed_pool["Speed (mph)"] / 5).round() * 5
+        target = int(rounded.mode().iloc[0])
+        direction = "West" if going_west else "East"
         distance = abs(grp["Distance (mi)"].iloc[-1] - grp["Distance (mi)"].iloc[0])
         runs.append({
             "seg_id": seg_id,
@@ -234,7 +258,8 @@ with st.sidebar:
         "West trap lon", _lon_min, _lon_max, _trap_west_def, step=0.0005, format="%.4f",
         help="Western boundary of the measured distance (lower/more-negative lon)."
     )
-runs = segment_exercise_runs(df_raw, lat_threshold, min_speed, min_rows)
+runs = segment_exercise_runs(df_raw, lat_threshold, min_speed, min_rows,
+                             trap_east=trap_east, trap_west=trap_west)
 
 # ── Transit segments (pre-compute before tabs) ────────────────────────────────
 ex_mask = df_raw["Latitude"] < lat_threshold
@@ -249,6 +274,37 @@ df_inbound  = df_raw[df_raw["Elapsed time (sec)"] >  (ex_end_elapsed   or float(
 df_outbound["Leg"] = "To Exercise"
 df_inbound["Leg"]  = "From Exercise"
 df_transit = pd.concat([df_outbound, df_inbound]).reset_index(drop=True)
+
+# ── Range helpers (used in multiple tabs) ─────────────────────────────────────
+
+def _sym_range(arr: np.ndarray, pad: float = 0.15,
+               min_half: float = 0.5, zero: bool = False) -> list:
+    """Min/max range with fractional padding; optionally force zero in range."""
+    vals = arr[np.isfinite(arr)]
+    if len(vals) == 0:
+        return [-min_half, min_half]
+    lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+    if zero:
+        lo, hi = min(lo, 0.0), max(hi, 0.0)
+    span = max(hi - lo, min_half * 2)
+    p = span * pad
+    return [lo - p, hi + p]
+
+
+def _pct_range(arr: np.ndarray, pct: float = 2, pad: float = 0.15,
+               min_half: float = 1.0, zero: bool = True) -> list:
+    """Percentile-clipped range (clips derivative spikes); optionally force zero."""
+    vals = arr[np.isfinite(arr)]
+    if len(vals) == 0:
+        return [-min_half, min_half]
+    lo = float(np.percentile(vals, pct))
+    hi = float(np.percentile(vals, 100 - pct))
+    if zero:
+        lo, hi = min(lo, 0.0), max(hi, 0.0)
+    span = max(hi - lo, min_half * 2)
+    p = span * pad
+    return [lo - p, hi + p]
+
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
@@ -415,18 +471,63 @@ with tab_overview:
 
     # Summary table
     st.subheader("Run Summary (measured section only)")
+
+    # Pass 1: compute derivatives and cache on every run
+    for r in runs:
+        if "_grp_with_derivs" not in r:
+            grp = r["data"].copy()
+            grp = compute_derivatives(grp, smooth_window)
+            r["_grp_with_derivs"] = grp
+
+    # Build the peer acceleration model once from all standing-start runs.
+    # Normalised speed-vs-distance profiles aligned at trap entry, pointwise median.
+    _ov_standing = [r for r in runs if run_start_type(r) == "Standing"]
+    _ov_accel_profs = []
+    for _r_p in _ov_standing:
+        _grp_p  = _r_p["_grp_with_derivs"]
+        _gw_p   = _r_p["direction"] == "West"
+        _en_p   = find_crossing_dist(_grp_p, trap_east if _gw_p else trap_west, _gw_p)
+        if _en_p is None:
+            continue
+        _d_p  = _grp_p["Distance (mi)"].to_numpy()
+        _v_p  = _grp_p["speed_smooth"].to_numpy()
+        _vt_p = float(_r_p["target_speed"])
+        _daln = _d_p - _en_p
+        _ph   = (_daln >= -0.05) & (_v_p < 1.01 * _vt_p)
+        if _ph.sum() < 5:
+            continue
+        _ds = _daln[_ph]; _vn = np.clip(_v_p[_ph] / _vt_p, 0.0, 1.05)
+        _si = np.argsort(_ds)
+        _ov_accel_profs.append((_ds[_si], _vn[_si]))
+
+    if _ov_accel_profs:
+        _ov_d_end  = max(p[0][-1] for p in _ov_accel_profs)
+        _OV_DGRID  = np.linspace(0.0, _ov_d_end, 400)
+        _ov_all_v  = np.vstack([
+            np.clip(np.interp(_OV_DGRID, d, v, left=v[0], right=1.0), 0.0, 1.05)
+            for d, v in _ov_accel_profs
+        ])
+        _ov_v_nrm  = np.median(_ov_all_v, axis=0)   # normalised [0,1]
+    else:
+        _OV_DGRID = _ov_v_nrm = None
+
+    # Pass 2: per-run summary stats + cumulative time error
     summary_rows = []
     for i, r in enumerate(runs):
-        grp = r["data"].copy()
-        grp = compute_derivatives(grp, smooth_window)
-        r["_grp_with_derivs"] = grp   # cache for reuse in detail tab
+        grp = r["_grp_with_derivs"]
 
-        # Clip to the measured section between the two traps
-        gw = r["direction"] == "West"
+        # Trap crossings with geometric fallback (same as detail tab)
+        gw     = r["direction"] == "West"
         en_lon = trap_east if gw else trap_west
         ex_lon = trap_west if gw else trap_east
-        en_d = find_crossing_dist(grp, en_lon, gw)
-        ex_d = find_crossing_dist(grp, ex_lon, gw)
+        en_d   = find_crossing_dist(grp, en_lon, gw)
+        ex_d   = find_crossing_dist(grp, ex_lon, gw)
+        _lat_r = float(np.radians(r["data"]["Latitude"].mean()))
+        _geo   = abs(trap_east - trap_west) * 69.172 * float(np.cos(_lat_r))
+        if en_d is None and ex_d is not None:
+            en_d = ex_d - _geo
+        if ex_d is None and en_d is not None:
+            ex_d = en_d + _geo
 
         if en_d is not None and ex_d is not None:
             d_lo, d_hi = min(en_d, ex_d), max(en_d, ex_d)
@@ -434,19 +535,53 @@ with tab_overview:
                 (grp["Distance (mi)"] >= d_lo) & (grp["Distance (mi)"] <= d_hi)
             ]
         else:
-            section = grp   # fallback: no trap data, use whole run
+            section = grp
 
-        section = section[section["Speed (mph)"] >= min_speed]
-        spd_err = section["Speed (mph)"] - r["target_speed"]
+        section    = section[section["Speed (mph)"] >= min_speed]
+        spd_err    = section["Speed (mph)"] - r["target_speed"]
         measured_dist = (d_hi - d_lo) if (en_d is not None and ex_d is not None) else r["distance_mi"]
 
         if section.empty:
             continue
 
+        # ── Cumulative time error at exit (same method as detail tab) ─────────
+        time_err_s = None
+        if en_d is not None and ex_d is not None:
+            _d_arr    = grp["Distance (mi)"].to_numpy()
+            _v_arr    = grp["speed_smooth"].to_numpy()
+            _d_aln    = _d_arr - en_d
+            _trap_len = ex_d - en_d
+            _tmask    = (_d_aln >= 0) & (_d_aln <= _trap_len)
+            if _tmask.sum() >= 3:
+                _si       = np.argsort(_d_aln[_tmask])
+                _d_s      = _d_aln[_tmask][_si]
+                _v_act    = np.where(_v_arr[_tmask][_si] > 1.0,
+                                     _v_arr[_tmask][_si], np.nan)
+                _target_f = float(r["target_speed"])
+
+                if run_start_type(r) == "Flying" or _OV_DGRID is None:
+                    _v_id = np.full(len(_d_s), _target_f)
+                else:
+                    _v_id = np.clip(
+                        np.interp(_d_s, _OV_DGRID, _ov_v_nrm * _target_f,
+                                  left=np.nan, right=np.nan),
+                        0.0, _target_f,
+                    )
+
+                _v_id  = np.where(_v_id > 1.0, _v_id, np.nan)
+                _dd    = np.diff(_d_s, prepend=_d_s[0])
+                _dt    = np.nan_to_num(
+                    (1.0 / _v_id - 1.0 / _v_act) * _dd * 3600.0, nan=0.0
+                )
+                time_err_s = round(float(np.sum(_dt)), 2)
+
         summary_rows.append({
             "Run": i + 1,
             "Direction": r["direction"],
             "Target (mph)": r["target_speed"],
+            "Start": run_start_type(r),
+            "Finish": run_finish_type(r),
+            "Time err at exit (s)": time_err_s,
             "Mean speed (mph)": round(float(section["Speed (mph)"].mean()), 1),
             "Max speed (mph)": round(float(section["Speed (mph)"].max()), 1),
             "Speed RMS err (mph)": round(float(np.sqrt((spd_err ** 2).mean())), 2),
@@ -493,8 +628,9 @@ with tab_overview:
     # Trap-aligned speed comparison
     st.subheader("Measured Section Comparison — Aligned at Trap Entry")
     st.caption(
-        f"X = 0 at trap entry | vertical line = trap exit "
-        f"(east trap {trap_east:.4f}, west trap {trap_west:.4f})"
+        f"X = 0 at trap entry | dashed red line = trap exit (median length). "
+        f"East trap {trap_east:.4f}, west trap {trap_west:.4f}. "
+        f"Exit distance uses geometric fallback when GPS data ends before exit trap."
     )
     fig_trap = go.Figure()
     trap_lengths = []
@@ -508,13 +644,21 @@ with tab_overview:
         entry_dist = find_crossing_dist(grp, entry_lon, going_west)
         exit_dist  = find_crossing_dist(grp, exit_lon,  going_west)
 
+        # Geometric fallback for missing trap crossing (same logic as detail tab)
+        _lat_rad = float(np.radians(r["data"]["Latitude"].mean()))
+        _mi_per_deg = 69.172 * float(np.cos(_lat_rad))
+        _geo_trap_len = abs(trap_east - trap_west) * _mi_per_deg
+        if entry_dist is None and exit_dist is not None:
+            entry_dist = exit_dist - _geo_trap_len
+        if exit_dist is None and entry_dist is not None:
+            exit_dist = entry_dist + _geo_trap_len
+
         if entry_dist is None:
             continue
 
         d_aligned = grp["Distance (mi)"] - entry_dist
 
-        if exit_dist is not None:
-            trap_lengths.append(abs(exit_dist - entry_dist))
+        trap_lengths.append(abs(exit_dist - entry_dist))
 
         fig_trap.add_trace(go.Scatter(
             x=d_aligned,
@@ -668,12 +812,12 @@ with tab_transit:
 
     colors_transit = {"To Exercise": "#457b9d", "From Exercise": "#e76f51"}
 
-    # ── Summary metrics ───────────────────────────────────────────────────────
+    # ── Summary table ─────────────────────────────────────────────────────────
     def leg_stats(leg_df: pd.DataFrame, label: str) -> dict:
         moving = leg_df[leg_df["Speed (mph)"] > 2]
         if moving.empty:
             return {}
-        dist = leg_df["Distance (mi)"].iloc[-1] - leg_df["Distance (mi)"].iloc[0]
+        dist  = leg_df["Distance (mi)"].iloc[-1] - leg_df["Distance (mi)"].iloc[0]
         dur_s = leg_df["Elapsed time (sec)"].iloc[-1] - leg_df["Elapsed time (sec)"].iloc[0]
         return {
             "Leg": label,
@@ -681,7 +825,6 @@ with tab_transit:
             "Duration (min)": round(dur_s / 60, 1),
             "Avg speed (mph)": round(moving["Speed (mph)"].mean(), 1),
             "Max speed (mph)": round(moving["Speed (mph)"].max(), 1),
-            "Rows": len(leg_df),
         }
 
     stats_rows = [s for s in [leg_stats(df_outbound, "To Exercise"),
@@ -690,156 +833,101 @@ with tab_transit:
         st.subheader("Transit Summary")
         st.dataframe(pd.DataFrame(stats_rows), use_container_width=True, hide_index=True)
 
-    # ── Map ───────────────────────────────────────────────────────────────────
-    st.subheader("Transit Route")
-    tr_map_style = st.radio(
-        "Transit map style", ["Street (carto)", "Satellite (ESRI)"],
-        horizontal=True, key="transit_map_style", label_visibility="collapsed"
-    )
-    tr_satellite = tr_map_style == "Satellite (ESRI)"
-
-    df_transit_plot = df_transit.iloc[::3].copy()  # downsample
-    fig_tr_map = px.scatter_map(
-        df_transit_plot,
-        lat="Latitude", lon="Longitude",
-        color="Leg",
-        color_discrete_map=colors_transit,
-        hover_data={"Speed (mph)": ":.1f", "Time": True, "Date": True,
-                    "Elapsed time (sec)": True},
-        zoom=10,
-        map_style="white-bg" if tr_satellite else "carto-positron",
-        title="Transit Route — To Exercise & From Exercise",
-    )
-    fig_tr_map.update_traces(marker=dict(size=3))
-    if tr_satellite:
-        fig_tr_map.update_layout(map=dict(layers=[{
-            "below": "traces", "sourcetype": "raster",
-            "source": ["https://server.arcgisonline.com/ArcGIS/rest/services/"
-                       "World_Imagery/MapServer/tile/{z}/{y}/{x}"],
-            "sourceattribution": "Tiles &copy; Esri",
-        }]))
-    fig_tr_map.update_layout(height=520, margin=dict(l=0, r=0, t=40, b=0))
-    st.plotly_chart(fig_tr_map, use_container_width=True)
-
-    # ── Speed vs distance ─────────────────────────────────────────────────────
-    st.subheader("Speed Profile")
-    fig_tr_spd = go.Figure()
-    for leg_label, leg_df in [("To Exercise", df_outbound), ("From Exercise", df_inbound)]:
+    # ── Compute derivatives per leg ───────────────────────────────────────────
+    tr_legs = []
+    for leg_label, leg_df, color in [
+        ("To Exercise",   df_outbound, "#457b9d"),
+        ("From Exercise", df_inbound,  "#e76f51"),
+    ]:
         if leg_df.empty:
             continue
-        d0 = leg_df["Distance (mi)"].iloc[0]
-        fig_tr_spd.add_trace(go.Scatter(
-            x=leg_df["Distance (mi)"] - d0,
-            y=leg_df["Speed (mph)"],
-            mode="lines",
-            name=leg_label,
-            line=dict(color=colors_transit[leg_label], width=1.5),
-            opacity=0.8,
-        ))
-    fig_tr_spd.update_layout(
-        xaxis_title="Distance from leg start (mi)",
-        yaxis_title="Speed (mph)",
-        height=380,
-        legend=dict(orientation="h"),
+        sub = compute_derivatives(leg_df.copy(), smooth_window)
+        t0  = sub["Elapsed time (sec)"].iloc[0]
+        d0  = sub["Distance (mi)"].iloc[0]
+        sub["t_rel"] = sub["Elapsed time (sec)"] - t0
+        sub["d_rel"] = sub["Distance (mi)"] - d0
+        tr_legs.append({"label": leg_label, "df": sub, "color": color})
+
+    # ── X-axis selector ───────────────────────────────────────────────────────
+    tr_use_time = st.radio(
+        "X axis", ["Distance from leg start", "Time from leg start"],
+        horizontal=True, key="transit_xaxis",
+    ) == "Time from leg start"
+    x_col   = "t_rel" if tr_use_time else "d_rel"
+    x_label = ("Time from leg start (s)"
+                if tr_use_time else "Distance from leg start (mi)")
+
+    # ── 3-panel subplot: Speed / Acceleration / Jerk ──────────────────────────
+    fig_tr = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.38, 0.31, 0.31],
+        vertical_spacing=0.04,
+        subplot_titles=["Speed (mph)", "Acceleration (ft/s²)", "Jerk (ft/s³)"],
     )
-    st.plotly_chart(fig_tr_spd, use_container_width=True)
 
-    # ── Speed histogram ───────────────────────────────────────────────────────
-    st.subheader("Speed Distribution")
-    fig_hist = go.Figure()
-    for leg_label, leg_df in [("To Exercise", df_outbound), ("From Exercise", df_inbound)]:
-        moving = leg_df[leg_df["Speed (mph)"] > 2]
-        if moving.empty:
-            continue
-        fig_hist.add_trace(go.Histogram(
-            x=moving["Speed (mph)"],
-            name=leg_label,
-            nbinsx=40,
-            marker_color=colors_transit[leg_label],
-            opacity=0.6,
-        ))
-    fig_hist.update_layout(
-        barmode="overlay",
-        xaxis_title="Speed (mph)",
-        yaxis_title="GPS samples",
-        height=320,
-        legend=dict(orientation="h"),
-    )
-    st.plotly_chart(fig_hist, use_container_width=True)
+    _all_spd = _all_acc = _all_jrk = np.array([])
+    for leg in tr_legs:
+        sub   = leg["df"]
+        color = leg["color"]
+        label = leg["label"]
+        x     = sub[x_col].to_numpy()
+        moving_mask = sub["Speed (mph)"] > 2
 
-    # ── Acceleration & jerk ───────────────────────────────────────────────────
-    st.subheader("Acceleration & Jerk (Transit)")
-    tr_with_derivs = compute_derivatives(df_transit, smooth_window)
-    tr_moving = tr_with_derivs[tr_with_derivs["Speed (mph)"] > 2]
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        fig_acc_box = go.Figure()
-        for leg_label in ["To Exercise", "From Exercise"]:
-            sub = tr_moving[tr_moving["Leg"] == leg_label]
-            if sub.empty:
-                continue
-            fig_acc_box.add_trace(go.Box(
-                y=sub["accel_ft_s2"],
-                name=leg_label,
-                marker_color=colors_transit[leg_label],
-                boxmean="sd",
-            ))
-        fig_acc_box.update_layout(
-            title="Acceleration (ft/s²)",
-            yaxis_title="ft/s²",
-            height=320,
+        # Row 1 — Speed: raw (faint) + smoothed
+        fig_tr.add_trace(go.Scatter(
+            x=x, y=sub["Speed (mph)"],
+            name=f"{label} (raw)", mode="lines",
+            line=dict(color=color, width=1), opacity=0.35,
             showlegend=False,
-        )
-        st.plotly_chart(fig_acc_box, use_container_width=True)
-
-    with col_b:
-        fig_jrk_box = go.Figure()
-        for leg_label in ["To Exercise", "From Exercise"]:
-            sub = tr_moving[tr_moving["Leg"] == leg_label]
-            if sub.empty:
-                continue
-            fig_jrk_box.add_trace(go.Box(
-                y=sub["jerk_ft_s3"],
-                name=leg_label,
-                marker_color=colors_transit[leg_label],
-                boxmean="sd",
-            ))
-        fig_jrk_box.update_layout(
-            title="Jerk (ft/s³)",
-            yaxis_title="ft/s³",
-            height=320,
-            showlegend=False,
-        )
-        st.plotly_chart(fig_jrk_box, use_container_width=True)
-
-    # Accel/jerk over time
-    fig_tr_deriv = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                  subplot_titles=["Acceleration (ft/s²)", "Jerk (ft/s³)"],
-                                  vertical_spacing=0.1)
-    for leg_label, leg_df in [("To Exercise", df_outbound), ("From Exercise", df_inbound)]:
-        if leg_df.empty:
-            continue
-        sub = compute_derivatives(leg_df, smooth_window)
-        d0 = sub["Distance (mi)"].iloc[0]
-        x = sub["Distance (mi)"] - d0
-        fig_tr_deriv.add_trace(go.Scatter(
-            x=x, y=sub["accel_ft_s2"], mode="lines",
-            name=leg_label, line=dict(color=colors_transit[leg_label], width=1.5),
-            showlegend=True,
         ), row=1, col=1)
-        fig_tr_deriv.add_trace(go.Scatter(
-            x=x, y=sub["jerk_ft_s3"], mode="lines",
-            name=leg_label, line=dict(color=colors_transit[leg_label], width=1.5),
+        fig_tr.add_trace(go.Scatter(
+            x=x, y=sub["speed_smooth"],
+            name=label, mode="lines",
+            line=dict(color=color, width=2),
+        ), row=1, col=1)
+
+        # Row 2 — Acceleration
+        fig_tr.add_trace(go.Scatter(
+            x=x, y=sub["accel_ft_s2"],
+            name=f"{label} accel", mode="lines",
+            line=dict(color=color, width=2),
             showlegend=False,
         ), row=2, col=1)
-    fig_tr_deriv.add_hline(y=0, line_dash="dot", line_color="gray", row=1, col=1)
-    fig_tr_deriv.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
-    fig_tr_deriv.update_xaxes(title_text="Distance from leg start (mi)", row=2, col=1)
-    fig_tr_deriv.update_yaxes(title_text="ft/s²", row=1, col=1)
-    fig_tr_deriv.update_yaxes(title_text="ft/s³", row=2, col=1)
-    fig_tr_deriv.update_layout(height=500, legend=dict(orientation="h"))
-    st.plotly_chart(fig_tr_deriv, use_container_width=True)
+
+        # Row 3 — Jerk
+        fig_tr.add_trace(go.Scatter(
+            x=x, y=sub["jerk_ft_s3"],
+            name=f"{label} jerk", mode="lines",
+            line=dict(color=color, width=2),
+            showlegend=False,
+        ), row=3, col=1)
+
+        mv = sub[moving_mask]
+        _all_spd = np.concatenate([_all_spd, mv["speed_smooth"].to_numpy()])
+        _all_acc = np.concatenate([_all_acc, mv["accel_ft_s2"].to_numpy()])
+        _all_jrk = np.concatenate([_all_jrk, mv["jerk_ft_s3"].to_numpy()])
+
+    fig_tr.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+    fig_tr.add_hline(y=0, line_dash="dot", line_color="gray", row=3, col=1)
+    fig_tr.update_xaxes(title_text=x_label, row=3, col=1)
+    fig_tr.update_yaxes(
+        title_text="mph",
+        range=_sym_range(_all_spd, pad=0.08, min_half=5.0),
+        row=1, col=1,
+    )
+    fig_tr.update_yaxes(
+        title_text="ft/s²",
+        range=_pct_range(_all_acc, pct=1, pad=0.15, min_half=1.0, zero=True),
+        row=2, col=1,
+    )
+    fig_tr.update_yaxes(
+        title_text="ft/s³",
+        range=_pct_range(_all_jrk, pct=1, pad=0.15, min_half=1.0, zero=True),
+        row=3, col=1,
+    )
+    fig_tr.update_layout(height=820, legend=dict(orientation="h", y=-0.06))
+    st.plotly_chart(fig_tr, use_container_width=True)
 
 # ── Idealized Run comparison — continues inside the Run Detail tab ─────────────
 with tab_detail:
@@ -1255,31 +1343,6 @@ with tab_detail:
     else:
         _cte_range = [-1, 1]
     fig_ideal.update_yaxes(title_text="sec", range=_cte_range, row=1, col=1)
-    def _sym_range(arr, pad=0.15, min_half=0.5, zero=False):
-        """Min/max range with fractional padding; optionally force zero in range."""
-        vals = arr[np.isfinite(arr)]
-        if len(vals) == 0:
-            return [-min_half, min_half]
-        lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
-        if zero:
-            lo, hi = min(lo, 0.0), max(hi, 0.0)
-        span = max(hi - lo, min_half * 2)
-        p = span * pad
-        return [lo - p, hi + p]
-
-    def _pct_range(arr, pct=2, pad=0.15, min_half=1.0, zero=True):
-        """Percentile-clipped range (clips derivative spikes); optionally force zero."""
-        vals = arr[np.isfinite(arr)]
-        if len(vals) == 0:
-            return [-min_half, min_half]
-        lo = float(np.percentile(vals, pct))
-        hi = float(np.percentile(vals, 100 - pct))
-        if zero:
-            lo, hi = min(lo, 0.0), max(hi, 0.0)
-        span = max(hi - lo, min_half * 2)
-        p = span * pad
-        return [lo - p, hi + p]
-
     # Mask ideal-grid arrays to trap section for range calculations
     _grid_trap = (d_grid >= 0) & (d_grid <= (trap_exit_d if trap_exit_d is not None else np.inf))
 
