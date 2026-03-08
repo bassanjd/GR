@@ -11,7 +11,7 @@ from pathlib import Path
 
 st.set_page_config(page_title="Team Ownby Analysis", layout="wide", page_icon="🏁")
 
-PARQUET = Path(__file__).parent / "Output" / "long_format_times.parquet"
+PARQUET = Path(__file__).parent / "long_format_times.parquet"
 OWNBY_CAR = 123
 
 # Stage route descriptions (from stage notes PDFs)
