@@ -189,8 +189,8 @@ def load_track(path: str) -> pd.DataFrame:
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-st.title("Speed Tracker — Acceleration & Jerk Analysis")
-st.caption("Practice run evaluation")
+st.title("Practice run evaluation")
+st.caption("Analyze GPS logs from the Speed Tracker app to evaluate acceleration, jerk, and run quality.")
 
 pq_files  = sorted(DATALOGS.glob("*.parquet"), reverse=True)
 csv_files = sorted(DATALOGS.glob("*.csv"),     reverse=True)
