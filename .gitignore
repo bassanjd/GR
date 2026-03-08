@@ -40,3 +40,9 @@ env/
 *.swo
 *~
 .DS_Store
+
+# Secrets
+.env
+Output/claude_cache/
+Practice/DataLogs/speed_tracker_07_Mar_2026_11_23_00.csv
+Results/raw_data/
