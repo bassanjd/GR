@@ -268,6 +268,31 @@ def run_start_type(r: dict) -> str:
     return "Flying" if v_entry >= 0.5 * r["target_speed"] else "Standing"
 
 
+def run_finish_type(r: dict) -> str:
+    """Return 'Standing' or 'Flying' based on smoothed speed at trap exit.
+
+    The run segment ends at the last *moving* row before the car stops, so the
+    GPS data often doesn't reach the exit trap longitude.  When the crossing
+    can't be found we fall back to the speed at the end of the segment: if the
+    car is still fast it was a flying finish; if it decelerated to near-stop it
+    was a standing finish.
+    """
+    grp = r.get("_grp_with_derivs")
+    if grp is None:
+        grp = r["data"]
+    gw     = r["direction"] == "West"
+    ex_lon = trap_west if gw else trap_east
+    ex_d   = find_crossing_dist(grp, ex_lon, gw)
+    v_col  = "speed_smooth" if "speed_smooth" in grp.columns else "Speed (mph)"
+    if ex_d is not None:
+        v_exit = float(np.interp(ex_d, grp["Distance (mi)"].to_numpy(),
+                                 grp[v_col].to_numpy()))
+    else:
+        # GPS data ended before exit trap — use tail speed as proxy
+        v_exit = float(grp[v_col].iloc[-min(5, len(grp)):].mean())
+    return "Flying" if v_exit >= 0.5 * r["target_speed"] else "Standing"
+
+
 tab_map, tab_overview, tab_detail, tab_transit = st.tabs(
     ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis"]
 )
@@ -573,7 +598,8 @@ with tab_detail:
 
     run_labels = [
         f"Run {i+1}: {r['direction']}  ~{r['target_speed']} mph  "
-        f"[{run_start_type(r)} start]  ({r['start_elapsed']}–{r['end_elapsed']} s)"
+        f"[{run_start_type(r)} start | {run_finish_type(r)} finish]  "
+        f"({r['start_elapsed']}–{r['end_elapsed']} s)"
         for i, r in enumerate(runs)
     ]
     sel_idx = st.selectbox("Select run", range(len(runs)), format_func=lambda i: run_labels[i])
@@ -838,6 +864,18 @@ with tab_detail:
     is_flying  = speed_at_entry >= 0.5 * ri["target_speed"]
     start_type = "Flying start" if is_flying else "Standstill start"
 
+    # Finish type: speed at trap exit (or tail speed if GPS ended before exit)
+    _d_i        = grp_i["Distance (mi)"].to_numpy()
+    _v_smooth_i = grp_i["speed_smooth"].to_numpy()
+    _exit_raw   = find_crossing_dist(grp_i, exit_lon_r, going_west)
+    if _exit_raw is not None:
+        speed_at_exit = float(np.interp(_exit_raw, _d_i, _v_smooth_i))
+    else:
+        # GPS ended before exit trap — tail mean as proxy (same as run_finish_type)
+        speed_at_exit = float(grp_i["speed_smooth"].iloc[-min(5, len(grp_i)):].mean())
+    is_flying_finish = speed_at_exit >= 0.5 * ri["target_speed"]
+    finish_type      = "Flying finish" if is_flying_finish else "Standstill finish"
+
     # ── Selected run aligned at trap entry ────────────────────────────────────
     _d_arr = grp_i["Distance (mi)"].to_numpy()
     _t_arr = grp_i["Elapsed time (sec)"].to_numpy()
@@ -861,11 +899,13 @@ with tab_detail:
     if is_flying:
         # ── Flying start: ideal = constant target speed, zero accel/jerk ─────
         col_info1, col_info2 = st.columns(2)
-        col_info1.info(f"Detected start type: **{start_type}** "
-                       f"(speed at trap entry ≈ {speed_at_entry:.1f} mph)")
+        col_info1.info(
+            f"Start: **{start_type}** (speed at entry ≈ {speed_at_entry:.1f} mph)  |  "
+            f"Finish: **{finish_type}** (speed at exit ≈ {speed_at_exit:.1f} mph)"
+        )
         col_info2.info(
-            f"Flying start — ideal is constant **{ri['target_speed']} mph** "
-            f"with zero acceleration and jerk."
+            f"Flying start — ideal is constant **{ri['target_speed']} mph** through the "
+            f"trap" + (" then decelerates to rest." if not is_flying_finish else " with zero acceleration and jerk.")
         )
 
         d_grid         = np.linspace(d_run_min, d_run_max, GRID_N)
@@ -884,16 +924,25 @@ with tab_detail:
         peer_labels_str = ", ".join(f"R{runs.index(r)+1} {r['direction']}" for r in all_standing)
 
         col_info1, col_info2 = st.columns(2)
-        col_info1.info(f"Detected start type: **{start_type}** "
-                       f"(speed at trap entry ≈ {speed_at_entry:.1f} mph)")
+        col_info1.info(
+            f"Start: **{start_type}** (speed at entry ≈ {speed_at_entry:.1f} mph)  |  "
+            f"Finish: **{finish_type}** (speed at exit ≈ {speed_at_exit:.1f} mph)"
+        )
         col_info2.info(
             f"Acceleration model built from {len(all_standing)} standing-start run(s): "
             f"{peer_labels_str}"
         )
 
-        # Collect (v_ratio = v/v_target, accel_ft_s2) from the acceleration
-        # phase of every standing-start run (trap entry → 95% of target speed)
-        model_pts = []   # list of (v_ratio, accel_ft_s2)
+        # ── Acceleration model: direct speed-profile median ───────────────────
+        # Collect normalised speed-vs-distance profiles from every standing-start
+        # peer run, aligned at trap entry (d=0).  Taking the pointwise median
+        # avoids ODE integration and the noise that comes from differentiating
+        # GPS speed data twice to get acceleration.
+        target_f       = float(ri["target_speed"])
+        trap_exit_d_ext = (exit_d_i - entry_d_i) \
+                          if (entry_d_i is not None and exit_d_i is not None) else 0.25
+
+        accel_profs = []   # list of (d_aligned, v_normalised) arrays
         for r_p in all_standing:
             grp_p = r_p.get("_grp_with_derivs")
             if grp_p is None:
@@ -903,87 +952,133 @@ with tab_detail:
             entry_d_p   = find_crossing_dist(grp_p, entry_lon_p, gw_p)
             if entry_d_p is None:
                 continue
-            d_aln_p = (grp_p["Distance (mi)"] - entry_d_p).to_numpy()
-            v_col   = "speed_smooth" if "speed_smooth" in grp_p.columns else "Speed (mph)"
-            v_p     = grp_p[v_col].to_numpy()
-            a_p     = grp_p["accel_ft_s2"].to_numpy() if "accel_ft_s2" in grp_p.columns else np.zeros(len(grp_p))
-            vt_p    = float(r_p["target_speed"])
-            # Acceleration phase: from trap entry until speed reaches 95% of target
-            phase   = (d_aln_p >= 0) & (v_p < 0.95 * vt_p)
-            if not phase.any():
-                continue
-            vr = v_p[phase] / vt_p
-            ac = a_p[phase]
-            valid = np.isfinite(vr) & np.isfinite(ac) & (ac > 0) & (vr >= 0) & (vr <= 1)
-            if valid.sum() < 3:
-                continue
-            model_pts.append(np.column_stack([vr[valid], ac[valid]]))
+            d_p   = grp_p["Distance (mi)"].to_numpy()
+            v_col = "speed_smooth" if "speed_smooth" in grp_p.columns else "Speed (mph)"
+            v_p   = grp_p[v_col].to_numpy()
+            vt_p  = float(r_p["target_speed"])
 
-        if not model_pts:
-            st.warning("Not enough standing-start acceleration data to build model.")
+            d_aln = d_p - entry_d_p
+            # Keep from slightly before entry through to target speed
+            phase = (d_aln >= -0.05) & (v_p < 1.01 * vt_p)
+            if phase.sum() < 5:
+                continue
+            d_sl  = d_aln[phase]
+            v_nrm = np.clip(v_p[phase] / vt_p, 0.0, 1.05)
+            s_idx = np.argsort(d_sl)
+            accel_profs.append((d_sl[s_idx], v_nrm[s_idx]))
+
+        if not accel_profs:
+            st.warning("Not enough standing-start data to build acceleration model.")
             st.stop()
 
-        all_pts = np.vstack(model_pts)   # shape (N, 2): [v_ratio, accel_ft_s2]
+        # Common distance grid from trap entry to just past trap exit
+        _d_end_acc = max(p[0][-1] for p in accel_profs)
+        D_IDEAL    = np.linspace(0.0, min(_d_end_acc, trap_exit_d_ext * 1.5), 400)
 
-        # Bin by v_ratio, compute median accel per bin → a_model(v_ratio)
-        N_BINS    = 20
-        bin_edges = np.linspace(0.0, 1.0, N_BINS + 1)
-        bin_ctrs  = (bin_edges[:-1] + bin_edges[1:]) / 2
-        bin_ids   = np.clip(np.digitize(all_pts[:, 0], bin_edges[:-1]) - 1, 0, N_BINS - 1)
-        med_accel = np.array([
-            float(np.median(all_pts[bin_ids == b, 1])) if (bin_ids == b).any() else 0.0
-            for b in range(N_BINS)
+        _all_v_acc = np.vstack([
+            np.clip(np.interp(D_IDEAL, d, v, left=v[0], right=1.0), 0.0, 1.05)
+            for d, v in accel_profs
         ])
-        med_accel = np.maximum(smooth_series(med_accel, 3), 0.0)   # smooth + non-negative
+        v_nrm_ideal    = np.median(_all_v_acc, axis=0)
+        v_ideal_smooth = np.clip(v_nrm_ideal * target_f, 0.0, target_f)
+        d_grid         = D_IDEAL
 
-        def a_model(vr_val: float) -> float:
-            return float(np.interp(min(vr_val, 0.9999), bin_ctrs, med_accel))
+        # Distance → time via the ideal speed (avoids ODE integration noise)
+        _dd_acc  = np.diff(d_grid, prepend=d_grid[0])
+        _v_safe  = np.maximum(v_ideal_smooth, 0.5)         # mph, avoid /0
+        t_grid   = np.cumsum(_dd_acc / _v_safe * 3600.0)   # seconds from trap entry
 
-        # ── Integrate ideal profile from rest at trap entry ───────────────────
-        DT        = 0.1   # seconds
-        target_f  = float(ri["target_speed"])
-        v_int     = 0.0   # mph
-        t_pts_int, v_pts_int, d_pts_int = [0.0], [0.0], [0.0]
-        for _ in range(int(600 / DT)):
-            vr = v_int / target_f if target_f > 0 else 1.0
-            if vr >= 0.99:
-                break
-            v_int += a_model(vr) * DT / MPH_S_TO_FT_S2          # ft/s² → mph
-            t_pts_int.append(t_pts_int[-1] + DT)
-            v_pts_int.append(min(v_int, target_f))
-            d_pts_int.append(d_pts_int[-1] + v_int * DT / 3600)  # miles
-
-        # Extend at constant target speed to cover the full trap section
-        trap_exit_d_ext = (exit_d_i - entry_d_i) if (entry_d_i is not None and exit_d_i is not None) else d_pts_int[-1] * 1.1
-        if d_pts_int[-1] < trap_exit_d_ext:
-            n_ext = 50
-            d_ext = np.linspace(d_pts_int[-1], trap_exit_d_ext, n_ext + 1)[1:]
-            dt_ext = (d_ext / target_f * 3600)   # cumulative time for each extra point
-            t_ext  = t_pts_int[-1] + (dt_ext - dt_ext[0] + (d_ext[0] - d_pts_int[-1]) / target_f * 3600)
-            t_pts_int.extend(t_ext.tolist())
-            v_pts_int.extend([target_f] * n_ext)
-            d_pts_int.extend(d_ext.tolist())
-
-        d_grid         = np.array(d_pts_int)
-        v_ideal_smooth = np.array(v_pts_int)
-        t_grid         = np.array(t_pts_int)
-
-        # Accel from model; zero once target reached
-        accel_ideal = smooth_series(np.array([
-            a_model(v / target_f) if v < 0.99 * target_f else 0.0
-            for v in v_ideal_smooth
-        ]), smooth_window)
-
-        # Jerk = d(accel)/dt along the ideal time axis
-        jerk_ideal = smooth_series(np.gradient(accel_ideal, t_grid), smooth_window)
+        # Smooth derivatives from the ideal speed profile
+        accel_ideal = smooth_series(
+            np.gradient(v_ideal_smooth * MPH_S_TO_FT_S2, t_grid), smooth_window
+        )
+        jerk_ideal  = smooth_series(np.gradient(accel_ideal, t_grid), smooth_window)
 
         v_band_lo = None
         v_band_hi = None
 
-        residual_label = "Speed Residual — Actual minus Acceleration Model (mph)"
+        residual_label = "Speed Residual — Actual minus Ideal (mph)"
         v_ideal_at_actual = np.interp(d_aligned_i, d_grid, v_ideal_smooth,
                                        left=np.nan, right=np.nan)
         speed_residual = v_actual - v_ideal_at_actual
+
+    # ── Deceleration model (standing finish) ─────────────────────────────────
+    # Same direct-profile approach as the acceleration model: collect normalised
+    # speed-vs-distance profiles from all standing-finish runs, aligned at the
+    # trap exit (d=0), then take the pointwise median.
+    d_decel_ideal = v_decel_ideal = t_decel_ideal = None
+    accel_decel_ideal = jerk_decel_ideal = None
+
+    if not is_flying_finish:
+        all_standing_finish = [r for r in runs if run_finish_type(r) == "Standing"]
+        decel_profs = []
+        for r_p in all_standing_finish:
+            grp_p = r_p.get("_grp_with_derivs")
+            if grp_p is None:
+                grp_p = compute_derivatives(r_p["data"].copy(), smooth_window)
+            gw_p        = r_p["direction"] == "West"
+            entry_lon_p = trap_east if gw_p else trap_west
+            exit_lon_p  = trap_west if gw_p else trap_east
+            vt_p        = float(r_p["target_speed"])
+
+            entry_d_p = find_crossing_dist(grp_p, entry_lon_p, gw_p)
+            exit_d_p  = find_crossing_dist(grp_p, exit_lon_p,  gw_p)
+            # Geometric fallback: many runs end before their GPS crosses exit lon
+            if exit_d_p is None and entry_d_p is not None:
+                _lat_rad = float(np.radians(grp_p["Latitude"].mean()))
+                exit_d_p = entry_d_p + abs(trap_east - trap_west) * 69.172 * float(np.cos(_lat_rad))
+            if exit_d_p is None:
+                continue
+
+            d_p   = grp_p["Distance (mi)"].to_numpy()
+            v_col = "speed_smooth" if "speed_smooth" in grp_p.columns else "Speed (mph)"
+            v_p   = grp_p[v_col].to_numpy()
+
+            d_aln_exit = d_p - exit_d_p
+            phase = d_aln_exit >= -0.01   # from exit onward
+            if phase.sum() < 3:
+                continue
+            d_sl  = d_aln_exit[phase]
+            v_nrm = np.clip(v_p[phase] / vt_p, 0.0, 1.1)
+            s_idx = np.argsort(d_sl)
+            d_sl, v_nrm = d_sl[s_idx], v_nrm[s_idx]
+
+            # Skip if the car wasn't near target speed at exit (partial run)
+            if v_nrm[0] < 0.5:
+                continue
+            decel_profs.append((d_sl, v_nrm))
+
+        if decel_profs:
+            _d_end_dec = max(p[0][-1] for p in decel_profs)
+            D_DECEL    = np.linspace(0.0, _d_end_dec, 300)
+
+            _all_v_dec = np.vstack([
+                np.clip(np.interp(D_DECEL, d, v, left=v[0], right=0.0), 0.0, 1.1)
+                for d, v in decel_profs
+            ])
+            _v_nrm_dec    = np.median(_all_v_dec, axis=0)
+            _target_f     = float(ri["target_speed"])
+            v_decel_ideal = np.clip(_v_nrm_dec * _target_f, 0.0, _target_f)
+
+            # Align decel distance to trap-entry coordinate system
+            _d0_dec       = (exit_d_i - entry_d_i) \
+                            if (exit_d_i is not None and entry_d_i is not None) \
+                            else float(d_grid[-1])
+            d_decel_ideal = D_DECEL + _d0_dec
+
+            # Distance → time via the ideal decel speed
+            _t0_dec       = float(np.interp(_d0_dec, d_grid, t_grid))
+            _dd_dec       = np.diff(d_decel_ideal, prepend=d_decel_ideal[0])
+            _v_s_dec      = np.maximum(v_decel_ideal, 0.1)
+            t_decel_ideal = _t0_dec + np.cumsum(_dd_dec / _v_s_dec * 3600.0)
+
+            # Smooth derivatives
+            accel_decel_ideal = smooth_series(
+                np.gradient(v_decel_ideal * MPH_S_TO_FT_S2, t_decel_ideal), smooth_window
+            )
+            jerk_decel_ideal  = smooth_series(
+                np.gradient(accel_decel_ideal, t_decel_ideal), smooth_window
+            )
 
     # ── Cumulative time error (measured section only) ─────────────────────────
     # Integrate (1/v_ideal − 1/v_actual) × dd × 3600 s/hr between the traps.
@@ -1021,6 +1116,10 @@ with tab_detail:
                       if use_time else _exit_d_aln
     else:
         exit_x_plot = None
+
+    # Decel ideal x-axis (None if no decel model)
+    x_decel = (t_decel_ideal if use_time else d_decel_ideal) \
+              if d_decel_ideal is not None else None
 
     # ── 5-panel subplot ───────────────────────────────────────────────────────
     fig_ideal = make_subplots(
@@ -1064,12 +1163,19 @@ with tab_detail:
             name="Peer range",
             showlegend=True,
         ), row=2, col=1)
-    ideal_name = "Target speed" if is_flying else "Ideal (median peers)"
+    ideal_name = "Target speed" if is_flying else "Ideal accel profile"
     fig_ideal.add_trace(go.Scatter(
         x=x_ideal, y=v_ideal_smooth,
         name=ideal_name, mode="lines",
         line=dict(color="orange", width=2.5, dash="dash"),
     ), row=2, col=1)
+    if x_decel is not None:
+        fig_ideal.add_trace(go.Scatter(
+            x=x_decel, y=v_decel_ideal,
+            name="Ideal decel", mode="lines",
+            line=dict(color="darkorange", width=2.5, dash="dot"),
+            showlegend=True,
+        ), row=2, col=1)
     fig_ideal.add_trace(go.Scatter(
         x=x_actual, y=v_actual,
         name="Actual (smooth)", mode="lines",
@@ -1087,6 +1193,13 @@ with tab_detail:
         name="Ideal accel", mode="lines",
         line=dict(color="darkorange", width=2, dash="dash"),
     ), row=3, col=1)
+    if x_decel is not None:
+        fig_ideal.add_trace(go.Scatter(
+            x=x_decel, y=accel_decel_ideal,
+            name="Ideal decel accel", mode="lines",
+            line=dict(color="darkorange", width=2, dash="dot"),
+            showlegend=False,
+        ), row=3, col=1)
     fig_ideal.add_trace(go.Scatter(
         x=x_actual, y=accel_actual,
         name="Actual accel", mode="lines",
@@ -1100,6 +1213,13 @@ with tab_detail:
         name="Ideal jerk", mode="lines",
         line=dict(color="darkcyan", width=2, dash="dash"),
     ), row=4, col=1)
+    if x_decel is not None:
+        fig_ideal.add_trace(go.Scatter(
+            x=x_decel, y=jerk_decel_ideal,
+            name="Ideal decel jerk", mode="lines",
+            line=dict(color="darkcyan", width=2, dash="dot"),
+            showlegend=False,
+        ), row=4, col=1)
     fig_ideal.add_trace(go.Scatter(
         x=x_actual, y=jerk_actual,
         name="Actual jerk", mode="lines",
