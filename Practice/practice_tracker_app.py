@@ -124,10 +124,12 @@ def segment_exercise_runs(df: pd.DataFrame, lat_thresh: float,
         target = int(rounded.mode().iloc[0])
         direction = "West" if going_west else "East"
         distance = abs(grp["Distance (mi)"].iloc[-1] - grp["Distance (mi)"].iloc[0])
+        _start_time = str(grp["Time"].iloc[0]) if "Time" in grp.columns else ""
         runs.append({
             "seg_id": seg_id,
             "start_elapsed": int(grp["Elapsed time (sec)"].iloc[0]),
             "end_elapsed": int(grp["Elapsed time (sec)"].iloc[-1]),
+            "start_time": _start_time,
             "direction": direction,
             "mean_speed": mean_spd,
             "target_speed": target,
@@ -214,26 +216,22 @@ if not track_files:
     st.error(f"No parquet or CSV files found in {DATALOGS}")
     st.stop()
 
+# ── Settings defaults via session state (Settings tab widgets write here) ─────
+for _k, _v in [("cfg_lat", 29.34), ("cfg_smooth", 9),
+               ("cfg_min_speed", 3), ("cfg_min_rows", 40)]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+lat_threshold = float(st.session_state.cfg_lat)
+smooth_window = int(st.session_state.cfg_smooth)
+min_speed     = float(st.session_state.cfg_min_speed)
+min_rows      = int(st.session_state.cfg_min_rows)
+
 with st.sidebar:
-    st.header("Settings")
-    if not pq_files:
-        st.warning("No parquet files found. Run `prepare_track_data.py` to create filtered parquets.")
+    st.header("Trap Setup")
     selected_file = st.selectbox(
         "Log file", track_files, format_func=lambda p: p.name
     )
-    st.divider()
-    st.subheader("Exercise area")
-    lat_threshold = st.slider(
-        "Southern boundary (lat)", 29.30, 29.42, 29.34, step=0.005, format="%.3f",
-        help="Rows south of this latitude are treated as the exercise area."
-    )
-    st.subheader("Run detection")
-    smooth_window = st.slider(
-        "Smoothing window (samples)", 3, 31, 9, step=2,
-        help="Larger = smoother acceleration/jerk curves but less temporal resolution."
-    )
-    min_speed = st.slider("Min speed to count as 'moving' (mph)", 1, 15, 3)
-    min_rows = st.slider("Min GPS samples per run", 10, 100, 40)
 
 # ── Load data early so we can estimate trap locations before rendering sliders ─
 df_raw = load_track(str(selected_file))
@@ -254,25 +252,51 @@ else:
     _trap_east_def = -95.641
     _trap_west_def = -95.656
 
-# Slider range spans all exercise-area longitudes with a small margin
-_lon_min = float(_df_ex["Longitude"].min()) - 0.001 if not _df_ex.empty else -95.670
-_lon_max = float(_df_ex["Longitude"].max()) + 0.001 if not _df_ex.empty else -95.630
+_TRAP_MARGIN = 0.002   # slider range ± ~660 ft around auto-detected default
 
 with st.sidebar:
     st.divider()
     st.subheader("Measured section traps")
     st.caption(
-        f"Defaults estimated from {len(_rest)} at-rest GPS points in exercise area. "
-        f"East: **{_trap_east_def}**, West: **{_trap_west_def}**"
+        f"Auto-detected from {len(_rest)} at-rest GPS points.  \n"
+        f"East: **{_trap_east_def:.4f}**, West: **{_trap_west_def:.4f}**  \n"
+        f"Slider step = 0.0001° ≈ 33 ft"
     )
     trap_east = st.slider(
-        "East trap lon", _lon_min, _lon_max, _trap_east_def, step=0.0005, format="%.4f",
-        help="Eastern boundary of the measured distance (higher/less-negative lon)."
+        "East trap lon",
+        float(round(_trap_east_def - _TRAP_MARGIN, 4)),
+        float(round(_trap_east_def + _TRAP_MARGIN, 4)),
+        float(_trap_east_def),
+        step=0.0001, format="%.4f",
+        help="Eastern boundary of the measured distance (~33 ft per step)."
     )
+    _te_exact = st.text_input(
+        "East exact lon", value="", placeholder=f"{trap_east:.4f}",
+        help="Type an exact longitude to override the slider.",
+        label_visibility="collapsed",
+    )
+    try:
+        trap_east = float(_te_exact) if _te_exact.strip() else trap_east
+    except ValueError:
+        pass
+
     trap_west = st.slider(
-        "West trap lon", _lon_min, _lon_max, _trap_west_def, step=0.0005, format="%.4f",
-        help="Western boundary of the measured distance (lower/more-negative lon)."
+        "West trap lon",
+        float(round(_trap_west_def - _TRAP_MARGIN, 4)),
+        float(round(_trap_west_def + _TRAP_MARGIN, 4)),
+        float(_trap_west_def),
+        step=0.0001, format="%.4f",
+        help="Western boundary of the measured distance (~33 ft per step)."
     )
+    _tw_exact = st.text_input(
+        "West exact lon", value="", placeholder=f"{trap_west:.4f}",
+        help="Type an exact longitude to override the slider.",
+        label_visibility="collapsed",
+    )
+    try:
+        trap_west = float(_tw_exact) if _tw_exact.strip() else trap_west
+    except ValueError:
+        pass
 
 # ── Precise trap geometry ──────────────────────────────────────────────────────
 # The trap is exactly 5280 ft (1 mile).  We estimate each endpoint's latitude
@@ -378,32 +402,39 @@ def run_start_type(r: dict) -> str:
 
 
 def run_finish_type(r: dict) -> str:
-    """Return 'Standing' or 'Flying' based on smoothed speed at trap exit.
+    """Return 'Standing', 'Flying', or 'Unknown' based on smoothed speed at trap exit.
 
-    The run segment ends at the last *moving* row before the car stops, so the
-    GPS data often doesn't reach the exit trap longitude.  When the crossing
-    can't be found we fall back to the speed at the end of the segment: if the
-    car is still fast it was a flying finish; if it decelerated to near-stop it
-    was a standing finish.
+    Uses the same geometric fallback as the detail tab: if the GPS track ends
+    before the exit trap longitude is reached, estimates the exit position as
+    entry + TRAP_DIST_MI (1 mile) rather than falling back to tail speed.
     """
     grp = r.get("_grp_with_derivs")
     if grp is None:
         grp = r["data"]
     gw     = r["direction"] == "West"
+    en_lon = trap_east if gw else trap_west
     ex_lon = trap_west if gw else trap_east
+    en_d   = find_crossing_dist(grp, en_lon, gw)
     ex_d   = find_crossing_dist(grp, ex_lon, gw)
+    # Geometric fallback: if exit not found but entry was, exit = entry + 1 mi
+    if ex_d is None and en_d is not None:
+        ex_d = en_d + TRAP_DIST_MI
     v_col  = "speed_smooth" if "speed_smooth" in grp.columns else "Speed (mph)"
+    _v     = grp[v_col].to_numpy()
+    _d     = grp["Distance (mi)"].to_numpy()
     if ex_d is not None:
-        v_exit = float(np.interp(ex_d, grp["Distance (mi)"].to_numpy(),
-                                 grp[v_col].to_numpy()))
+        v_exit = float(np.interp(ex_d, _d, _v, left=_v[0], right=_v[-1]))
     else:
-        # GPS data ended before exit trap — use tail speed as proxy
-        v_exit = float(grp[v_col].iloc[-min(5, len(grp)):].mean())
-    return "Flying" if v_exit >= 0.5 * r["target_speed"] else "Standing"
+        v_exit = float(_v[-min(5, len(_v)):].mean())
+    if v_exit < 5:
+        return "Standing"
+    if v_exit >= r["target_speed"] - 5:
+        return "Flying"
+    return "Unknown"
 
 
-tab_map, tab_overview, tab_detail, tab_transit = st.tabs(
-    ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis"]
+tab_map, tab_overview, tab_detail, tab_transit, tab_settings = st.tabs(
+    ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis", "Settings"]
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -439,6 +470,8 @@ with tab_map:
         )
         use_satellite = map_style_choice == "Satellite (ESRI)"
 
+        _map_center_lat = (trap_east_lat + trap_west_lat) / 2
+        _map_center_lon = (trap_east + trap_west) / 2
         fig_map = px.scatter_map(
             df_plot,
             lat="Latitude", lon="Longitude",
@@ -446,7 +479,8 @@ with tab_map:
             color_discrete_map={"Exercise Area": "#e63946", "Transit": "#457b9d"},
             hover_data={"Speed (mph)": ":.1f", "Time": True, "Date": True,
                         "Elapsed time (sec)": True, "Distance (mi)": ":.2f"},
-            zoom=10,
+            zoom=14,
+            center={"lat": _map_center_lat, "lon": _map_center_lon},
             map_style="white-bg" if use_satellite else "carto-positron",
             title="Full Track — Exercise Area & Measured Section Highlighted",
         )
@@ -471,7 +505,7 @@ with tab_map:
             lat=[trap_lat_lo, trap_lat_hi],
             lon=[trap_east, trap_east],
             mode="lines",
-            line=dict(color="lime", width=3),
+            line=dict(color="dodgerblue", width=3),
             name="East trap",
             hoverinfo="name",
         ))
@@ -480,7 +514,7 @@ with tab_map:
             lat=[trap_lat_lo, trap_lat_hi],
             lon=[trap_west, trap_west],
             mode="lines",
-            line=dict(color="red", width=3),
+            line=dict(color="dodgerblue", width=3),
             name="West trap",
             hoverinfo="name",
         ))
@@ -628,6 +662,7 @@ with tab_overview:
 
         summary_rows.append({
             "Run": i + 1,
+            "Time": r["start_time"],
             "Direction": r["direction"],
             "Target (mph)": r["target_speed"],
             "Start": run_start_type(r),
@@ -774,7 +809,7 @@ with tab_detail:
     run_labels = [
         f"Run {i+1}: {r['direction']}  ~{r['target_speed']} mph  "
         f"[{run_start_type(r)} start | {run_finish_type(r)} finish]  "
-        f"({r['start_elapsed']}–{r['end_elapsed']} s)"
+        f"@ {r['start_time']}  ({r['start_elapsed']}–{r['end_elapsed']} s)"
         for i, r in enumerate(runs)
     ]
     sel_idx = st.selectbox("Select run", range(len(runs)), format_func=lambda i: run_labels[i])
@@ -802,13 +837,14 @@ with tab_detail:
     max_jerk = float(moving["jerk_ft_s3"].abs().max())
 
     # Metrics row
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Target speed", f"{r['target_speed']} mph")
-    c2.metric("Mean speed", f"{mean_spd:.1f} mph")
-    c3.metric("Speed RMS error", f"{rms_err:.2f} mph")
-    c4.metric("Max |accel|", f"{max_accel_fps2:.2f} ft/s² ({max_accel_g:.3f} g)")
-    c5.metric("Max |jerk|", f"{max_jerk:.2f} ft/s3")
-    c6.metric("Distance", f"{r['distance_mi']:.3f} mi")
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("Start time", r["start_time"])
+    c2.metric("Target speed", f"{r['target_speed']} mph")
+    c3.metric("Mean speed", f"{mean_spd:.1f} mph")
+    c4.metric("Speed RMS error", f"{rms_err:.2f} mph")
+    c5.metric("Max |accel|", f"{max_accel_fps2:.2f} ft/s² ({max_accel_g:.3f} g)")
+    c6.metric("Max |jerk|", f"{max_jerk:.2f} ft/s3")
+    c7.metric("Distance", f"{r['distance_mi']:.3f} mi")
 
     use_time = st.radio(
         "X axis", ["Distance from trap entry", "Time from trap entry"],
@@ -979,17 +1015,23 @@ with tab_detail:
     is_flying  = speed_at_entry >= 0.5 * ri["target_speed"]
     start_type = "Flying start" if is_flying else "Standstill start"
 
-    # Finish type: speed at trap exit (or tail speed if GPS ended before exit)
+    # Finish type: speed at trap exit
+    # Use exit_d_i which already has the geometric fallback (entry + 1 mi) applied,
+    # matching the logic in run_finish_type().
     _d_i        = grp_i["Distance (mi)"].to_numpy()
     _v_smooth_i = grp_i["speed_smooth"].to_numpy()
-    _exit_raw   = find_crossing_dist(grp_i, exit_lon_r, going_west)
-    if _exit_raw is not None:
-        speed_at_exit = float(np.interp(_exit_raw, _d_i, _v_smooth_i))
+    if exit_d_i is not None:
+        speed_at_exit = float(np.interp(exit_d_i, _d_i, _v_smooth_i,
+                                        left=_v_smooth_i[0], right=_v_smooth_i[-1]))
     else:
-        # GPS ended before exit trap — tail mean as proxy (same as run_finish_type)
-        speed_at_exit = float(grp_i["speed_smooth"].iloc[-min(5, len(grp_i)):].mean())
-    is_flying_finish = speed_at_exit >= 0.5 * ri["target_speed"]
-    finish_type      = "Flying finish" if is_flying_finish else "Standstill finish"
+        speed_at_exit = float(_v_smooth_i[-min(5, len(_v_smooth_i)):].mean())
+    if speed_at_exit < 5:
+        finish_type = "Standstill finish"
+    elif speed_at_exit >= ri["target_speed"] - 5:
+        finish_type = "Flying finish"
+    else:
+        finish_type = "Unknown finish"
+    is_flying_finish = finish_type == "Flying finish"
 
     # ── Selected run aligned at trap entry ────────────────────────────────────
     _d_arr = grp_i["Distance (mi)"].to_numpy()
@@ -1472,3 +1514,34 @@ where abrupt throttle/brake inputs cause overshoot.
                      "Latitude", "Longitude", "Accuracy (ft)"]
         st.dataframe(grp[[c for c in show_cols if c in grp.columns]].round(4),
                      use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tab 5 — Settings
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_settings:
+    if not pq_files:
+        st.warning("No parquet files found. Run `prepare_track_data.py` to create filtered parquets.")
+
+    st.subheader("Exercise Area")
+    st.slider(
+        "Southern boundary (lat)", 29.30, 29.42, step=0.005, format="%.3f",
+        help="Rows south of this latitude are treated as the exercise area.",
+        key="cfg_lat",
+    )
+
+    st.divider()
+    st.subheader("Run Detection")
+    st.slider(
+        "Smoothing window (samples)", 3, 31, step=2,
+        help="Larger = smoother acceleration/jerk curves but less temporal resolution.",
+        key="cfg_smooth",
+    )
+    st.slider(
+        "Min speed to count as 'moving' (mph)", 1, 15,
+        key="cfg_min_speed",
+    )
+    st.slider(
+        "Min GPS samples per run", 10, 100,
+        key="cfg_min_rows",
+    )
+    st.info("Changes take effect immediately on the next interaction.")
