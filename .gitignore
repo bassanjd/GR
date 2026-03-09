@@ -43,7 +43,7 @@ env/
 
 # Secrets
 .env
-Practice/DataLogs/speed_tracker_07_Mar_2026_11_23_00.csv
+Practice/DataLogs/
 Results/raw_data/
 Stage Notes/claude_cache/
 Stage Notes/raw_data/

@@ -49,15 +49,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(me
 log = logging.getLogger(__name__)
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-BASE          = Path(__file__).parent
-STAGE_DIR     = BASE / "raw_data"
-OUTPUT_DIR    = BASE
-CACHE_DIR     = BASE / "claude_cache"
-INST_PARQUET  = OUTPUT_DIR / "stage_instructions.parquet"
-LEG_PARQUET   = OUTPUT_DIR / "leg_characteristics.parquet"
-POPPLER_PATH  = r"C:\Program Files (x86)\poppler\Library\bin"
-DPI           = 200      # lower than before — Claude reads images well at lower res
-MAX_PX        = 1400     # max image dimension sent to API (saves tokens)
+BASE            = Path(__file__).parent
+STAGE_DIR       = BASE / "raw_data"
+OUTPUT_DIR      = BASE
+CACHE_DIR       = BASE / "claude_cache"
+INST_PARQUET    = OUTPUT_DIR / "stage_instructions.parquet"
+LEG_PARQUET     = OUTPUT_DIR / "leg_characteristics.parquet"
+RESULTS_PARQUET = BASE.parent / "Results" / "long_format_times.parquet"
+POPPLER_PATH    = r"C:\Program Files (x86)\poppler\Library\bin"
+DPI             = 200      # lower than before — Claude reads images well at lower res
+MAX_PX          = 1400     # max image dimension sent to API (saves tokens)
 
 # ─── PDF map ──────────────────────────────────────────────────────────────────
 def build_pdf_map(stages=None):
@@ -381,7 +382,11 @@ def assemble_instructions(stage_filter=None) -> pd.DataFrame:
                 "hw_speed_correction": instr.get("hw_speed_correction"),
 
                 # Column C (timing)
-                "target_speed_mph":  instr.get("c_target_mph"),
+                # 0 MPH appears in sit-stop sequences ("0 MPH  sit  0m15s  45 MPH")
+                # and is not a cruising speed — treat as null.
+                "target_speed_mph":  (
+                    instr.get("c_target_mph") if instr.get("c_target_mph", 1) != 0 else None
+                ),
                 "leg_duration_s":    instr.get("c_leg_duration_s"),
                 "interval_seconds":  instr.get("c_interval_s"),
                 "cumulative_seconds": instr.get("c_cumulative_s"),
@@ -448,12 +453,16 @@ def build_leg_characteristics(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # Forward-fill target speed within each leg (speed holds until next change)
+    # Forward-fill target speed within each leg (speed holds until next change).
+    # Zero-speed values are sit-stop markers, not real cruising speeds — null them
+    # out so they don't pollute speed statistics or the forward-fill.
     df = df.sort_values(["stage", "instruction_num"])
+    df["_speed_nonzero"] = df["target_speed_mph"].where(df["target_speed_mph"] != 0)
     df["speed_filled"] = (
-        df.groupby(["stage", "leg_num"])["target_speed_mph"]
+        df.groupby(["stage", "leg_num"])["_speed_nonzero"]
         .transform(lambda s: s.ffill())
     )
+    df.drop(columns=["_speed_nonzero"], inplace=True)
 
     # Diagram type dummies
     diagram_types = [
@@ -526,20 +535,149 @@ def build_leg_characteristics(df: pd.DataFrame) -> pd.DataFrame:
     agg = agg.rename(columns={"stage": "Stage", "leg_num": "Leg"})
     return agg
 
+# ─── Validation ───────────────────────────────────────────────────────────────
+
+def validate_instructions(df: pd.DataFrame) -> dict:
+    """
+    Run extraction quality checks analogous to the Data Verification tab in
+    field_comparison_app.py.  Returns a dict with structured issue lists.
+
+    Checks:
+      boundary_errors    – legs with != 1 start or != 1 checkpoint
+      instruction_gaps   – missing instruction numbers per stage (with page hints)
+      speed_outliers     – target_speed_mph outside [15, 80]
+      cumulative_drops   – cumulative_seconds decreases within a leg (> 5s)
+      leg_count_mismatches – stages where extracted leg count != results parquet
+    """
+    issues: dict = {
+        "boundary_errors":      [],
+        "instruction_gaps":     [],
+        "speed_outliers":       [],
+        "cumulative_drops":     [],
+        "leg_count_mismatches": [],
+    }
+
+    if df.empty:
+        return issues
+
+    # 1. Boundary check: each (stage, leg) should have exactly 1 start + 1 checkpoint
+    boundary = (
+        df.groupby(["stage", "leg_num"])
+        .agg(leg_starts=("is_leg_start", "sum"), checkpoints=("is_checkpoint", "sum"))
+        .reset_index()
+    )
+    bad = boundary[(boundary["leg_starts"] != 1) | (boundary["checkpoints"] != 1)]
+    for _, row in bad.iterrows():
+        issues["boundary_errors"].append({
+            "stage": int(row["stage"]), "leg": int(row["leg_num"]),
+            "starts": int(row["leg_starts"]), "checkpoints": int(row["checkpoints"]),
+        })
+
+    # 2. Instruction number gaps per stage — also map gaps to grid pages for re-run hints
+    for stage, grp in df.groupby("stage"):
+        nums = grp["instruction_num"].dropna().astype(int).sort_values().unique()
+        if len(nums) < 2:
+            continue
+        expected = set(range(int(nums.min()), int(nums.max()) + 1))
+        missing  = sorted(expected - set(nums.tolist()))
+        if not missing:
+            continue
+        # Identify which grid pages border the gaps (use neighbour instructions)
+        page_map = (
+            grp.dropna(subset=["instruction_num", "grid_page"])
+            .set_index("instruction_num")["grid_page"]
+            .to_dict()
+        )
+        # Condense missing into ranges
+        ranges = []
+        start = missing[0]
+        for i in range(1, len(missing)):
+            if missing[i] != missing[i - 1] + 1:
+                ranges.append((start, missing[i - 1]))
+                start = missing[i]
+        ranges.append((start, missing[-1]))
+        # Suggest ALL grid pages between last-known-before and first-known-after
+        page_hints = set()
+        for lo, hi in ranges:
+            before_num = max((n for n in page_map if n < lo), default=None)
+            after_num  = min((n for n in page_map if n > hi), default=None)
+            before_page = int(page_map[before_num]) if before_num is not None else None
+            after_page  = int(page_map[after_num])  if after_num  is not None else None
+            if before_page is not None and after_page is not None:
+                for p in range(before_page + 1, after_page):
+                    page_hints.add(p)
+            elif before_page is not None:
+                page_hints.add(before_page + 1)
+            elif after_page is not None:
+                page_hints.add(after_page - 1)
+        issues["instruction_gaps"].append({
+            "stage": int(stage),
+            "missing_count": len(missing),
+            "ranges": ranges,
+            "suggested_pages": sorted(page_hints),
+        })
+
+    # 3. Speed outliers
+    speed_df = df[df["target_speed_mph"].notna()]
+    for _, row in speed_df[(speed_df["target_speed_mph"] < 15) | (speed_df["target_speed_mph"] > 80)].iterrows():
+        issues["speed_outliers"].append({
+            "stage": int(row["stage"]) if pd.notna(row["stage"]) else None,
+            "instruction": int(row["instruction_num"]) if pd.notna(row["instruction_num"]) else None,
+            "speed": float(row["target_speed_mph"]),
+        })
+
+    # 4. Cumulative time drops within a leg
+    for (stage, leg), grp in df.groupby(["stage", "leg_num"]):
+        cum = grp["cumulative_seconds"].dropna()
+        if len(cum) < 2:
+            continue
+        diffs = cum.diff().dropna()
+        drops = diffs[diffs < -5]
+        for idx in drops.index:
+            num = df.loc[idx, "instruction_num"]
+            issues["cumulative_drops"].append({
+                "stage": int(stage), "leg": int(leg),
+                "instruction": int(num) if pd.notna(num) else None,
+                "drop_s": float(drops[idx]),
+            })
+
+    # 5. Compare extracted leg count against results parquet (if available)
+    if RESULTS_PARQUET.exists():
+        try:
+            times_df = pd.read_parquet(RESULTS_PARQUET)
+            expected = times_df.groupby("Stage")["Leg"].nunique()
+            actual   = df.groupby("stage")["leg_num"].nunique()
+            for stage in sorted(set(expected.index) | set(actual.index)):
+                exp = int(expected.get(stage, 0))
+                act = int(actual.get(stage, 0))
+                if exp != act:
+                    issues["leg_count_mismatches"].append({
+                        "stage": stage, "expected": exp, "actual": act,
+                    })
+        except Exception as e:
+            log.warning(f"Could not load results parquet for leg-count check: {e}")
+
+    return issues
+
+
 # ─── Reporting ────────────────────────────────────────────────────────────────
 
 def print_quality_report(df: pd.DataFrame):
-    print("\n" + "=" * 65)
+    W = 70
+    print("\n" + "=" * W)
     print("EXTRACTION QUALITY REPORT")
-    print("=" * 65)
+    print("=" * W)
     print(f"Total instructions : {len(df):,}")
     if df.empty:
         return
-    print(f"Stages             : {sorted(df['stage'].dropna().unique().astype(int).tolist())}")
-    leg_max = int(df['leg_num'].max()) if df['leg_num'].notna().any() else 0
+
+    stages  = sorted(df["stage"].dropna().unique().astype(int).tolist())
+    leg_max = int(df["leg_num"].max()) if df["leg_num"].notna().any() else 0
+    print(f"Stages             : {stages}")
     print(f"Legs detected      : {leg_max}")
     print(f"Leg starts         : {df['is_leg_start'].sum()}")
     print(f"Checkpoints        : {df['is_checkpoint'].sum()}")
+
     print()
     print("Key column fill rates:")
     check = [
@@ -554,13 +692,80 @@ def print_quality_report(df: pd.DataFrame):
         pct   = valid / len(df) * 100
         bar   = "#" * int(pct / 5)
         print(f"  {c:<30} {pct:>5.0f}%  {bar}")
+
     print()
     print("Diagram type distribution:")
     if "diagram_type" in df.columns:
-        top = df["diagram_type"].value_counts().head(15)
-        for dt, cnt in top.items():
+        for dt, cnt in df["diagram_type"].value_counts().head(15).items():
             print(f"  {dt:<25} {cnt:>4}")
-    print("=" * 65)
+
+    # ── Validation checks ────────────────────────────────────────────────────
+    v = validate_instructions(df)
+
+    print()
+    print("-" * W)
+    print("VALIDATION CHECKS")
+    print("-" * W)
+
+    # Leg boundary errors
+    if v["boundary_errors"]:
+        print(f"[FAIL] Leg boundary errors ({len(v['boundary_errors'])} legs):")
+        for e in v["boundary_errors"]:
+            print(f"       Stage {e['stage']} Leg {e['leg']:>2}  "
+                  f"starts={e['starts']}  checkpoints={e['checkpoints']}")
+    else:
+        print("[OK]   All legs have exactly 1 start + 1 checkpoint.")
+
+    # Instruction gaps
+    if v["instruction_gaps"]:
+        print(f"[WARN] Instruction number gaps detected:")
+        for g in v["instruction_gaps"]:
+            ranges_str = ", ".join(
+                f"{lo}-{hi}" if lo != hi else str(lo)
+                for lo, hi in g["ranges"]
+            )
+            hint = ""
+            if g["suggested_pages"]:
+                pages_str = " ".join(str(p) for p in g["suggested_pages"])
+                hint = f"  => re-run: --stages {g['stage']} --pages {pages_str} --force"
+            print(f"       Stage {g['stage']}: {g['missing_count']} missing "
+                  f"[{ranges_str}]{hint}")
+    else:
+        print("[OK]   No instruction number gaps.")
+
+    # Speed outliers
+    if v["speed_outliers"]:
+        print(f"[WARN] Speed outliers (outside 15–80 mph): {len(v['speed_outliers'])}")
+        for o in v["speed_outliers"][:5]:
+            print(f"       Stage {o['stage']} instr {o['instruction']}: {o['speed']} mph")
+        if len(v["speed_outliers"]) > 5:
+            print(f"       … and {len(v['speed_outliers']) - 5} more")
+    else:
+        print("[OK]   All target speeds in plausible range (15–80 mph).")
+
+    # Cumulative drops
+    if v["cumulative_drops"]:
+        print(f"[WARN] Cumulative time drops within legs: {len(v['cumulative_drops'])}")
+        for d in v["cumulative_drops"][:5]:
+            print(f"       Stage {d['stage']} Leg {d['leg']} instr {d['instruction']}: "
+                  f"{d['drop_s']:.1f}s drop")
+        if len(v["cumulative_drops"]) > 5:
+            print(f"       … and {len(v['cumulative_drops']) - 5} more")
+    else:
+        print("[OK]   Cumulative times are monotonically increasing within legs.")
+
+    # Leg count mismatches
+    if v["leg_count_mismatches"]:
+        print(f"[FAIL] Leg count mismatches vs results parquet:")
+        for m in v["leg_count_mismatches"]:
+            print(f"       Stage {m['stage']}: extracted {m['actual']} legs, "
+                  f"results have {m['expected']}")
+    elif RESULTS_PARQUET.exists():
+        print("[OK]   Extracted leg counts match results parquet.")
+    else:
+        print("[INFO] Results parquet not found — skipping leg count comparison.")
+
+    print("=" * W)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -576,10 +781,23 @@ def main():
     parser.add_argument("--scan",         type=str, help="Path to a single scanned image")
     parser.add_argument("--no-grid-filter", action="store_true",
                         help="Disable non-grid page heuristic; send every uncached page to Claude")
+    parser.add_argument("--validate-only", action="store_true",
+                        help="Load existing parquets and run validation checks only (no API calls)")
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     CACHE_DIR.mkdir(exist_ok=True)
+
+    # ── Validate-only mode ────────────────────────────────────────────────────
+    if args.validate_only:
+        if not INST_PARQUET.exists():
+            log.error(f"No parquet found at {INST_PARQUET} — run without --validate-only first.")
+            sys.exit(1)
+        df = pd.read_parquet(INST_PARQUET)
+        if args.stages:
+            df = df[df["stage"].isin(args.stages)]
+        print_quality_report(df)
+        return
 
     # ── Single-scan daily coaching mode ───────────────────────────────────────
     if args.scan:

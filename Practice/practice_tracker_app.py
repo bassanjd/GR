@@ -12,7 +12,7 @@ from pathlib import Path
 
 st.set_page_config(page_title="Speed Tracker Analysis", layout="wide", page_icon="🏎")
 
-DATALOGS = Path(__file__).parent / "DataLogs"
+DATALOGS = Path(__file__).parent
 
 # ── Physics constants ─────────────────────────────────────────────────────────
 MPH_S_TO_FT_S2 = 5280.0 / 3600.0   # 1 mph/s = 1.4667 ft/s²
