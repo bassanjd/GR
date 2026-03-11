@@ -1085,10 +1085,10 @@ with tab_detail:
             f"Start: **{start_type}** (speed at entry ≈ {speed_at_entry:.1f} mph)  |  "
             f"Finish: **{finish_type}** (speed at exit ≈ {speed_at_exit:.1f} mph)"
         )
-        col_info2.info(
-            f"Acceleration model built from {len(all_standing)} standing-start run(s): "
-            f"{peer_labels_str}"
-        )
+        # col_info2.info(
+        #     f"Acceleration model built from {len(all_standing)} standing-start run(s): "
+        #     f"{peer_labels_str}"
+        # )
 
         # ── Acceleration model: direct speed-profile median ───────────────────
         # Collect normalised speed-vs-distance profiles from every standing-start
