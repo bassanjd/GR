@@ -139,8 +139,8 @@ def segment_exercise_runs(df: pd.DataFrame, lat_thresh: float,
         _start_time = str(grp["Time"].iloc[0]) if "Time" in grp.columns else ""
         runs.append({
             "seg_id": seg_id,
-            "start_elapsed": int(grp["Elapsed time (sec)"].iloc[0]),
-            "end_elapsed": int(grp["Elapsed time (sec)"].iloc[-1]),
+            "start_elapsed": float(grp["Elapsed time (sec)"].iloc[0]),
+            "end_elapsed": float(grp["Elapsed time (sec)"].iloc[-1]),
             "start_time": _start_time,
             "direction": direction,
             "mean_speed": mean_spd,
@@ -494,6 +494,42 @@ def run_finish_type(r: dict) -> str:
     return "Flying" if _min_speed_near(grp, ex_d, v_col, side="after") > flying_thresh else "Standing"
 
 
+def get_run_timing_refs(r: dict, start_type: str | None = None) -> tuple[float | None, float | None]:
+    """Return (entry_d, exit_d) cumulative-odometer distances (mi) for timing.
+
+    Separates the timing-reference logic from segmentation and from
+    standing/flying detection so each concern lives in one place.
+
+    Standing start → entry_d = first sample where speed_smooth ≥ min_speed
+                     exit_d  = entry_d + TRAP_DIST_MI  (GPS 1-mile mark)
+    Flying start   → entry_d / exit_d = geometric GPS trap-crossing distances,
+                     with TRAP_DIST_MI fallback when one crossing is missing.
+    """
+    if start_type is None:
+        start_type = run_start_type(r)
+    grp = _grp_derivs(r)
+
+    if start_type == "Standing":
+        v_col = "speed_smooth" if "speed_smooth" in grp.columns else "Speed (mph)"
+        moving = grp[grp[v_col] >= min_speed]
+        if moving.empty:
+            return None, None
+        entry_d = float(moving["Distance (mi)"].iloc[0])
+        return entry_d, entry_d + TRAP_DIST_MI
+
+    # Flying: use GPS trap-crossing geometry
+    gw     = r["direction"] == "West"
+    en_lon = trap_east if gw else trap_west
+    ex_lon = trap_west if gw else trap_east
+    en_d   = find_crossing_dist(grp, en_lon, gw)
+    ex_d   = find_crossing_dist(grp, ex_lon, gw)
+    if en_d is None and ex_d is not None:
+        en_d = ex_d - TRAP_DIST_MI
+    if ex_d is None and en_d is not None:
+        ex_d = en_d + TRAP_DIST_MI
+    return en_d, ex_d
+
+
 tab_map, tab_overview, tab_detail, tab_transit, tab_accel, tab_settings = st.tabs(
     ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis", "Accel/Decel", "Settings"]
 )
@@ -618,8 +654,7 @@ with tab_overview:
     _ov_accel_profs = []
     for _r_p in _ov_standing:
         _grp_p  = _r_p["_grp_with_derivs"]
-        _gw_p   = _r_p["direction"] == "West"
-        _en_p   = find_crossing_dist(_grp_p, trap_east if _gw_p else trap_west, _gw_p)
+        _en_p, _ = get_run_timing_refs(_r_p, start_type="Standing")
         if _en_p is None:
             continue
         _d_p  = _grp_p["Distance (mi)"].to_numpy()
@@ -649,16 +684,9 @@ with tab_overview:
     for i, r in enumerate(runs):
         grp = r["_grp_with_derivs"]
 
-        # Trap crossings with geometric fallback (same as detail tab)
-        gw     = r["direction"] == "West"
-        en_lon = trap_east if gw else trap_west
-        ex_lon = trap_west if gw else trap_east
-        en_d   = find_crossing_dist(grp, en_lon, gw)
-        ex_d   = find_crossing_dist(grp, ex_lon, gw)
-        if en_d is None and ex_d is not None:
-            en_d = ex_d - TRAP_DIST_MI
-        if ex_d is None and en_d is not None:
-            ex_d = en_d + TRAP_DIST_MI
+        # Timing references (standing → motion-start + 1 mi GPS mark; flying → GPS trap crossings)
+        gw = r["direction"] == "West"
+        en_d, ex_d = get_run_timing_refs(r)
 
         if en_d is not None and ex_d is not None:
             d_lo, d_hi = min(en_d, ex_d), max(en_d, ex_d)
@@ -767,10 +795,7 @@ with tab_overview:
     fig_trap = go.Figure()
     for i, r in enumerate(runs):
         grp = r["data"].copy()
-        going_west = r["direction"] == "West"
-        entry_lon = trap_east if going_west else trap_west
-
-        entry_dist = find_crossing_dist(grp, entry_lon, going_west)
+        entry_dist, _ = get_run_timing_refs(r)
         aligned = entry_dist is not None
         if entry_dist is None:
             entry_dist = grp["Distance (mi)"].iloc[0]
@@ -898,18 +923,11 @@ with tab_detail:
         horizontal=True,
     ) == "Time from trap entry"
 
-    # ── Trap crossing positions for this run ──────────────────────────────────
+    # ── Timing references for this run ────────────────────────────────────────
+    # Standing → motion-start distance + GPS 1-mile mark.
+    # Flying   → GPS trap-crossing geometry with TRAP_DIST_MI fallback.
     going_west  = r["direction"] == "West"
-    entry_lon_r = trap_east if going_west else trap_west
-    exit_lon_r  = trap_west if going_west else trap_east
-    entry_d_raw = find_crossing_dist(grp, entry_lon_r, going_west)
-    exit_d_raw  = find_crossing_dist(grp, exit_lon_r,  going_west)
-
-    # Geometric fallback: trap is exactly TRAP_DIST_MI (5280 ft = 1 mile).
-    if entry_d_raw is None and exit_d_raw is not None:
-        entry_d_raw = exit_d_raw - TRAP_DIST_MI
-    if exit_d_raw is None and entry_d_raw is not None:
-        exit_d_raw = entry_d_raw + TRAP_DIST_MI
+    entry_d_raw, exit_d_raw = get_run_timing_refs(r)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1121,9 +1139,7 @@ with tab_detail:
             grp_p = r_p.get("_grp_with_derivs")
             if grp_p is None:
                 grp_p = compute_derivatives(r_p["data"].copy(), smooth_window)
-            gw_p        = r_p["direction"] == "West"
-            entry_lon_p = trap_east if gw_p else trap_west
-            entry_d_p   = find_crossing_dist(grp_p, entry_lon_p, gw_p)
+            entry_d_p, _ = get_run_timing_refs(r_p, start_type="Standing")
             if entry_d_p is None:
                 continue
             d_p   = grp_p["Distance (mi)"].to_numpy()
@@ -1190,16 +1206,9 @@ with tab_detail:
             grp_p = r_p.get("_grp_with_derivs")
             if grp_p is None:
                 grp_p = compute_derivatives(r_p["data"].copy(), smooth_window)
-            gw_p        = r_p["direction"] == "West"
-            entry_lon_p = trap_east if gw_p else trap_west
-            exit_lon_p  = trap_west if gw_p else trap_east
-            vt_p        = float(r_p["target_speed"])
+            vt_p = float(r_p["target_speed"])
 
-            entry_d_p = find_crossing_dist(grp_p, entry_lon_p, gw_p)
-            exit_d_p  = find_crossing_dist(grp_p, exit_lon_p,  gw_p)
-            # Geometric fallback: trap is exactly TRAP_DIST_MI (5280 ft = 1 mile)
-            if exit_d_p is None and entry_d_p is not None:
-                exit_d_p = entry_d_p + TRAP_DIST_MI
+            entry_d_p, exit_d_p = get_run_timing_refs(r_p)
             if exit_d_p is None:
                 continue
 
@@ -1593,10 +1602,8 @@ with tab_accel:
             )
 
             for idx, r_p in enumerate(ss_sel):
-                grp_p   = _grp_derivs(r_p)
-                gw_p    = r_p["direction"] == "West"
-                en_lon  = trap_east if gw_p else trap_west
-                en_d    = find_crossing_dist(grp_p, en_lon, gw_p)
+                grp_p = _grp_derivs(r_p)
+                en_d, _ = get_run_timing_refs(r_p, start_type="Standing")
                 if en_d is None:
                     continue
 
@@ -1652,14 +1659,14 @@ with tab_accel:
             for _r in (2, 3):
                 fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=1)
             fig_acc.add_vline(x=0, line_dash="dash", line_color="green",
-                              annotation_text="Entry", row=1, col=1)
+                              annotation_text="Run start", row=1, col=1)
             # Reference lines — right column (rows 2 & 3)
             for _r in (2, 3):
                 fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=2)
                 fig_acc.add_vline(x=sel_ss_tgt, line_dash="dot", line_color="gray",
                                   annotation_text=f"{sel_ss_tgt} mph", row=_r, col=2)
 
-            fig_acc.update_xaxes(title_text="Distance from trap entry (mi)", row=3, col=1)
+            fig_acc.update_xaxes(title_text="Distance from run start (mi)", row=3, col=1)
             fig_acc.update_xaxes(title_text="Speed (mph)", row=2, col=2)
             fig_acc.update_xaxes(title_text="Speed (mph)", row=3, col=2)
             fig_acc.update_layout(
@@ -1702,13 +1709,7 @@ with tab_accel:
 
             for idx, r_p in enumerate(sf_sel):
                 grp_p    = _grp_derivs(r_p)
-                gw_p     = r_p["direction"] == "West"
-                en_lon   = trap_east if gw_p else trap_west
-                ex_lon   = trap_west if gw_p else trap_east
-                en_d     = find_crossing_dist(grp_p, en_lon, gw_p)
-                ex_d     = find_crossing_dist(grp_p, ex_lon, gw_p)
-                if ex_d is None and en_d is not None:
-                    ex_d = en_d + TRAP_DIST_MI
+                _, ex_d  = get_run_timing_refs(r_p)
                 if ex_d is None:
                     continue
 
