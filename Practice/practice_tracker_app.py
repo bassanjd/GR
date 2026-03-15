@@ -209,11 +209,10 @@ def load_track(path: str) -> pd.DataFrame:
 st.title("Practice run evaluation")
 st.caption("Analyze GPS logs from the Speed Tracker app to evaluate acceleration, jerk, and run quality.")
 
-pq_files  = sorted(DATALOGS.glob("*.parquet"), reverse=True)
-csv_files = sorted(DATALOGS.glob("*.csv"),     reverse=True)
-track_files = pq_files or csv_files
+pq_files  = sorted(DATALOGS.glob("*speed_tracker*.parquet"), reverse=True)
+track_files = pq_files
 if not track_files:
-    st.error(f"No parquet or CSV files found in {DATALOGS}")
+    st.error(f"No parquet files matching '*speed_tracker*.parquet' found in {DATALOGS}")
     st.stop()
 
 # ── Settings defaults via session state (Settings tab widgets write here) ─────
