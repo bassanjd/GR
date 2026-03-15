@@ -291,9 +291,9 @@ with st.sidebar:
         "Log file", track_files, format_func=lambda p: p.name
     )
     st.slider(
-        "Standing detection window (ft)", 10, 500, value=100, step=10,
-        help="Half-width of the speed-sampling window centered on each trap crossing.",
-        key="cfg_flying_window_ft",
+        "Smoothing window (samples)", 3, 31, step=2,
+        help="Larger = smoother acceleration/jerk curves but less temporal resolution.",
+        key="cfg_smooth",
     )
 
 
@@ -2036,9 +2036,9 @@ with tab_compare:
 with tab_settings:
     st.subheader("Run Detection")
     st.slider(
-        "Smoothing window (samples)", 3, 31, step=2,
-        help="Larger = smoother acceleration/jerk curves but less temporal resolution.",
-        key="cfg_smooth",
+        "Standing detection window (ft)", 10, 500, value=100, step=10,
+        help="Half-width of the speed-sampling window centered on each trap crossing.",
+        key="cfg_flying_window_ft",
     )
     st.slider(
         "Min speed to count as 'moving' (mph)", 0.01, 2.0, step=0.05,
