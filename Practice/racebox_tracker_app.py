@@ -68,29 +68,41 @@ def compute_derivatives(df: pd.DataFrame, smooth_window: int) -> pd.DataFrame:
 def segment_exercise_runs(df: pd.DataFrame, lat_thresh: float,
                           min_speed: float, min_rows: int,
                           trap_east: float | None = None,
-                          trap_west: float | None = None) -> list[dict]:
+                          trap_west: float | None = None,
+                          window_mi: float = 0.0,
+                          mi_per_deg_lon: float = 69.172) -> list[dict]:
     """
-    Isolate the southern exercise area and split into individual runs.
-    A new run boundary is declared when speed drops below min_speed OR when
-    there is a time gap > 30 s between consecutive GPS fixes.
+    Isolate the run zone (south of lat_thresh AND within the trap window in
+    longitude) and split into individual runs.  A new run boundary is declared
+    when speed drops below min_speed OR when there is a time gap > 30 s.
 
-    Target speed: each GPS sample between the traps is rounded to the nearest
-    5 mph; the most frequent (mode) value is used as the target.  Falls back
-    to the mode over the full moving portion when trap positions are unknown.
+    The run zone extends (window_mi) beyond each trap endpoint so that the
+    standing-start/stop region is captured.  Everything outside is Transit.
+
+    Target speed: per-sample speeds between the traps rounded to nearest 5 mph;
+    mode is used as target.  Falls back to full-segment mode when traps unknown.
     """
-    south = df[df["Latitude"] < lat_thresh].copy().reset_index(drop=True)
+
+    if trap_east is not None and trap_west is not None and window_mi > 0:
+        window_deg = window_mi / mi_per_deg_lon
+        lon_lo = trap_west - window_deg
+        lon_hi = trap_east + window_deg
+        mask = (
+            (df["Latitude"] < lat_thresh) &
+            (df["Longitude"] >= lon_lo) &
+            (df["Longitude"] <= lon_hi)
+        )
+    else:
+        mask = df["Latitude"] < lat_thresh
+    
+    south = df[mask].copy().reset_index(drop=True)
     if south.empty:
         return []
 
     south["is_moving"] = south["Speed (mph)"] >= min_speed
-    south["time_gap"] = south["Elapsed time (sec)"].diff().fillna(0) > 30
-
-    # New segment: transition from moving→stopped, or a time gap
-    stopped = ~south["is_moving"]
-    prev_moving = south["is_moving"].shift(1, fill_value=True)
-    south["seg_id"] = (
-        (stopped & prev_moving) | south["time_gap"]
-    ).cumsum()
+    # Split only on time gaps — the lon zone filter already separates passes.
+    # Speed transitions within a pass (e.g. standing start stop) stay in one run.
+    south["seg_id"] = (south["Elapsed time (sec)"].diff().fillna(0) > 30).cumsum()
 
     runs = []
     for seg_id, grp in south.groupby("seg_id"):
@@ -263,7 +275,7 @@ if not track_files:
 
 # ── Settings defaults via session state (Settings tab widgets write here) ─────
 for _k, _v in [("cfg_lat", 29.34), ("cfg_smooth", 9),
-               ("cfg_min_speed", 3), ("cfg_min_rows", 40)]:
+               ("cfg_min_speed", 0.2), ("cfg_min_rows", 40)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -300,7 +312,7 @@ df_raw = df_raw.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
 _EAST_TRAP_LAT =  29.337290   # ← edit me
 _EAST_TRAP_LON = -95.63952    # ← edit me
 _WEST_TRAP_LAT =  29.33716    # ← edit me
-_WEST_TRAP_LON = -95.65611    # ← edit me
+_WEST_TRAP_LON = -95.65614    # ← edit me
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Reset session state when file changes.
@@ -338,7 +350,9 @@ else:
     _TRAP_UX, _TRAP_UY = 1.0, 0.0
 
 runs = segment_exercise_runs(df_raw, lat_threshold, min_speed, min_rows,
-                             trap_east=trap_east, trap_west=trap_west)
+                             trap_east=trap_east, trap_west=trap_west,
+                             window_mi=flying_window_mi,
+                             mi_per_deg_lon=_MI_PER_DEG_LON)
 
 # ── Transit segments (pre-compute before tabs) ────────────────────────────────
 ex_mask = df_raw["Latitude"] < lat_threshold
@@ -385,12 +399,69 @@ def _pct_range(arr: np.ndarray, pct: float = 2, pad: float = 0.15,
     return [lo - p, hi + p]
 
 
+# ── Shared map/run helpers ────────────────────────────────────────────────────
+
+def _grp_derivs(r: dict) -> pd.DataFrame:
+    """Return the derivative-enriched DataFrame for a run, computing if needed."""
+    g = r.get("_grp_with_derivs")
+    return g if g is not None else compute_derivatives(r["data"].copy(), smooth_window)
+
+
+def _esri_layer() -> list[dict]:
+    """ESRI World Imagery raster tile layer for Plotly Scattermap."""
+    return [{"sourcetype": "raster",
+             "source": ["https://server.arcgisonline.com/ArcGIS/rest/services/"
+                        "World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+             "type": "raster", "below": "traces"}]
+
+
+def _map_layout(center_lat: float, center_lon: float,
+                satellite: bool, height: int = 580) -> dict:
+    """Standard Scattermap layout dict (satellite or street basemap)."""
+    return dict(
+        map=dict(
+            style="white-bg" if satellite else "carto-positron",
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=13,
+            layers=_esri_layer() if satellite else [],
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=height,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+    )
+
+
+def _add_trap_lines(fig: go.Figure) -> None:
+    """Add East/West trap gate lines and measured-section centre line to a Scattermap."""
+    for name, lon in [("East trap", trap_east), ("West trap", trap_west)]:
+        fig.add_trace(go.Scattermap(
+            lat=[trap_lat_lo, trap_lat_hi], lon=[lon, lon],
+            mode="lines", line=dict(color="dodgerblue", width=3),
+            name=name, showlegend=False,
+            hovertemplate=f"{name}<br>lon={lon:.5f}<extra></extra>",
+        ))
+    fig.add_trace(go.Scattermap(
+        lat=[trap_lat_mid, trap_lat_mid], lon=[trap_east, trap_west],
+        mode="lines", line=dict(color="yellow", width=2),
+        name="Measured section", showlegend=False,
+        hovertemplate="Measured section<extra></extra>",
+    ))
+
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-def _min_speed_near(grp: pd.DataFrame, center_d: float, v_col: str) -> float:
-    """Return the minimum smoothed speed within flying_window_mi of center_d."""
+def _min_speed_near(grp: pd.DataFrame, center_d: float, v_col: str, side: str = "before") -> float:
+    """Return minimum smoothed speed in the standing-detection window OUTSIDE the trap.
+
+    side='before': [center_d - window, center_d]  — approach to entry trap
+    side='after' : [center_d, center_d + window]  — departure from exit trap
+    The window never extends into the measured section between traps.
+    """
     _d = grp["Distance (mi)"].to_numpy()
-    mask = (_d >= center_d - flying_window_mi) & (_d <= center_d + flying_window_mi)
+    if side == "before":
+        mask = (_d >= center_d - flying_window_mi) & (_d <= center_d)
+    else:
+        mask = (_d >= center_d) & (_d <= center_d + flying_window_mi)
     if mask.any():
         return float(grp.loc[mask, v_col].min())
     # Fallback: interpolated point if window contains no samples
@@ -399,19 +470,19 @@ def _min_speed_near(grp: pd.DataFrame, center_d: float, v_col: str) -> float:
 
 def run_start_type(r: dict) -> str:
     """Return 'Standing' or 'Flying' based on min speed in window around trap entry."""
-    grp   = r["_grp_with_derivs"] if "_grp_with_derivs" in r else r["data"]
+    grp   = _grp_derivs(r)
     gw    = r["direction"] == "West"
     e_lon = trap_east if gw else trap_west
     e_d   = find_crossing_dist(grp, e_lon, gw)
     v_col = "speed_smooth" if "speed_smooth" in grp.columns else "Speed (mph)"
     if e_d is None:
         e_d = grp["Distance (mi)"].iloc[0]
-    return "Flying" if _min_speed_near(grp, e_d, v_col) > flying_thresh else "Standing"
+    return "Flying" if _min_speed_near(grp, e_d, v_col, side="before") > flying_thresh else "Standing"
 
 
 def run_finish_type(r: dict) -> str:
     """Return 'Standing' or 'Flying' based on min speed in window around trap exit."""
-    grp    = r["_grp_with_derivs"] if "_grp_with_derivs" in r else r["data"]
+    grp    = _grp_derivs(r)
     gw     = r["direction"] == "West"
     en_lon = trap_east if gw else trap_west
     ex_lon = trap_west if gw else trap_east
@@ -420,12 +491,53 @@ def run_finish_type(r: dict) -> str:
     if ex_d is None:
         ex_d = (en_d + TRAP_DIST_MI) if en_d is not None else grp["Distance (mi)"].iloc[-1]
     v_col = "speed_smooth" if "speed_smooth" in grp.columns else "Speed (mph)"
-    return "Flying" if _min_speed_near(grp, ex_d, v_col) > flying_thresh else "Standing"
+    return "Flying" if _min_speed_near(grp, ex_d, v_col, side="after") > flying_thresh else "Standing"
 
 
 tab_map, tab_overview, tab_detail, tab_transit, tab_accel, tab_settings = st.tabs(
     ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis", "Accel/Decel", "Settings"]
 )
+
+# ── Module-scope map state (used across multiple tabs) ────────────────────────
+
+_window_deg_lon = flying_window_mi / _MI_PER_DEG_LON
+_run_zone_mask = (
+    (df_raw["Latitude"] < lat_threshold) &
+    (df_raw["Longitude"] >= min(trap_east, trap_west) - _window_deg_lon) &
+    (df_raw["Longitude"] <= max(trap_east, trap_west) + _window_deg_lon)
+)
+df_raw["Zone"] = np.where(_run_zone_mask, "Exercise Area", "Transit")
+
+df_raw["RunID"] = -1
+for _ri, _r in enumerate(runs):
+    df_raw.loc[
+        (df_raw["Elapsed time (sec)"] >= _r["start_elapsed"]) &
+        (df_raw["Elapsed time (sec)"] <= _r["end_elapsed"]),
+        "RunID"
+    ] = _ri
+
+df_plot = df_raw.iloc[::5].copy()  # downsample for render speed
+
+# Trap gate lat bounds (used by _add_trap_lines and all maps)
+_ex_rows = df_raw[
+    (df_raw["Latitude"] < lat_threshold) &
+    (df_raw["Longitude"] >= trap_west) &
+    (df_raw["Longitude"] <= trap_east)
+]
+if not _ex_rows.empty:
+    trap_lat_mid = float(_ex_rows["Latitude"].median())
+    trap_lat_lo  = float(_ex_rows["Latitude"].quantile(0.05))
+    trap_lat_hi  = float(_ex_rows["Latitude"].quantile(0.95))
+else:
+    trap_lat_mid, trap_lat_lo, trap_lat_hi = 29.337, 29.334, 29.340
+
+_map_center_lat = (trap_east_lat + trap_west_lat) / 2
+_map_center_lon = (trap_east + trap_west) / 2
+
+_RUN_PALETTE = [
+    "#e63946", "#f4a261", "#2a9d8f", "#e9c46a", "#a8dadc",
+    "#ff6b6b", "#ffd166", "#06d6a0", "#118ab2", "#fb5607",
+]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tab 1 — Track map
@@ -433,89 +545,36 @@ tab_map, tab_overview, tab_detail, tab_transit, tab_accel, tab_settings = st.tab
 with tab_map:
     col_map, col_stats = st.columns([4, 1])
 
-    df_raw["Zone"] = np.where(
-        df_raw["Latitude"] < lat_threshold, "Exercise Area", "Transit"
-    )
-    df_plot = df_raw.iloc[::5].copy()  # downsample for render speed
-
-    # Compute exercise track lat bounds for drawing trap lines
-    ex_rows = df_raw[
-        (df_raw["Latitude"] < lat_threshold) &
-        (df_raw["Longitude"] >= trap_west) &
-        (df_raw["Longitude"] <= trap_east)
-    ]
-    if not ex_rows.empty:
-        trap_lat_mid  = float(ex_rows["Latitude"].median())
-        trap_lat_lo   = float(ex_rows["Latitude"].quantile(0.05))
-        trap_lat_hi   = float(ex_rows["Latitude"].quantile(0.95))
-    else:
-        trap_lat_mid  = 29.337
-        trap_lat_lo   = 29.334
-        trap_lat_hi   = 29.340
-
     with col_map:
-        map_style_choice = st.radio(
+        use_satellite = st.radio(
             "Map style", ["Street (carto)", "Satellite (ESRI)"],
             horizontal=True, label_visibility="collapsed"
-        )
-        use_satellite = map_style_choice == "Satellite (ESRI)"
-
-        _map_center_lat = (trap_east_lat + trap_west_lat) / 2
-        _map_center_lon = (trap_east + trap_west) / 2
-
-        _transit_df = df_plot[df_plot["Zone"] == "Transit"]
-        _exer_df    = df_plot[df_plot["Zone"] == "Exercise Area"]
+        ) == "Satellite (ESRI)"
 
         _fig_map = go.Figure()
         _fig_map.add_trace(go.Scattermap(
-            lat=_transit_df["Latitude"], lon=_transit_df["Longitude"],
-            mode="lines", line=dict(color="#457b9d", width=2),
-            name="Transit",
+            lat=df_plot.loc[df_plot["Zone"] == "Transit", "Latitude"],
+            lon=df_plot.loc[df_plot["Zone"] == "Transit", "Longitude"],
+            mode="lines", line=dict(color="#457b9d", width=2), name="Transit",
             hovertemplate="Transit<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
         ))
         _fig_map.add_trace(go.Scattermap(
-            lat=_exer_df["Latitude"], lon=_exer_df["Longitude"],
-            mode="lines", line=dict(color="#e63946", width=2),
-            name="Exercise",
-            hovertemplate="Exercise<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
+            lat=df_plot.loc[(df_plot["Zone"] == "Exercise Area") & (df_plot["RunID"] == -1), "Latitude"],
+            lon=df_plot.loc[(df_plot["Zone"] == "Exercise Area") & (df_plot["RunID"] == -1), "Longitude"],
+            mode="lines", line=dict(color="#aaaaaa", width=1), name="In zone (no run)",
+            hovertemplate="In zone<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
         ))
-        # Trap lines
-        for _tname, _tlon in [("East trap", trap_east), ("West trap", trap_west)]:
+        for _ri, _r in enumerate(runs):
+            _rdf = df_plot[df_plot["RunID"] == _ri]
+            _col = _RUN_PALETTE[_ri % len(_RUN_PALETTE)]
+            _lbl = f"R{_ri+1} {_r['direction']} {_r['target_speed']}mph"
             _fig_map.add_trace(go.Scattermap(
-                lat=[trap_lat_lo, trap_lat_hi], lon=[_tlon, _tlon],
-                mode="lines", line=dict(color="dodgerblue", width=3),
-                name=_tname, showlegend=False,
-                hovertemplate=f"{_tname}<br>lon={_tlon:.5f}<extra></extra>",
+                lat=_rdf["Latitude"], lon=_rdf["Longitude"],
+                mode="lines", line=dict(color=_col, width=3), name=_lbl,
+                hovertemplate=f"{_lbl}<br>lat=%{{lat:.5f}}<br>lon=%{{lon:.5f}}<extra></extra>",
             ))
-        _fig_map.add_trace(go.Scattermap(
-            lat=[trap_lat_mid, trap_lat_mid], lon=[trap_east, trap_west],
-            mode="lines", line=dict(color="yellow", width=2),
-            name="Measured section", showlegend=False,
-            hovertemplate="Measured section<extra></extra>",
-        ))
-
-        _map_layers = []
-        if use_satellite:
-            _map_layers = [{
-                "sourcetype": "raster",
-                "source": [
-                    "https://server.arcgisonline.com/ArcGIS/rest/services/"
-                    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-                ],
-                "type": "raster",
-                "below": "traces",
-            }]
-        _fig_map.update_layout(
-            map=dict(
-                style="white-bg" if use_satellite else "carto-positron",
-                center=dict(lat=_map_center_lat, lon=_map_center_lon),
-                zoom=13,
-                layers=_map_layers,
-            ),
-            margin=dict(l=0, r=0, t=0, b=0),
-            height=580,
-            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-        )
+        _add_trap_lines(_fig_map)
+        _fig_map.update_layout(**_map_layout(_map_center_lat, _map_center_lon, use_satellite))
         st.plotly_chart(_fig_map, use_container_width=True)
 
     with col_stats:
@@ -693,7 +752,7 @@ with tab_overview:
         legend=dict(orientation="v", x=1.01, font_size=11),
         margin=dict(r=180),
     )
-    st.plotly_chart(fig_all, width='stretch')
+    st.plotly_chart(fig_all, use_container_width=True)
 
     st.divider()
 
@@ -743,7 +802,7 @@ with tab_overview:
         legend=dict(orientation="v", x=1.01, font_size=11),
         margin=dict(r=180),
     )
-    st.plotly_chart(fig_trap, width='stretch')
+    st.plotly_chart(fig_trap, use_container_width=True)
 
     st.divider()
 
@@ -765,7 +824,7 @@ with tab_overview:
         height=380,
         showlegend=False,
     )
-    st.plotly_chart(accel_fig, width='stretch')
+    st.plotly_chart(accel_fig, use_container_width=True)
 
     st.subheader("Jerk Distribution by Run (measured section only)")
     jerk_fig = go.Figure()
@@ -784,7 +843,7 @@ with tab_overview:
         height=380,
         showlegend=False,
     )
-    st.plotly_chart(jerk_fig, width='stretch')
+    st.plotly_chart(jerk_fig, use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tab 3 — Run detail
@@ -978,46 +1037,38 @@ with tab_transit:
         row=3, col=1,
     )
     fig_tr.update_layout(height=820, legend=dict(orientation="h", y=-0.06))
-    st.plotly_chart(fig_tr, width='stretch')
+    st.plotly_chart(fig_tr, use_container_width=True)
 
-# ── Idealized Run comparison — continues inside the Run Detail tab ─────────────
 with tab_detail:
+    # ── Idealized Run comparison ──────────────────────────────────────────────
     st.divider()
     st.subheader("Idealized Run Comparison")
 
-    # Reuse variables already computed above for the selected run
-    ri           = r
-    grp_i        = grp
-    going_west_i = going_west
-    entry_d_i    = entry_d_raw
-    exit_d_i     = exit_d_raw
-
     # Detect flying vs standing start/finish using min speed in window around each trap
-    _v_col_i   = "speed_smooth"
-    _center_en = entry_d_i if entry_d_i is not None else grp_i["Distance (mi)"].iloc[0]
-    _center_ex = exit_d_i  if exit_d_i  is not None else grp_i["Distance (mi)"].iloc[-1]
-    speed_at_entry   = _min_speed_near(grp_i, _center_en, _v_col_i)
-    speed_at_exit    = _min_speed_near(grp_i, _center_ex, _v_col_i)
+    _center_en = entry_d_raw if entry_d_raw is not None else grp["Distance (mi)"].iloc[0]
+    _center_ex = exit_d_raw  if exit_d_raw  is not None else grp["Distance (mi)"].iloc[-1]
+    speed_at_entry = _min_speed_near(grp, _center_en, "speed_smooth", side="before")
+    speed_at_exit  = _min_speed_near(grp, _center_ex, "speed_smooth", side="after")
     is_flying        = speed_at_entry > flying_thresh
     is_flying_finish = speed_at_exit  > flying_thresh
     start_type  = "Flying start"  if is_flying        else "Standstill start"
     finish_type = "Flying finish" if is_flying_finish else "Standstill finish"
 
     # ── Selected run aligned at trap entry ────────────────────────────────────
-    _d_arr = grp_i["Distance (mi)"].to_numpy()
-    _t_arr = grp_i["Elapsed time (sec)"].to_numpy()
+    _d_arr = grp["Distance (mi)"].to_numpy()
+    _t_arr = grp["Elapsed time (sec)"].to_numpy()
 
-    if entry_d_i is not None:
-        d_aligned_i = (_d_arr - entry_d_i)
-        t_at_entry  = float(np.interp(entry_d_i, _d_arr, _t_arr))
+    if entry_d_raw is not None:
+        d_aligned_i = (_d_arr - entry_d_raw)
+        t_at_entry  = float(np.interp(entry_d_raw, _d_arr, _t_arr))
     else:
         d_aligned_i = (_d_arr - _d_arr[0])
         t_at_entry  = float(_t_arr[0])
     t_aligned_i = _t_arr - t_at_entry   # seconds from trap entry
 
-    v_actual     = grp_i["speed_smooth"].to_numpy()
-    accel_actual = grp_i["accel_ft_s2"].to_numpy()
-    jerk_actual  = grp_i["jerk_ft_s3"].to_numpy()
+    v_actual     = grp["speed_smooth"].to_numpy()
+    accel_actual = grp["accel_ft_s2"].to_numpy()
+    jerk_actual  = grp["jerk_ft_s3"].to_numpy()
 
     GRID_N = 600
     d_run_min = float(d_aligned_i.min())
@@ -1031,19 +1082,19 @@ with tab_detail:
             f"Finish: **{finish_type}** (speed at exit ≈ {speed_at_exit:.1f} mph)"
         )
         col_info2.info(
-            f"Flying start — ideal is constant **{ri['target_speed']} mph** through the "
+            f"Flying start — ideal is constant **{r['target_speed']} mph** through the "
             f"trap" + (" then decelerates to rest." if not is_flying_finish else " with zero acceleration and jerk.")
         )
 
         d_grid         = np.linspace(d_run_min, d_run_max, GRID_N)
-        t_grid         = d_grid / float(ri["target_speed"]) * 3600
-        v_ideal_smooth = np.full(GRID_N, float(ri["target_speed"]))
+        t_grid         = d_grid / float(r["target_speed"]) * 3600
+        v_ideal_smooth = np.full(GRID_N, float(r["target_speed"]))
         accel_ideal    = np.zeros(GRID_N)
         jerk_ideal     = np.zeros(GRID_N)
         v_band_lo      = None
         v_band_hi      = None
-        residual_label = f"Speed Residual — Actual minus Target ({ri['target_speed']} mph)"
-        speed_residual = v_actual - float(ri["target_speed"])
+        residual_label = f"Speed Residual — Actual minus Target ({r['target_speed']} mph)"
+        speed_residual = v_actual - float(r["target_speed"])
 
     else:
         # ── Standing start: acceleration model from ALL standing-start runs ───
@@ -1061,9 +1112,9 @@ with tab_detail:
         # peer run, aligned at trap entry (d=0).  Taking the pointwise median
         # avoids ODE integration and the noise that comes from differentiating
         # GPS speed data twice to get acceleration.
-        target_f       = float(ri["target_speed"])
-        trap_exit_d_ext = (exit_d_i - entry_d_i) \
-                          if (entry_d_i is not None and exit_d_i is not None) else 0.25
+        target_f       = float(r["target_speed"])
+        trap_exit_d_ext = (exit_d_raw - entry_d_raw) \
+                          if (entry_d_raw is not None and exit_d_raw is not None) else 0.25
 
         accel_profs = []   # list of (d_aligned, v_normalised) arrays
         for r_p in all_standing:
@@ -1179,12 +1230,12 @@ with tab_detail:
                 for d, v in decel_profs
             ])
             _v_nrm_dec    = np.median(_all_v_dec, axis=0)
-            _target_f     = float(ri["target_speed"])
+            _target_f     = float(r["target_speed"])
             v_decel_ideal = np.clip(_v_nrm_dec * _target_f, 0.0, _target_f)
 
             # Align decel distance to trap-entry coordinate system
-            _d0_dec       = (exit_d_i - entry_d_i) \
-                            if (exit_d_i is not None and entry_d_i is not None) \
+            _d0_dec       = (exit_d_raw - entry_d_raw) \
+                            if (exit_d_raw is not None and entry_d_raw is not None) \
                             else float(d_grid[-1])
             d_decel_ideal = D_DECEL + _d0_dec
 
@@ -1205,7 +1256,7 @@ with tab_detail:
     # ── Cumulative time error (measured section only) ─────────────────────────
     # Integrate (1/v_ideal − 1/v_actual) × dd × 3600 s/hr between the traps.
     # Positive = ahead of ideal (running fast), negative = behind.
-    trap_exit_d = (exit_d_i - entry_d_i) if (entry_d_i is not None and exit_d_i is not None) else None
+    trap_exit_d = (exit_d_raw - entry_d_raw) if (entry_d_raw is not None and exit_d_raw is not None) else None
     trap_mask   = (d_aligned_i >= 0) & (d_aligned_i <= (trap_exit_d if trap_exit_d is not None else np.inf))
 
     sort_idx_i  = np.argsort(d_aligned_i[trap_mask])
@@ -1232,8 +1283,8 @@ with tab_detail:
                    "Distance from trap entry (mi)  [negative = run-in]")
 
     # Trap exit x position for vline/vrect
-    if exit_d_i is not None and entry_d_i is not None:
-        _exit_d_aln = exit_d_i - entry_d_i
+    if exit_d_raw is not None and entry_d_raw is not None:
+        _exit_d_aln = exit_d_raw - entry_d_raw
         exit_x_plot = float(np.interp(_exit_d_aln, d_aligned_i, t_aligned_i)) \
                       if use_time else _exit_d_aln
     else:
@@ -1270,7 +1321,7 @@ with tab_detail:
 
     # Row 2: Speed
     fig_ideal.add_trace(go.Scatter(
-        x=x_actual, y=grp_i["Speed (mph)"],
+        x=x_actual, y=grp["Speed (mph)"],
         name="Actual (raw)", mode="lines",
         line=dict(color="lightsteelblue", width=1), opacity=0.5,
     ), row=2, col=1)
@@ -1304,8 +1355,8 @@ with tab_detail:
         line=dict(color="royalblue", width=2),
     ), row=2, col=1)
     fig_ideal.add_hline(
-        y=ri["target_speed"], line_dash="dot", line_color="gray",
-        annotation_text=f"Target {ri['target_speed']} mph",
+        y=r["target_speed"], line_dash="dot", line_color="gray",
+        annotation_text=f"Target {r['target_speed']} mph",
         annotation_position="top right", row=2, col=1,
     )
 
@@ -1382,12 +1433,12 @@ with tab_detail:
 
     # Row 2 — Speed: trap-section data only
     _spd_vals = np.concatenate([
-        grp_i["Speed (mph)"].to_numpy()[trap_mask],
+        grp["Speed (mph)"].to_numpy()[trap_mask],
         v_actual[trap_mask],
         v_ideal_smooth[_grid_trap],
         v_band_lo[_grid_trap] if v_band_lo is not None else np.array([]),
         v_band_hi[_grid_trap] if v_band_hi is not None else np.array([]),
-        np.array([float(ri["target_speed"])]),
+        np.array([float(r["target_speed"])]),
     ])
     _spd_range = _sym_range(_spd_vals, pad=0.08, min_half=5.0)
 
@@ -1410,12 +1461,12 @@ with tab_detail:
     fig_ideal.update_yaxes(title_text="ft/s³", range=_jerk_range,  row=4, col=1)
     fig_ideal.update_yaxes(title_text="Δ mph", range=_res_range,   row=5, col=1)
     fig_ideal.update_layout(height=1100, legend=dict(orientation="h", y=-0.04))
-    st.plotly_chart(fig_ideal, width='stretch')
+    st.plotly_chart(fig_ideal, use_container_width=True)
 
     # ── Comparison metrics table (measured section only) ──────────────────────
     st.subheader("Measured Section: Actual vs Ideal")
-    if entry_d_i is not None and exit_d_i is not None:
-        exit_d_aln = exit_d_i - entry_d_i
+    if entry_d_raw is not None and exit_d_raw is not None:
+        exit_d_aln = exit_d_raw - entry_d_raw
         ms_mask = (d_aligned_i >= 0) & (d_aligned_i <= exit_d_aln)
     else:
         ms_mask = np.ones(len(d_aligned_i), dtype=bool)
@@ -1438,8 +1489,8 @@ with tab_detail:
              round(float(np.nanmean(v_actual_ms)), 2),
              round(float(np.nanmean(v_ideal_ms)), 2)),
         _cmp("Speed vs target RMS (mph)",
-             round(float(np.sqrt(np.nanmean((v_actual_ms - ri["target_speed"])**2))), 3),
-             round(float(np.sqrt(np.nanmean((v_ideal_ms  - ri["target_speed"])**2))), 3)),
+             round(float(np.sqrt(np.nanmean((v_actual_ms - r["target_speed"])**2))), 3),
+             round(float(np.sqrt(np.nanmean((v_ideal_ms  - r["target_speed"])**2))), 3)),
         _cmp("Max |Accel| (ft/s²)",
              round(float(np.nanmax(np.abs(accel_ms))), 2),
              round(float(np.nanmax(np.abs(accel_ideal_ms))), 2)),
@@ -1491,45 +1542,17 @@ where abrupt throttle/brake inputs cause overshoot.
 
     _fig_det = go.Figure()
     _fig_det.add_trace(go.Scattermap(
-        lat=grp_i["Latitude"], lon=grp_i["Longitude"],
+        lat=grp["Latitude"], lon=grp["Longitude"],
         mode="lines+markers",
         line=dict(color="#e63946", width=2),
         marker=dict(size=4, color="#e63946"),
-        name=f"R{sel_idx+1} {ri['direction']}",
+        name=f"R{sel_idx+1} {r['direction']}",
         hovertemplate="lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
     ))
-    for _tname, _tlon in [("East trap", trap_east), ("West trap", trap_west)]:
-        _fig_det.add_trace(go.Scattermap(
-            lat=[trap_lat_lo, trap_lat_hi], lon=[_tlon, _tlon],
-            mode="lines", line=dict(color="dodgerblue", width=3),
-            name=_tname, showlegend=False,
-            hovertemplate=f"{_tname}<br>lon={_tlon:.5f}<extra></extra>",
-        ))
-    _fig_det.add_trace(go.Scattermap(
-        lat=[trap_lat_mid, trap_lat_mid], lon=[trap_east, trap_west],
-        mode="lines", line=dict(color="yellow", width=2),
-        name="Measured section", showlegend=False,
+    _add_trap_lines(_fig_det)
+    _fig_det.update_layout(**_map_layout(
+        float(grp["Latitude"].mean()), float(grp["Longitude"].mean()), _det_sat, height=500
     ))
-    _det_layers = [{
-        "sourcetype": "raster",
-        "source": [
-            "https://server.arcgisonline.com/ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        ],
-        "type": "raster", "below": "traces",
-    }] if _det_sat else []
-    _fig_det.update_layout(
-        map=dict(
-            style="white-bg" if _det_sat else "carto-positron",
-            center=dict(lat=float(grp_i["Latitude"].mean()),
-                        lon=float(grp_i["Longitude"].mean())),
-            zoom=13,
-            layers=_det_layers,
-        ),
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=500,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-    )
     st.plotly_chart(_fig_det, use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1544,10 +1567,6 @@ with tab_accel:
         def _run_short_label(r_p: dict) -> str:
             idx = runs.index(r_p)
             return f"R{idx+1} {r_p['direction']} {r_p['start_time']} (~{r_p['target_speed']} mph)"
-
-        def _get_grp(r_p: dict) -> pd.DataFrame:
-            g = r_p.get("_grp_with_derivs")
-            return g if g is not None else compute_derivatives(r_p["data"].copy(), smooth_window)
 
         # ── Acceleration ─────────────────────────────────────────────────────
         st.subheader("Acceleration — Standing Starts")
@@ -1574,7 +1593,7 @@ with tab_accel:
             )
 
             for idx, r_p in enumerate(ss_sel):
-                grp_p   = _get_grp(r_p)
+                grp_p   = _grp_derivs(r_p)
                 gw_p    = r_p["direction"] == "West"
                 en_lon  = trap_east if gw_p else trap_west
                 en_d    = find_crossing_dist(grp_p, en_lon, gw_p)
@@ -1648,7 +1667,7 @@ with tab_accel:
                 legend=dict(orientation="h", y=-0.08),
                 title_text=f"Acceleration to {sel_ss_tgt} mph — {len(ss_sel)} run(s)",
             )
-            st.plotly_chart(fig_acc, width='stretch')
+            st.plotly_chart(fig_acc, use_container_width=True)
 
             # ── Gear shift summary ────────────────────────────────────────────
             st.caption(
@@ -1682,7 +1701,7 @@ with tab_accel:
             )
 
             for idx, r_p in enumerate(sf_sel):
-                grp_p    = _get_grp(r_p)
+                grp_p    = _grp_derivs(r_p)
                 gw_p     = r_p["direction"] == "West"
                 en_lon   = trap_east if gw_p else trap_west
                 ex_lon   = trap_west if gw_p else trap_east
@@ -1756,7 +1775,7 @@ with tab_accel:
                 legend=dict(orientation="h", y=-0.08),
                 title_text=f"Deceleration from {sel_sf_tgt} mph — {len(sf_sel)} run(s)",
             )
-            st.plotly_chart(fig_dec, width='stretch')
+            st.plotly_chart(fig_dec, use_container_width=True)
             st.caption(
                 "Braking consistency: the deceleration vs speed curves (right) should overlap "
                 "if the driver applies the brakes at the same rate each run. "
@@ -1774,7 +1793,7 @@ with tab_settings:
         key="cfg_smooth",
     )
     st.slider(
-        "Min speed to count as 'moving' (mph)", 1, 15,
+        "Min speed to count as 'moving' (mph)", 0.01, 2.0, step=0.05,
         key="cfg_min_speed",
     )
     st.slider(
@@ -1828,36 +1847,19 @@ with tab_settings:
     _set_satellite = _set_map_style == "Satellite (ESRI)"
 
     _fig_rest = go.Figure()
-    # Track lines (same as Track Map)
-    _s_transit = df_plot[df_plot["Zone"] == "Transit"]
-    _s_exer    = df_plot[df_plot["Zone"] == "Exercise Area"]
     _fig_rest.add_trace(go.Scattermap(
-        lat=_s_transit["Latitude"], lon=_s_transit["Longitude"],
-        mode="lines", line=dict(color="#457b9d", width=2),
-        name="Transit",
+        lat=df_plot.loc[df_plot["Zone"] == "Transit", "Latitude"],
+        lon=df_plot.loc[df_plot["Zone"] == "Transit", "Longitude"],
+        mode="lines", line=dict(color="#457b9d", width=2), name="Transit",
         hovertemplate="Transit<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
     ))
     _fig_rest.add_trace(go.Scattermap(
-        lat=_s_exer["Latitude"], lon=_s_exer["Longitude"],
-        mode="lines", line=dict(color="#e63946", width=2),
-        name="Exercise",
+        lat=df_plot.loc[df_plot["Zone"] == "Exercise Area", "Latitude"],
+        lon=df_plot.loc[df_plot["Zone"] == "Exercise Area", "Longitude"],
+        mode="lines", line=dict(color="#e63946", width=2), name="Exercise",
         hovertemplate="Exercise<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
     ))
-    # Trap lines
-    for _tname, _tlon in [("East trap", trap_east), ("West trap", trap_west)]:
-        _fig_rest.add_trace(go.Scattermap(
-            lat=[trap_lat_lo, trap_lat_hi], lon=[_tlon, _tlon],
-            mode="lines", line=dict(color="dodgerblue", width=3),
-            name=_tname, showlegend=False,
-            hovertemplate=f"{_tname}<br>lon={_tlon:.5f}<extra></extra>",
-        ))
-    _fig_rest.add_trace(go.Scattermap(
-        lat=[trap_lat_mid, trap_lat_mid], lon=[trap_east, trap_west],
-        mode="lines", line=dict(color="yellow", width=2),
-        name="Measured section", showlegend=False,
-        hovertemplate="Measured section<extra></extra>",
-    ))
-    # At-rest points
+    _add_trap_lines(_fig_rest)
     _fig_rest.add_trace(go.Scattermap(
         lat=_rest_pts["Latitude"], lon=_rest_pts["Longitude"],
         mode="markers", marker=dict(size=6, color="#e76f51", opacity=0.8),
@@ -1865,29 +1867,7 @@ with tab_settings:
         hovertemplate="At rest<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<br>%{customdata:.2f} mph<extra></extra>",
         customdata=_rest_pts["Speed (mph)"].to_numpy(),
     ))
-
-    _set_map_layers = []
-    if _set_satellite:
-        _set_map_layers = [{
-            "sourcetype": "raster",
-            "source": [
-                "https://server.arcgisonline.com/ArcGIS/rest/services/"
-                "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-            ],
-            "type": "raster",
-            "below": "traces",
-        }]
-    _fig_rest.update_layout(
-        map=dict(
-            style="white-bg" if _set_satellite else "carto-positron",
-            center=dict(lat=_map_center_lat, lon=_map_center_lon),
-            zoom=13,
-            layers=_set_map_layers,
-        ),
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=580,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-    )
+    _fig_rest.update_layout(**_map_layout(_map_center_lat, _map_center_lon, _set_satellite))
     st.plotly_chart(_fig_rest, use_container_width=True)
     st.caption(f"{len(_rest_pts):,} points at rest (speed < {_rest_thresh:.1f} mph).")
 
