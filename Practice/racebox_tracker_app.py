@@ -575,8 +575,8 @@ def get_run_timing_refs(r: dict,
     return entry_d, exit_d
 
 
-tab_map, tab_overview, tab_detail, tab_transit, tab_accel, tab_settings = st.tabs(
-    ["Track Map", "Runs Overview", "Run Detail", "Transit Analysis", "Accel/Decel", "Settings"]
+tab_map, tab_overview, tab_detail, tab_accel, tab_compare, tab_settings, tab_transit = st.tabs(
+    ["Track Map", "Runs Overview", "Run Detail", "Accel/Decel", "GPS vs Accel", "Settings", "Transit Analysis"]
 )
 
 # ── Module-scope map state (used across multiple tabs) ────────────────────────
@@ -1627,15 +1627,22 @@ with tab_accel:
         # ── Acceleration ─────────────────────────────────────────────────────
         st.subheader("Acceleration — Standing Starts")
         all_ss = [r for r in runs if run_start_type(r) == "Standing"]
+        all_sf = [r for r in runs if run_finish_type(r) == "Standing"]
 
         if not all_ss:
             st.info("No standing-start runs found.")
         else:
             ss_targets = sorted({r["target_speed"] for r in all_ss})
             _ss_counts = {t: sum(1 for r in all_ss if r["target_speed"] == t) for t in ss_targets}
+            _sf_counts = {t: sum(1 for r in all_sf if r["target_speed"] == t) for t in ss_targets}
+            _ss_default = max(ss_targets, key=lambda t: _ss_counts[t])
             sel_ss_tgt = st.selectbox(
                 "Target speed (acceleration)",
-                ss_targets, format_func=lambda x: f"{x} mph ({_ss_counts[x]} run{'s' if _ss_counts[x] != 1 else ''})",
+                ss_targets,
+                index=ss_targets.index(_ss_default),
+                format_func=lambda x: (
+                    f"{x} mph  —  {_ss_counts[x]} accel / {_sf_counts.get(x, 0)} decel"
+                ),
                 key="acc_tgt",
             ) if len(ss_targets) > 1 else ss_targets[0]
 
@@ -1734,15 +1741,22 @@ with tab_accel:
 
         # ── Deceleration ─────────────────────────────────────────────────────
         st.subheader("Deceleration — Standing Stops")
-        all_sf = [r for r in runs if run_finish_type(r) == "Standing"]
 
         if not all_sf:
             st.info("No standing-finish runs found.")
         else:
             sf_targets = sorted({r["target_speed"] for r in all_sf})
+            _sf_dec_counts = {t: sum(1 for r in all_sf if r["target_speed"] == t) for t in sf_targets}
+            _ss_dec_counts  = {t: sum(1 for r in all_ss if r["target_speed"] == t) for t in sf_targets}
+            _sf_default = max(sf_targets, key=lambda t: _sf_dec_counts[t])
             sel_sf_tgt = st.selectbox(
                 "Target speed (deceleration)",
-                sf_targets, format_func=lambda x: f"{x} mph", key="dec_tgt",
+                sf_targets,
+                index=sf_targets.index(_sf_default),
+                format_func=lambda x: (
+                    f"{x} mph  —  {_ss_dec_counts.get(x, 0)} accel / {_sf_dec_counts[x]} decel"
+                ),
+                key="dec_tgt",
             ) if len(sf_targets) > 1 else sf_targets[0]
 
             sf_sel = [r for r in all_sf if r["target_speed"] == sel_sf_tgt]
@@ -1828,6 +1842,192 @@ with tab_accel:
                 "Braking consistency: the deceleration vs speed curves (right) should overlap "
                 "if the driver applies the brakes at the same rate each run. "
                 "Braking application point shows as the distance at which speed begins to drop."
+            )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tab — GPS vs Accelerometer
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_compare:
+    st.subheader("GPS-Derived vs Accelerometer Acceleration")
+    if not runs:
+        st.info("No exercise runs found.")
+    else:
+        # ── Controls ──────────────────────────────────────────────────────────
+        _c1, _c2, _c3 = st.columns([2, 1, 2])
+        with _c1:
+            _cmp_axis = st.selectbox(
+                "GForce axis",
+                ["Auto (best r)", "X", "Y", "Z", "Horiz √(X²+Y²)"],
+                key="cmp_axis",
+                help="Which accelerometer axis to compare against GPS-derived acceleration. "
+                     "Auto tests X/Y/Z ± sign and picks the highest Pearson r.",
+            )
+        with _c2:
+            _cmp_flip = st.checkbox("Flip sign", value=False, key="cmp_flip",
+                                    help="Flip the GForce sign (ignored in Auto mode).")
+        with _c3:
+            _cmp_run_idx = st.selectbox(
+                "Run (overlay chart)",
+                range(len(runs)),
+                format_func=lambda i: f"R{i+1} {runs[i]['direction']} ~{runs[i]['target_speed']} mph",
+                key="cmp_run",
+            )
+
+        # ── Helper: extract GForce acceleration for a grp DataFrame ───────────
+        def _gf_accel(grp: pd.DataFrame, axis: str, flip: bool) -> np.ndarray:
+            if axis == "X":
+                raw = grp["GForceX"].to_numpy(dtype=float)
+            elif axis == "Y":
+                raw = grp["GForceY"].to_numpy(dtype=float)
+            elif axis == "Z":
+                raw = grp["GForceZ"].to_numpy(dtype=float)
+            else:  # horizontal magnitude — always positive, sign from GPS
+                raw = np.sqrt(grp["GForceX"].to_numpy(dtype=float) ** 2 +
+                              grp["GForceY"].to_numpy(dtype=float) ** 2)
+            if flip:
+                raw = -raw
+            t   = grp["Elapsed time (sec)"].to_numpy(dtype=float)
+            s   = smooth_series(raw, smooth_window) * G_FT_S2   # g → ft/s²
+            s[np.diff(t, prepend=t[0]) > 5] = np.nan            # mask big gaps
+            return s
+
+        # ── Auto-select axis ──────────────────────────────────────────────────
+        _gps_all = np.concatenate([_grp_derivs(r)["accel_ft_s2"].to_numpy() for r in runs])
+        if _cmp_axis == "Auto (best r)":
+            _best_r, _use_axis, _use_flip = -np.inf, "X", False
+            for _ax in ["X", "Y", "Z"]:
+                for _fl in [False, True]:
+                    _gf = np.concatenate([_gf_accel(_grp_derivs(r), _ax, _fl) for r in runs])
+                    _m  = np.isfinite(_gps_all) & np.isfinite(_gf)
+                    if _m.sum() < 10:
+                        continue
+                    _r = float(np.corrcoef(_gps_all[_m], _gf[_m])[0, 1])
+                    if _r > _best_r:
+                        _best_r, _use_axis, _use_flip = _r, _ax, _fl
+            st.caption(f"Auto-selected: GForce **{_use_axis}**  "
+                       f"flip={_use_flip}  —  Pearson r = **{_best_r:.4f}**")
+        else:
+            _use_axis = _cmp_axis
+            _use_flip = _cmp_flip
+
+        # ── Assemble per-run arrays ───────────────────────────────────────────
+        _run_gps, _run_gf = [], []
+        for _r in runs:
+            _g = _grp_derivs(_r)
+            _run_gps.append(_g["accel_ft_s2"].to_numpy())
+            _run_gf.append(_gf_accel(_g, _use_axis, _use_flip))
+
+        _gf_all = np.concatenate(_run_gf)
+        _m_all  = np.isfinite(_gps_all) & np.isfinite(_gf_all)
+        _gps_v  = _gps_all[_m_all]
+        _gf_v   = _gf_all[_m_all]
+        _resid  = _gps_v - _gf_v
+
+        # ── Per-run stats ─────────────────────────────────────────────────────
+        _stat_rows = []
+        for _i, _r in enumerate(runs):
+            _m = np.isfinite(_run_gps[_i]) & np.isfinite(_run_gf[_i])
+            if _m.sum() < 5:
+                continue
+            _gv, _av = _run_gps[_i][_m], _run_gf[_i][_m]
+            _stat_rows.append({
+                "Run": f"R{_i+1} {_r['direction']}",
+                "Target (mph)": _r["target_speed"],
+                "Pearson r": round(float(np.corrcoef(_gv, _av)[0, 1]), 4),
+                "Bias GPS−GF (ft/s²)": round(float(np.mean(_gv - _av)), 3),
+                "RMSE (ft/s²)": round(float(np.sqrt(np.mean((_gv - _av) ** 2))), 3),
+                "GPS max |a| (ft/s²)": round(float(np.nanmax(np.abs(_gv))), 2),
+                "GF  max |a| (ft/s²)": round(float(np.nanmax(np.abs(_av))), 2),
+            })
+
+        # ── Row 1: Overlay for selected run ───────────────────────────────────
+        # st.markdown("#### Overlay — Selected Run")
+        _sel_r   = runs[_cmp_run_idx]
+        _sel_grp = _grp_derivs(_sel_r)
+        _sel_gps = _sel_grp["accel_ft_s2"].to_numpy()
+        _sel_gf  = _gf_accel(_sel_grp, _use_axis, _use_flip)
+        _sel_d   = _sel_grp["Distance (mi)"].to_numpy()
+        _sel_t   = (_sel_grp["Elapsed time (sec)"] - _sel_grp["Elapsed time (sec)"].iloc[0]).to_numpy()
+
+        _cmp_use_time = st.radio(
+            "X axis", ["Distance (mi)", "Time (s)"], horizontal=True, key="cmp_xax"
+        ) == "Time (s)"
+        _sel_x = _sel_t if _cmp_use_time else _sel_d
+        _sel_xl = "Time from run start (s)" if _cmp_use_time else "Distance (mi)"
+
+        _fig_ov = go.Figure()
+        _fig_ov.add_trace(go.Scatter(x=_sel_x, y=_sel_gps, mode="lines",
+                                      name="GPS-derived", line=dict(color="royalblue", width=2)))
+        _fig_ov.add_trace(go.Scatter(x=_sel_x, y=_sel_gf, mode="lines",
+                                      name=f"GForce {_use_axis}", line=dict(color="tomato", width=2)))
+        _fig_ov.add_hline(y=0, line_dash="dot", line_color="gray")
+        _fig_ov.update_layout(
+            xaxis_title=_sel_xl, yaxis_title="Acceleration (ft/s²)",
+            height=320, legend=dict(orientation="h", y=1.08),
+            yaxis=dict(range=_pct_range(
+                np.concatenate([_sel_gps[np.isfinite(_sel_gps)], _sel_gf[np.isfinite(_sel_gf)]]),
+                pct=1, min_half=2.0, zero=True)),
+        )
+        st.plotly_chart(_fig_ov, use_container_width=True)
+
+        # ── Row 2: Unity scatter (2-D histogram) + residual histogram ─────────
+        st.markdown("#### All Runs — Unity Plot & Residuals")
+        _col_unity, _col_resid = st.columns(2)
+
+        with _col_unity:
+            _ax_lim = _pct_range(np.concatenate([_gps_v, _gf_v]), pct=1, min_half=2.0, zero=True)
+            _fig_unity = go.Figure()
+            _fig_unity.add_trace(go.Histogram2dContour(
+                x=_gps_v, y=_gf_v,
+                colorscale="Viridis", reversescale=False,
+                contours=dict(showlabels=False),
+                showscale=True, name="Density",
+                hovertemplate="GPS: %{x:.2f}<br>GForce: %{y:.2f}<extra></extra>",
+            ))
+            # y = x unity line
+            _fig_unity.add_trace(go.Scatter(
+                x=_ax_lim, y=_ax_lim, mode="lines",
+                line=dict(color="white", width=1.5, dash="dash"), name="y = x",
+                showlegend=True,
+            ))
+            _fig_unity.update_layout(
+                xaxis_title="GPS-derived accel (ft/s²)",
+                yaxis_title=f"GForce {_use_axis} (ft/s²)",
+                xaxis=dict(range=_ax_lim), yaxis=dict(range=_ax_lim, scaleanchor="x"),
+                height=420, title="Unity Plot (density contour)",
+            )
+            st.plotly_chart(_fig_unity, use_container_width=True)
+
+        with _col_resid:
+            _fig_res = go.Figure()
+            _fig_res.add_trace(go.Histogram(
+                x=_resid, nbinsx=80,
+                marker_color="steelblue", opacity=0.8, name="GPS − GForce",
+            ))
+            _fig_res.add_vline(x=0, line_dash="dash", line_color="white")
+            _fig_res.add_vline(x=float(np.mean(_resid)), line_dash="dot", line_color="yellow",
+                               annotation_text=f"mean={np.mean(_resid):.3f}", annotation_position="top right")
+            _fig_res.update_layout(
+                xaxis_title="Residual: GPS − GForce (ft/s²)",
+                yaxis_title="Count",
+                height=420, title="Residual Distribution",
+            )
+            st.plotly_chart(_fig_res, use_container_width=True)
+
+        # ── Row 3: Stats table ────────────────────────────────────────────────
+        if _stat_rows:
+            st.markdown("#### Per-Run Statistics")
+            st.dataframe(pd.DataFrame(_stat_rows), use_container_width=True, hide_index=True)
+
+        if len(_gps_v) > 0:
+            _overall_r = float(np.corrcoef(_gps_v, _gf_v)[0, 1])
+            _overall_rmse = float(np.sqrt(np.mean(_resid ** 2)))
+            _overall_bias = float(np.mean(_resid))
+            st.caption(
+                f"All runs combined — N = {len(_gps_v):,}  |  "
+                f"Pearson r = **{_overall_r:.4f}**  |  "
+                f"RMSE = **{_overall_rmse:.3f} ft/s²**  |  "
+                f"Bias (GPS−GF) = **{_overall_bias:.3f} ft/s²**"
             )
 
 # ═══════════════════════════════════════════════════════════════════════════════
