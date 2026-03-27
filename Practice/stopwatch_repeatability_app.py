@@ -48,7 +48,7 @@ def reset_state():
         "phase", "cue_intervals", "cumulative_targets", "cue_actual_elapsed",
         "cue_active", "cue_active_time", "next_cue_time", "test_start_time",
         "entered_times", "countdown_start", "go_time", "n_cycles",
-        "base_interval", "variation",
+        "base_interval", "variation", "entry_mode",
     ]
     for k in keys:
         st.session_state.pop(k, None)
@@ -79,7 +79,7 @@ visual cues — useful practice before any precision timed event.
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        n_cycles = st.number_input("Number of marks", min_value=3, max_value=30, value=10, step=1)
+        n_cycles = st.number_input("Number of marks", min_value=3, max_value=30, value=5, step=1)
     with col2:
         base_interval = st.number_input("Base interval (s)", min_value=5, max_value=120, value=15, step=5)
     with col3:
@@ -193,11 +193,30 @@ elif phase == "running":
 # ── ENTER TIMES ───────────────────────────────────────────────────────────────
 elif phase == "entering":
     st.title("✍️ Enter Your Stopwatch Readings")
-    st.markdown(
-        "Enter the **lap time** shown on your stopwatch at each **MARK!** — "
-        "the time since the previous mark (or since GO for mark 1).  \n"
-        "Format: `M:SS.xx` (e.g. `0:14.83`) or decimal seconds (e.g. `14.83`)."
+
+    entry_mode = st.radio(
+        "Stopwatch mode",
+        options=["Lap times", "Elapsed times"],
+        horizontal=True,
+        help=(
+            "**Lap times**: time since the previous mark (stopwatch reset at each mark or auto-lap).  \n"
+            "**Elapsed times**: cumulative time since GO (stopwatch runs continuously)."
+        ),
     )
+    st.session_state.entry_mode = entry_mode
+
+    if entry_mode == "Lap times":
+        st.markdown(
+            "Enter the **lap time** shown at each **MARK!** — "
+            "the time since the previous mark (or since GO for mark 1).  \n"
+            "Format: `M:SS.xx` (e.g. `0:14.83`) or decimal seconds (e.g. `14.83`)."
+        )
+    else:
+        st.markdown(
+            "Enter the **elapsed time** shown at each **MARK!** — "
+            "the total time since GO.  \n"
+            "Format: `M:SS.xx` (e.g. `1:32.47`) or decimal seconds (e.g. `92.47`)."
+        )
 
     n = len(st.session_state.cue_actual_elapsed)
 
@@ -224,11 +243,18 @@ elif phase == "entering":
 # ── RESULTS ───────────────────────────────────────────────────────────────────
 elif phase == "results":
     cumulative = st.session_state.cue_actual_elapsed
-    entered = st.session_state.entered_times
+    entered_raw = st.session_state.entered_times
+    entry_mode = st.session_state.get("entry_mode", "Lap times")
     n = len(cumulative)
 
     # Convert cumulative cue times to lap intervals
     actual = [cumulative[0]] + [cumulative[i] - cumulative[i - 1] for i in range(1, n)]
+
+    # If user entered elapsed times, convert to lap intervals
+    if entry_mode == "Elapsed times":
+        entered = [entered_raw[0]] + [entered_raw[i] - entered_raw[i - 1] for i in range(1, n)]
+    else:
+        entered = entered_raw
 
     errors = [entered[i] - actual[i] for i in range(n)]
     abs_errors = [abs(e) for e in errors]
@@ -318,15 +344,30 @@ elif phase == "results":
     st.plotly_chart(fig, use_container_width=True)
 
     # ── Detail table ──
-    df = pd.DataFrame(
-        {
-            "Mark": range(1, n + 1),
-            "Actual lap": [fmt_elapsed(a) for a in actual],
-            "Your lap": [fmt_elapsed(e) for e in entered],
-            "Error (s)": [f"{e:+.3f}" for e in errors],
-            "|Error| (s)": [f"{a:.3f}" for a in abs_errors],
-        }
-    )
+    if entry_mode == "Elapsed times":
+        actual_cumulative = cumulative
+        entered_cumulative = entered_raw
+        df = pd.DataFrame(
+            {
+                "Mark": range(1, n + 1),
+                "Actual elapsed": [fmt_elapsed(a) for a in actual_cumulative],
+                "Your elapsed": [fmt_elapsed(e) for e in entered_cumulative],
+                "Actual lap": [fmt_elapsed(a) for a in actual],
+                "Your lap": [fmt_elapsed(e) for e in entered],
+                "Error (s)": [f"{e:+.3f}" for e in errors],
+                "|Error| (s)": [f"{a:.3f}" for a in abs_errors],
+            }
+        )
+    else:
+        df = pd.DataFrame(
+            {
+                "Mark": range(1, n + 1),
+                "Actual lap": [fmt_elapsed(a) for a in actual],
+                "Your lap": [fmt_elapsed(e) for e in entered],
+                "Error (s)": [f"{e:+.3f}" for e in errors],
+                "|Error| (s)": [f"{a:.3f}" for a in abs_errors],
+            }
+        )
     st.dataframe(df, hide_index=True, use_container_width=True)
 
     # ── Re-run ──
