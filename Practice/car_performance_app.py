@@ -29,7 +29,7 @@ st.set_page_config(page_title="Car Performance Review", layout="wide")
 st.title("Car Performance Review")
 
 # ── File selector ─────────────────────────────────────────────────────────────
-parquet_files = sorted(PRACTICE_DIR.glob("*.parquet"))
+parquet_files = sorted(PRACTICE_DIR.glob("*speed*.parquet"))
 if not parquet_files:
     st.error(f"No *.parquet files found in {PRACTICE_DIR}")
     st.stop()
