@@ -10,256 +10,30 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
 
+import telemetry
+from telemetry import (
+    TrapConfig,
+    MPH_S_TO_FT_S2, G_FT_S2,
+    smooth_series, compute_derivatives,
+    segment_exercise_runs, find_crossing_dist,
+    _sym_range, _pct_range,
+    _grp_derivs, _min_speed_near,
+    run_start_type, run_finish_type, get_run_timing_refs,
+)
+
 st.set_page_config(page_title="RaceBox Analysis", layout="wide", page_icon="🏎")
 
 DATALOGS = Path(__file__).parent
 
-# ── Physics constants ─────────────────────────────────────────────────────────
-MPH_S_TO_FT_S2 = 5280.0 / 3600.0   # 1 mph/s = 1.4667 ft/s²
-G_FT_S2 = 32.174                     # 1 g in ft/s²
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def smooth_series(arr: np.ndarray, window: int) -> np.ndarray:
-    """Centered rolling mean with edge handling."""
-    s = pd.Series(arr)
-    return s.rolling(window, center=True, min_periods=1).mean().to_numpy()
-
-
-def compute_derivatives(df: pd.DataFrame, smooth_window: int) -> pd.DataFrame:
-    """
-    Add smoothed speed, acceleration (ft/s²), acceleration (g), and jerk (ft/s³)
-    columns.  Uses np.gradient which handles non-uniform time spacing.
-    Large time gaps (>5 s) are masked to avoid spurious spikes.
-    """
-    df = df.copy()
-    t = df["Elapsed time (sec)"].to_numpy(dtype=float)
-    v = df["Speed (mph)"].to_numpy(dtype=float)
-
-    # Replace zero-speed GPS dropout spikes: if a single sample is 0 surrounded
-    # by non-zero values, interpolate it linearly.
-    mask_zero = (v == 0)
-    v_interp = pd.Series(np.where(mask_zero, np.nan, v)).interpolate().to_numpy()
-
-    v_smooth = smooth_series(v_interp, smooth_window)
-    df["speed_smooth"] = v_smooth
-
-    # Gap mask: flag rows where the time step to the NEXT sample is large
-    dt = np.diff(t, prepend=t[0])
-    gap_mask = dt > 5  # seconds
-
-    # Acceleration in mph/s → convert to ft/s² and g
-    dv_dt = np.gradient(v_smooth, t)          # mph/s (handles non-uniform t)
-    accel_raw = dv_dt * MPH_S_TO_FT_S2        # ft/s²
-    accel_raw[gap_mask] = np.nan
-    accel_smooth = smooth_series(accel_raw, smooth_window)
-    df["accel_ft_s2"] = accel_smooth
-    df["accel_g"] = accel_smooth / G_FT_S2
-
-    # Jerk in ft/s³
-    jerk_raw = np.gradient(np.nan_to_num(accel_smooth), t)
-    jerk_raw[gap_mask] = np.nan
-    df["jerk_ft_s3"] = smooth_series(jerk_raw, smooth_window)
-
-    return df
-
-
-def segment_exercise_runs(df: pd.DataFrame, lat_thresh: float,
-                          min_speed: float, min_rows: int,
-                          trap_east: float | None = None,
-                          trap_west: float | None = None,
-                          window_mi: float = 0.0,
-                          mi_per_deg_lon: float = 69.172) -> list[dict]:
-    """
-    Isolate the run zone (south of lat_thresh AND within the trap window in
-    longitude) and split into individual runs.  A new run boundary is declared
-    when speed drops below min_speed OR when there is a time gap > 30 s.
-
-    The run zone extends (window_mi) beyond each trap endpoint so that the
-    standing-start/stop region is captured.  Everything outside is Transit.
-
-    Target speed: per-sample speeds between the traps rounded to nearest 5 mph;
-    mode is used as target.  Falls back to full-segment mode when traps unknown.
-    """
-
-    if trap_east is not None and trap_west is not None and window_mi > 0:
-        window_deg = window_mi / mi_per_deg_lon
-        lon_lo = trap_west - window_deg
-        lon_hi = trap_east + window_deg
-        mask = (
-            (df["Latitude"] < lat_thresh) &
-            (df["Longitude"] >= lon_lo) &
-            (df["Longitude"] <= lon_hi)
-        )
-    else:
-        mask = df["Latitude"] < lat_thresh
-    
-    south = df[mask].copy().reset_index(drop=True)
-    if south.empty:
-        return []
-
-    south["is_moving"] = south["Speed (mph)"] >= min_speed
-    # Split only on time gaps — the lon zone filter already separates passes.
-    # Speed transitions within a pass (e.g. standing start stop) stay in one run.
-    south["seg_id"] = (south["Elapsed time (sec)"].diff().fillna(0) > 30).cumsum()
-
-    runs = []
-    for seg_id, grp in south.groupby("seg_id"):
-        moving = grp[grp["is_moving"]]
-        if len(moving) < min_rows:
-            continue
-        mean_spd = moving["Speed (mph)"].mean()
-
-        # Determine direction so we know which trap is entry vs exit
-        lon_delta = grp["Longitude"].iloc[-1] - grp["Longitude"].iloc[0]
-        going_west = lon_delta < 0
-
-        # Restrict to measured section when trap positions are available
-        speed_pool = moving
-        if trap_east is not None and trap_west is not None:
-            en_lon = trap_east if going_west else trap_west
-            ex_lon = trap_west if going_west else trap_east
-            en_d = find_crossing_dist(grp, en_lon, going_west)
-            ex_d = find_crossing_dist(grp, ex_lon, going_west)
-            if en_d is not None and ex_d is not None:
-                d_lo, d_hi = min(en_d, ex_d), max(en_d, ex_d)
-                trap_section = moving[
-                    (moving["Distance (mi)"] >= d_lo) &
-                    (moving["Distance (mi)"] <= d_hi)
-                ]
-                if not trap_section.empty:
-                    speed_pool = trap_section
-
-        # Mode of per-sample speeds rounded to nearest 5 mph
-        rounded = (speed_pool["Speed (mph)"] / 5).round() * 5
-        target = int(rounded.mode().iloc[0])
-        direction = "West" if going_west else "East"
-        distance = abs(grp["Distance (mi)"].iloc[-1] - grp["Distance (mi)"].iloc[0])
-        _start_time = str(grp["Time"].iloc[0]) if "Time" in grp.columns else ""
-        runs.append({
-            "seg_id": seg_id,
-            "start_elapsed": float(grp["Elapsed time (sec)"].iloc[0]),
-            "end_elapsed": float(grp["Elapsed time (sec)"].iloc[-1]),
-            "start_time": _start_time,
-            "direction": direction,
-            "mean_speed": mean_spd,
-            "target_speed": target,
-            "max_speed": grp["Speed (mph)"].max(),
-            "distance_mi": distance,
-            "n_rows": len(grp),
-            "data": grp.reset_index(drop=True),
-        })
-    return runs
-
-
-# ── Trap crossing helper ──────────────────────────────────────────────────────
-
-def find_crossing_dist(grp: pd.DataFrame, trap_lon: float, going_west: bool) -> float | None:
-    """
-    Return the cumulative odometer distance (mi) at which the run crosses the
-    perpendicular to the trap line at the specified trap endpoint (trap_lon).
-
-    The trap is treated as an oblique line (not pure east-west) using the
-    module-level geometry (_TRAP_UX, _TRAP_UY, _MI_PER_DEG_LON, etc.).
-    The "crossing" is where the GPS track's signed projection along the trap
-    direction past the trap endpoint changes sign — i.e. the car passes the
-    gate perpendicular to the trap at that endpoint.
-
-    Returns None if the crossing is never reached.
-    """
-    lat  = grp["Latitude"].to_numpy()
-    lon  = grp["Longitude"].to_numpy()
-    dist = grp["Distance (mi)"].to_numpy()
-
-    # Identify which endpoint we are looking for
-    trap_lat = trap_east_lat if trap_lon >= (trap_east + trap_west) / 2 else trap_west_lat
-
-    # Signed projection along the trap direction from the target endpoint.
-    # Positive = car is on the east side; negative = west side.
-    s = (((lon - trap_lon) * _MI_PER_DEG_LON * _TRAP_UX) +
-         ((lat - trap_lat) * _MI_PER_DEG_LAT * _TRAP_UY))
-
-    if going_west:
-        # Westbound: starts east of this endpoint (s > 0), crosses when s <= 0
-        mask = s <= 0
-    else:
-        # Eastbound: starts west of this endpoint (s < 0), crosses when s >= 0
-        mask = s >= 0
-
-    if not mask.any():
-        return None
-
-    idx = int(np.argmax(mask))   # first True
-    if idx == 0:
-        return float(dist[0])
-
-    # Linear interpolation between the bracketing samples
-    s0, s1 = s[idx - 1], s[idx]
-    d0, d1 = dist[idx - 1], dist[idx]
-    frac = (-s0) / (s1 - s0) if s1 != s0 else 0.0
-    return float(d0 + frac * (d1 - d0))
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def _haversine_cumulative_mi(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
-    """Compute cumulative great-circle distance (miles) from sequential lat/lon arrays."""
-    R_MI = 3958.8
-    lat = np.radians(lat_deg)
-    lon = np.radians(lon_deg)
-    dlat = np.diff(lat, prepend=lat[0])
-    dlon = np.diff(lon, prepend=lon[0])
-    lat_prev = np.concatenate([[lat[0]], lat[:-1]])
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat) * np.cos(lat_prev) * np.sin(dlon / 2) ** 2
-    step_mi = R_MI * 2 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
-    return np.cumsum(step_mi)
-
-
 @st.cache_data
 def load_track(path: str) -> pd.DataFrame:
-    """Load a RaceBox parquet file and normalise it to the standard internal schema.
-
-    RaceBox columns used:
-        Time        — ISO-8601 string  (e.g. '2026-03-10T18:03:09.600')
-        Latitude    — decimal degrees
-        Longitude   — decimal degrees
-        Speed       — mph (confirmed by GPS cross-check)
-
-    Derived columns added to match the rest of the app:
-        Elapsed time (sec)  — seconds since first record
-        Distance (mi)       — cumulative haversine distance
-        Speed (mph)         — alias of Speed
-        Date                — date string extracted from Time
-    """
-    p = Path(path)
-    df = pd.read_parquet(p)
-
-    # Parse timestamps and derive elapsed time
-    df["_ts"] = pd.to_datetime(df["Time"])
-    df = df.sort_values("_ts").reset_index(drop=True)
-    df["Elapsed time (sec)"] = (df["_ts"] - df["_ts"].iloc[0]).dt.total_seconds()
-
-    # Deduplicate on elapsed time (keeps first occurrence)
-    df = df.drop_duplicates(subset="Elapsed time (sec)", keep="first").reset_index(drop=True)
-
-    # Replace zero lat/lon with NaN (GPS lock lost)
-    df.loc[df["Latitude"] == 0, "Latitude"] = np.nan
-    df.loc[df["Longitude"] == 0, "Longitude"] = np.nan
-
-    # Cumulative GPS distance
-    df["Distance (mi)"] = _haversine_cumulative_mi(
-        df["Latitude"].to_numpy(), df["Longitude"].to_numpy()
-    )
-
-    # Speed alias (already in mph)
-    df["Speed (mph)"] = df["Speed"]
-
-    # Date column for hover tooltips
-    df["Date"] = df["_ts"].dt.strftime("%Y-%m-%d")
-
-    df = df.drop(columns=["_ts"])
-    return df.reset_index(drop=True)
+    """Load a RaceBox parquet and normalise to the standard internal schema."""
+    return telemetry.load_racebox(path)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -322,31 +96,18 @@ trap_east     = float(st.session_state.get("cfg_east_ctr_lon", _EAST_TRAP_LON))
 trap_west_lat = float(st.session_state.get("cfg_west_ctr_lat", _WEST_TRAP_LAT))
 trap_west     = float(st.session_state.get("cfg_west_ctr_lon", _WEST_TRAP_LON))
 
-# ── Precise trap geometry ──────────────────────────────────────────────────────
-# The trap is exactly 5280 ft (1 mile).  We estimate each endpoint's latitude
-# from the at-rest GPS cluster at that trap so that crossing detection uses
-# the actual (slightly oblique) trap line rather than a pure longitude gate.
+# ── Trap geometry and run segmentation ────────────────────────────────────────
+# TrapConfig derives all Cartesian geometry from the four endpoint coordinates.
 
-TRAP_DIST_MI = 1.0   # 5280 ft exactly
+trap = TrapConfig(
+    east_lon=trap_east, west_lon=trap_west,
+    east_lat=trap_east_lat, west_lat=trap_west_lat,
+    flying_window_mi=flying_window_mi,
+    min_speed=min_speed,
+)
+TRAP_DIST_MI = trap.dist_mi   # kept as a local alias for readability in tabs
 
-# Convert the trap endpoints to approximate Cartesian (x east, y north) in miles
-_trap_ref_lat_rad = np.radians((trap_east_lat + trap_west_lat) / 2)
-_MI_PER_DEG_LON   = 69.172 * float(np.cos(_trap_ref_lat_rad))
-_MI_PER_DEG_LAT   = 69.0
-_dx = (trap_east - trap_west) * _MI_PER_DEG_LON   # miles east
-_dy = (trap_east_lat - trap_west_lat) * _MI_PER_DEG_LAT  # miles north
-_trap_chord = float(np.sqrt(_dx**2 + _dy**2))
-
-# Trap unit vector (west → east), Cartesian miles
-if _trap_chord > 0:
-    _TRAP_UX, _TRAP_UY = _dx / _trap_chord, _dy / _trap_chord
-else:
-    _TRAP_UX, _TRAP_UY = 1.0, 0.0
-
-runs = segment_exercise_runs(df_raw, lat_threshold, min_speed, min_rows,
-                             trap_east=trap_east, trap_west=trap_west,
-                             window_mi=flying_window_mi,
-                             mi_per_deg_lon=_MI_PER_DEG_LON)
+runs = segment_exercise_runs(df_raw, lat_threshold, min_speed, min_rows, trap=trap)
 
 # ── Transit segments (pre-compute before tabs) ────────────────────────────────
 ex_mask = df_raw["Latitude"] < lat_threshold
@@ -362,43 +123,7 @@ df_outbound["Leg"] = "To Exercise"
 df_inbound["Leg"]  = "From Exercise"
 df_transit = pd.concat([df_outbound, df_inbound]).reset_index(drop=True)
 
-# ── Range helpers (used in multiple tabs) ─────────────────────────────────────
-
-def _sym_range(arr: np.ndarray, pad: float = 0.15,
-               min_half: float = 0.5, zero: bool = False) -> list:
-    """Min/max range with fractional padding; optionally force zero in range."""
-    vals = arr[np.isfinite(arr)]
-    if len(vals) == 0:
-        return [-min_half, min_half]
-    lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
-    if zero:
-        lo, hi = min(lo, 0.0), max(hi, 0.0)
-    span = max(hi - lo, min_half * 2)
-    p = span * pad
-    return [lo - p, hi + p]
-
-
-def _pct_range(arr: np.ndarray, pct: float = 2, pad: float = 0.15,
-               min_half: float = 1.0, zero: bool = True) -> list:
-    """Percentile-clipped range (clips derivative spikes); optionally force zero."""
-    vals = arr[np.isfinite(arr)]
-    if len(vals) == 0:
-        return [-min_half, min_half]
-    lo = float(np.percentile(vals, pct))
-    hi = float(np.percentile(vals, 100 - pct))
-    if zero:
-        lo, hi = min(lo, 0.0), max(hi, 0.0)
-    span = max(hi - lo, min_half * 2)
-    p = span * pad
-    return [lo - p, hi + p]
-
-
-# ── Shared map/run helpers ────────────────────────────────────────────────────
-
-def _grp_derivs(r: dict) -> pd.DataFrame:
-    """Return the derivative-enriched DataFrame for a run, computing if needed."""
-    g = r.get("_grp_with_derivs")
-    return g if g is not None else compute_derivatives(r["data"].copy(), smooth_window)
+# ── Shared map helpers ────────────────────────────────────────────────────────
 
 
 def _esri_layer() -> list[dict]:
@@ -444,135 +169,6 @@ def _add_trap_lines(fig: go.Figure) -> None:
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-def _min_speed_near(grp: pd.DataFrame, center_d: float, v_col: str, side: str = "before") -> float:
-    """Return minimum smoothed speed in the standing-detection window OUTSIDE the trap.
-
-    side='before': [center_d - window, center_d]  — approach to entry trap
-    side='after' : [center_d, center_d + window]  — departure from exit trap
-    The window never extends into the measured section between traps.
-    """
-    _d = grp["Distance (mi)"].to_numpy()
-    if side == "before":
-        mask = (_d >= center_d - flying_window_mi) & (_d <= center_d)
-    else:
-        mask = (_d >= center_d) & (_d <= center_d + flying_window_mi)
-    if mask.any():
-        return float(grp.loc[mask, v_col].min())
-    # Fallback: interpolated point if window contains no samples
-    return float(np.interp(center_d, _d, grp[v_col].to_numpy()))
-
-
-def run_start_type(r: dict) -> str:
-    """Return 'Standing' or 'Flying' based on min speed in window around trap entry.
-
-    Flying  = approach speed is within 5 mph of target (car entered at speed).
-    Standing = approach speed is more than 5 mph below target (car started from rest).
-    """
-    grp   = _grp_derivs(r)
-    gw    = r["direction"] == "West"
-    e_lon = trap_east if gw else trap_west
-    e_d   = find_crossing_dist(grp, e_lon, gw)
-    v_col = "speed_smooth" if "speed_smooth" in grp.columns else "Speed (mph)"
-    if e_d is None:
-        e_d = grp["Distance (mi)"].iloc[0]
-    return "Flying" if _min_speed_near(grp, e_d, v_col, side="before") >= r["target_speed"] - 5 else "Standing"
-
-
-def run_finish_type(r: dict) -> str:
-    """Return 'Standing' or 'Flying' based on min speed in window around trap exit.
-
-    Flying  = departure speed is within 5 mph of target (car left at speed).
-    Standing = departure speed is more than 5 mph below target (car stopped after).
-    """
-    grp    = _grp_derivs(r)
-    gw     = r["direction"] == "West"
-    en_lon = trap_east if gw else trap_west
-    ex_lon = trap_west if gw else trap_east
-    en_d   = find_crossing_dist(grp, en_lon, gw)
-    ex_d   = find_crossing_dist(grp, ex_lon, gw)
-    if ex_d is None:
-        ex_d = (en_d + TRAP_DIST_MI) if en_d is not None else grp["Distance (mi)"].iloc[-1]
-    v_col = "speed_smooth" if "speed_smooth" in grp.columns else "Speed (mph)"
-    return "Flying" if _min_speed_near(grp, ex_d, v_col, side="after") >= r["target_speed"] - 5 else "Standing"
-
-
-def _last_stopped_before(grp: pd.DataFrame, before_d: float) -> float | None:
-    """Return Distance (mi) at the last sample with Speed < min_speed before before_d."""
-    candidates = grp[(grp["Distance (mi)"] < before_d) & (grp["Speed (mph)"] < min_speed)]
-    if candidates.empty:
-        return None
-    return float(candidates["Distance (mi)"].iloc[-1])
-
-
-def _first_stopped_after(grp: pd.DataFrame, after_d: float) -> float | None:
-    """Return Distance (mi) at the first sample with Speed < min_speed after after_d."""
-    candidates = grp[(grp["Distance (mi)"] > after_d) & (grp["Speed (mph)"] < min_speed)]
-    if candidates.empty:
-        return None
-    return float(candidates["Distance (mi)"].iloc[0])
-
-
-
-def get_run_timing_refs(r: dict,
-                        start_type: str | None = None,
-                        finish_type: str | None = None) -> tuple[float | None, float | None]:
-    """Return (entry_d, exit_d) cumulative-odometer distances (mi) for timing.
-
-    Separates the timing-reference logic from segmentation and from
-    standing/flying detection so each concern lives in one place.
-
-    Standing start → entry_d = last stationary GPS sample before the 50% distance mark
-                     of the segment. The driver lines up more precisely than GPS can
-                     resolve, so we anchor at the last stopped moment in the first half.
-    Standing finish → exit_d = GPS distance at the first stationary sample after the
-                     segment midpoint (the driver stops at the trap; GPS position noise
-                     means the stop point varies per run, so we pin the stop to
-                     exit_d and derive entry_d = exit_d - TRAP_DIST_MI so all runs
-                     map their stop to exactly x = TRAP_DIST_MI in every chart).
-                     Fallback: GPS trap-crossing → end of segment.
-    Flying start/finish → GPS trap-crossing geometry, TRAP_DIST_MI fallback.
-    """
-    if start_type is None:
-        start_type = run_start_type(r)
-    if finish_type is None:
-        finish_type = run_finish_type(r)
-    grp = _grp_derivs(r)
-    gw = r["direction"] == "West"
-
-    d_start = float(grp["Distance (mi)"].iloc[0])
-    d_end   = float(grp["Distance (mi)"].iloc[-1])
-    d_mid   = (d_start + d_end) / 2
-
-    # ── Standing finish: anchor on actual stop, derive entry backwards ────────
-    if finish_type == "Standing":
-        exit_d = _first_stopped_after(grp, d_mid)
-        if exit_d is None:                          # no clean stop found
-            ex_lon = trap_west if gw else trap_east
-            exit_d = find_crossing_dist(grp, ex_lon, gw)
-        if exit_d is None:
-            exit_d = d_end
-        entry_d = exit_d - TRAP_DIST_MI
-        return entry_d, exit_d
-
-    # ── Standing start: anchor on last stopped sample, derive exit forwards ───
-    if start_type == "Standing":
-        entry_d = _last_stopped_before(grp, d_mid)
-        if entry_d is None:
-            moving_mask = grp["Speed (mph)"] >= min_speed
-            entry_d = float(grp["Distance (mi)"].iloc[int(moving_mask.to_numpy().argmax())]) \
-                      if moving_mask.any() else d_start
-        return entry_d, entry_d + TRAP_DIST_MI
-
-    # ── Flying start and finish: GPS trap-crossing geometry ───────────────────
-    en_lon  = trap_east if gw else trap_west
-    ex_lon  = trap_west if gw else trap_east
-    entry_d = find_crossing_dist(grp, en_lon, gw)
-    exit_d  = find_crossing_dist(grp, ex_lon, gw)
-    if entry_d is None and exit_d is not None:
-        entry_d = exit_d - TRAP_DIST_MI
-    if exit_d is None and entry_d is not None:
-        exit_d = entry_d + TRAP_DIST_MI
-    return entry_d, exit_d
 
 
 tab_map, tab_overview, tab_detail, tab_accel, tab_compare, tab_settings, tab_transit = st.tabs(
@@ -581,7 +177,7 @@ tab_map, tab_overview, tab_detail, tab_accel, tab_compare, tab_settings, tab_tra
 
 # ── Module-scope map state (used across multiple tabs) ────────────────────────
 
-_window_deg_lon = flying_window_mi / _MI_PER_DEG_LON
+_window_deg_lon = trap.flying_window_mi / trap.mi_per_deg_lon
 _run_zone_mask = (
     (df_raw["Latitude"] < lat_threshold) &
     (df_raw["Longitude"] >= min(trap_east, trap_west) - _window_deg_lon) &
@@ -695,11 +291,11 @@ with tab_overview:
 
     # Build the peer acceleration model once from all standing-start runs.
     # Normalised speed-vs-distance profiles aligned at trap entry, pointwise median.
-    _ov_standing = [r for r in runs if run_start_type(r) == "Standing"]
+    _ov_standing = [r for r in runs if run_start_type(r, trap, smooth_window) == "Standing"]
     _ov_accel_profs = []
     for _r_p in _ov_standing:
         _grp_p  = _r_p["_grp_with_derivs"]
-        _en_p, _ = get_run_timing_refs(_r_p)
+        _en_p, _ = get_run_timing_refs(_r_p, trap, smooth_window)
         if _en_p is None:
             continue
         _d_p  = _grp_p["Distance (mi)"].to_numpy()
@@ -730,7 +326,7 @@ with tab_overview:
         grp = r["_grp_with_derivs"]
 
         # Timing references: see get_run_timing_refs for anchor logic per start/finish type.
-        en_d, ex_d = get_run_timing_refs(r)
+        en_d, ex_d = get_run_timing_refs(r, trap, smooth_window)
 
         if en_d is not None and ex_d is not None:
             d_lo, d_hi = min(en_d, ex_d), max(en_d, ex_d)
@@ -761,7 +357,7 @@ with tab_overview:
                                      _v_arr[_tmask][_si], np.nan)
                 _target_f = float(r["target_speed"])
 
-                if run_start_type(r) == "Flying" or _OV_DGRID is None:
+                if run_start_type(r, trap, smooth_window) == "Flying" or _OV_DGRID is None:
                     _v_id = np.full(len(_d_s), _target_f)
                 else:
                     _v_id = np.clip(
@@ -782,8 +378,8 @@ with tab_overview:
             "Time": r["start_time"],
             "Direction": r["direction"],
             "Target (mph)": r["target_speed"],
-            "Start": run_start_type(r),
-            "Finish": run_finish_type(r),
+            "Start": run_start_type(r, trap, smooth_window),
+            "Finish": run_finish_type(r, trap, smooth_window),
             "Time err at exit (s)": time_err_s,
             "Mean speed (mph)": round(float(section["Speed (mph)"].mean()), 1),
             "Max speed (mph)": round(float(section["Speed (mph)"].max()), 1),
@@ -839,7 +435,7 @@ with tab_overview:
     fig_trap = go.Figure()
     for i, r in enumerate(runs):
         grp = r["data"].copy()
-        entry_dist, _ = get_run_timing_refs(r)
+        entry_dist, _ = get_run_timing_refs(r, trap, smooth_window)
         aligned = entry_dist is not None
         if entry_dist is None:
             entry_dist = grp["Distance (mi)"].iloc[0]
@@ -924,7 +520,7 @@ with tab_detail:
 
     run_labels = [
         f"Run {i+1}: {r['direction']}  ~{r['target_speed']} mph  "
-        f"[{run_start_type(r)} start | {run_finish_type(r)} finish]  "
+        f"[{run_start_type(r, trap, smooth_window)} start | {run_finish_type(r, trap, smooth_window)} finish]  "
         f"@ {r['start_time']}  ({r['start_elapsed']}–{r['end_elapsed']} s)"
         for i, r in enumerate(runs)
     ]
@@ -971,7 +567,7 @@ with tab_detail:
     # Standing → motion-start distance + GPS 1-mile mark.
     # Flying   → GPS trap-crossing geometry with TRAP_DIST_MI fallback.
     going_west  = r["direction"] == "West"
-    entry_d_raw, exit_d_raw = get_run_timing_refs(r)
+    entry_d_raw, exit_d_raw = get_run_timing_refs(r, trap, smooth_window)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1160,7 +756,7 @@ with tab_detail:
 
     else:
         # ── Standing start: acceleration model from ALL standing-start runs ───
-        all_standing = [r for r in runs if run_start_type(r) == "Standing"]
+        all_standing = [r for r in runs if run_start_type(r, trap, smooth_window) == "Standing"]
         peer_labels_str = ", ".join(f"R{runs.index(r)+1} {r['direction']}" for r in all_standing)
 
         col_info1, col_info2 = st.columns(2)
@@ -1183,7 +779,7 @@ with tab_detail:
             grp_p = r_p.get("_grp_with_derivs")
             if grp_p is None:
                 grp_p = compute_derivatives(r_p["data"].copy(), smooth_window)
-            entry_d_p, _ = get_run_timing_refs(r_p)
+            entry_d_p, _ = get_run_timing_refs(r_p, trap, smooth_window)
             if entry_d_p is None:
                 continue
             d_p   = grp_p["Distance (mi)"].to_numpy()
@@ -1244,7 +840,7 @@ with tab_detail:
     accel_decel_ideal = jerk_decel_ideal = None
 
     if not is_flying_finish:
-        all_standing_finish = [r for r in runs if run_finish_type(r) == "Standing"]
+        all_standing_finish = [r for r in runs if run_finish_type(r, trap, smooth_window) == "Standing"]
         decel_profs = []
         for r_p in all_standing_finish:
             grp_p = r_p.get("_grp_with_derivs")
@@ -1252,7 +848,7 @@ with tab_detail:
                 grp_p = compute_derivatives(r_p["data"].copy(), smooth_window)
             vt_p = float(r_p["target_speed"])
 
-            entry_d_p, exit_d_p = get_run_timing_refs(r_p)
+            entry_d_p, exit_d_p = get_run_timing_refs(r_p, trap, smooth_window)
             if exit_d_p is None:
                 continue
 
@@ -1626,8 +1222,8 @@ with tab_accel:
 
         # ── Acceleration ─────────────────────────────────────────────────────
         st.subheader("Acceleration — Standing Starts")
-        all_ss = [r for r in runs if run_start_type(r) == "Standing"]
-        all_sf = [r for r in runs if run_finish_type(r) == "Standing"]
+        all_ss = [r for r in runs if run_start_type(r, trap, smooth_window) == "Standing"]
+        all_sf = [r for r in runs if run_finish_type(r, trap, smooth_window) == "Standing"]
 
         if not all_ss:
             st.info("No standing-start runs found.")
@@ -1656,8 +1252,8 @@ with tab_accel:
             )
 
             for idx, r_p in enumerate(ss_sel):
-                grp_p = _grp_derivs(r_p)
-                en_d, _ = get_run_timing_refs(r_p)
+                grp_p = _grp_derivs(r_p, smooth_window)
+                en_d, _ = get_run_timing_refs(r_p, trap, smooth_window)
                 if en_d is None:
                     continue
 
@@ -1769,8 +1365,8 @@ with tab_accel:
             )
 
             for idx, r_p in enumerate(sf_sel):
-                grp_p    = _grp_derivs(r_p)
-                _, ex_d  = get_run_timing_refs(r_p)
+                grp_p    = _grp_derivs(r_p, smooth_window)
+                _, ex_d  = get_run_timing_refs(r_p, trap, smooth_window)
                 if ex_d is None:
                     continue
 
@@ -1892,12 +1488,12 @@ with tab_compare:
             return s
 
         # ── Auto-select axis ──────────────────────────────────────────────────
-        _gps_all = np.concatenate([_grp_derivs(r)["accel_ft_s2"].to_numpy() for r in runs])
+        _gps_all = np.concatenate([_grp_derivs(r, smooth_window)["accel_ft_s2"].to_numpy() for r in runs])
         if _cmp_axis == "Auto (best r)":
             _best_r, _use_axis, _use_flip = -np.inf, "X", False
             for _ax in ["X", "Y", "Z"]:
                 for _fl in [False, True]:
-                    _gf = np.concatenate([_gf_accel(_grp_derivs(r), _ax, _fl) for r in runs])
+                    _gf = np.concatenate([_gf_accel(_grp_derivs(r, smooth_window), _ax, _fl) for r in runs])
                     _m  = np.isfinite(_gps_all) & np.isfinite(_gf)
                     if _m.sum() < 10:
                         continue
@@ -2068,10 +1664,10 @@ with tab_settings:
         st.number_input("West lat", format="%.5f", step=0.00001, key="cfg_west_ctr_lat")
         st.number_input("West lon", format="%.5f", step=0.00001, key="cfg_west_ctr_lon")
 
-    _dist_ft = _trap_chord * 5280
+    _dist_ft = trap.chord_mi * 5280
     st.metric(
         "Distance between traps",
-        f"{_dist_ft:.1f} ft  ({_trap_chord:.4f} mi)",
+        f"{_dist_ft:.1f} ft  ({trap.chord_mi:.4f} mi)",
         delta=f"{_dist_ft - 5280:.1f} ft vs 5280 ft target",
         delta_color="inverse",
     )
