@@ -1,6 +1,6 @@
 """
-RaceBox — Acceleration & Jerk Analysis
-Practice run evaluation (RaceBox GPS logger)
+Practice Run Analysis — Acceleration & Jerk
+Supports RaceBox GPS logger files and speed-tracker parquet files.
 """
 import streamlit as st
 import pandas as pd
@@ -21,7 +21,7 @@ from telemetry import (
     run_start_type, run_finish_type, get_run_timing_refs,
 )
 
-st.set_page_config(page_title="RaceBox Analysis", layout="wide", page_icon="🏎")
+st.set_page_config(page_title="Practice Run Analysis", layout="wide", page_icon="🏎")
 
 DATALOGS = Path(__file__).parent
 
@@ -32,19 +32,28 @@ DATALOGS = Path(__file__).parent
 
 @st.cache_data
 def load_track(path: str) -> pd.DataFrame:
-    """Load a RaceBox parquet and normalise to the standard internal schema."""
-    return telemetry.load_racebox(path)
+    """Load a parquet file and normalise to the standard internal schema.
+
+    Files whose name starts with 'RaceBox' are loaded via telemetry.load_racebox
+    (raw ISO-8601 timestamps, haversine distance computation).  All other files
+    are treated as pre-processed speed-tracker output and loaded via
+    telemetry.load_speed_tracker.
+    """
+    if Path(path).name.startswith("RaceBox"):
+        return telemetry.load_racebox(path)
+    return telemetry.load_speed_tracker(path)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-st.title("Practice run evaluation (RaceBox)")
-st.caption("Analyze GPS logs from the RaceBox GPS logger to evaluate acceleration, jerk, and run quality.")
+st.title("Practice Run Analysis")
+st.caption("Analyze GPS logs from RaceBox or speed-tracker files to evaluate acceleration, jerk, and run quality.")
 
-rb_files    = sorted(DATALOGS.glob("RaceBox*.parquet"), reverse=True)
-track_files = rb_files
+rb_files = sorted(DATALOGS.glob("RaceBox*.parquet"), reverse=True)
+st_files = sorted(DATALOGS.glob("*speed_tracker*.parquet"), reverse=True)
+track_files = sorted(rb_files + st_files, key=lambda p: p.name, reverse=True)
 if not track_files:
-    st.error(f"No RaceBox parquet files found in {DATALOGS}")
+    st.error(f"No parquet files found in {DATALOGS}")
     st.stop()
 
 # ── Settings defaults via session state (Settings tab widgets write here) ─────
