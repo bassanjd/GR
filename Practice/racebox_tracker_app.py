@@ -714,8 +714,8 @@ with tab_detail:
     # Detect flying vs standing start/finish using min speed in window around each trap
     _center_en = entry_d_raw if entry_d_raw is not None else grp["Distance (mi)"].iloc[0]
     _center_ex = exit_d_raw  if exit_d_raw  is not None else grp["Distance (mi)"].iloc[-1]
-    speed_at_entry = _min_speed_near(grp, _center_en, "speed_smooth", side="before")
-    speed_at_exit  = _min_speed_near(grp, _center_ex, "speed_smooth", side="after")
+    speed_at_entry = _min_speed_near(grp, _center_en, "speed_smooth", side="before", flying_window_mi=flying_window_mi)
+    speed_at_exit  = _min_speed_near(grp, _center_ex, "speed_smooth", side="after",  flying_window_mi=flying_window_mi)
     is_flying        = speed_at_entry >= r["target_speed"] - 5
     is_flying_finish = speed_at_exit  >= r["target_speed"] - 5
     start_type  = "Flying start"  if is_flying        else "Standstill start"
@@ -1518,7 +1518,7 @@ with tab_compare:
         # ── Assemble per-run arrays ───────────────────────────────────────────
         _run_gps, _run_gf = [], []
         for _r in runs:
-            _g = _grp_derivs(_r)
+            _g = _grp_derivs(_r, smooth_window)
             _run_gps.append(_g["accel_ft_s2"].to_numpy())
             _run_gf.append(_gf_accel(_g, _use_axis, _use_flip))
 
@@ -1548,7 +1548,7 @@ with tab_compare:
         # ── Row 1: Overlay for selected run ───────────────────────────────────
         # st.markdown("#### Overlay — Selected Run")
         _sel_r   = runs[_cmp_run_idx]
-        _sel_grp = _grp_derivs(_sel_r)
+        _sel_grp = _grp_derivs(_sel_r, smooth_window)
         _sel_gps = _sel_grp["accel_ft_s2"].to_numpy()
         _sel_gf  = _gf_accel(_sel_grp, _use_axis, _use_flip)
         _sel_d   = _sel_grp["Distance (mi)"].to_numpy()
