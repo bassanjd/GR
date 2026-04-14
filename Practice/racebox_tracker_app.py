@@ -1161,14 +1161,15 @@ with tab_accel:
                 v_ap  = v_p[sl][acc_phase]
                 a_ap  = a_p[sl][acc_phase]
                 j_ap  = j_p[sl][acc_phase]
-                s_ord = np.argsort(v_ap)
                 fig_acc.add_trace(go.Scatter(
-                    x=v_ap[s_ord], y=a_ap[s_ord], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                    x=v_ap, y=a_ap, mode="lines",
+                    line=dict(color=color, width=1),
+                    name=lbl, showlegend=False, legendgroup=lbl,
                 ), row=2, col=2)
                 fig_acc.add_trace(go.Scatter(
-                    x=v_ap[s_ord], y=j_ap[s_ord], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                    x=v_ap, y=j_ap, mode="lines",
+                    line=dict(color=color, width=1),
+                    name=lbl, showlegend=False, legendgroup=lbl,
                 ), row=3, col=2)
 
             # Reference lines — left column
@@ -1250,14 +1251,15 @@ with tab_accel:
                 v_dp  = v_p[sl_mask][dec_mask]
                 a_dp  = a_p[sl_mask][dec_mask]
                 j_dp  = j_p[sl_mask][dec_mask]
-                s_ord = np.argsort(-v_dp)
                 fig_dec.add_trace(go.Scatter(
-                    x=v_dp[s_ord], y=a_dp[s_ord], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                    x=v_dp, y=a_dp, mode="lines",
+                    line=dict(color=color, width=1),
+                    name=lbl, showlegend=False, legendgroup=lbl,
                 ), row=2, col=2)
                 fig_dec.add_trace(go.Scatter(
-                    x=v_dp[s_ord], y=j_dp[s_ord], mode="lines",
-                    name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
+                    x=v_dp, y=j_dp, mode="lines",
+                    line=dict(color=color, width=1),
+                    name=lbl, showlegend=False, legendgroup=lbl,
                 ), row=3, col=2)
 
             for _r in (2, 3):
