@@ -256,6 +256,8 @@ def segment_exercise_runs(
 
         rounded   = (speed_pool["Speed (mph)"] / 5).round() * 5
         target    = int(rounded.mode().iloc[0])
+        if target == 0:
+            continue
         direction = "West" if going_west else "East"
         distance  = abs(grp["Distance (mi)"].iloc[-1] - grp["Distance (mi)"].iloc[0])
         _start_time = str(grp["Time"].iloc[0]) if "Time" in grp.columns else ""

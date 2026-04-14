@@ -15,13 +15,22 @@ from telemetry import (
     TrapConfig,
     MPH_S_TO_FT_S2, G_FT_S2,
     smooth_series, compute_derivatives,
-    segment_exercise_runs, find_crossing_dist,
+    segment_exercise_runs,
     _sym_range, _pct_range,
     _grp_derivs, _min_speed_near,
     run_start_type, run_finish_type, get_run_timing_refs,
 )
 
 st.set_page_config(page_title="Practice Run Analysis", layout="wide", page_icon="🏎")
+
+# Reduce default top padding
+st.markdown(
+    """<style>
+    [data-testid="stHeader"] { display: none; }
+    .block-container { padding-top: 1rem !important; }
+    </style>""",
+    unsafe_allow_html=True,
+)
 
 DATALOGS = Path(__file__).parent
 
@@ -68,22 +77,26 @@ min_speed      = float(st.session_state.cfg_min_speed)
 min_rows       = int(st.session_state.cfg_min_rows)
 flying_window_mi  = float(st.session_state.get("cfg_flying_window_ft", 100)) / 5280.0
 
+# Reserve a sidebar slot at the top for run filters (populated after runs are computed)
+_filter_container = st.sidebar.container()
+
 with st.sidebar:
-    st.header("Trap Setup")
-    selected_file = st.selectbox(
-        "Log file", track_files, format_func=lambda p: p.name
-    )
-    st.slider(
-        "Smoothing window (samples)", 3, 31, step=2,
-        help="Larger = smoother acceleration/jerk curves but less temporal resolution.",
-        key="cfg_smooth",
-    )
+    st.markdown("**Log files**")
+    selected_files = [
+        f for f in track_files
+        if st.checkbox(f.name, value=(f == track_files[0]), key=f"file__{f.name}")
+    ]
+    if not selected_files:
+        st.warning("Select at least one log file.")
+        st.stop()
 
 
 # ── Load data early so we can estimate trap locations before rendering sliders ─
-df_raw = load_track(str(selected_file))
-# Drop zero/NaN lat-lon rows regardless of cache state
-df_raw = df_raw.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
+_dfs_per_file = [
+    load_track(str(_tf)).dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
+    for _tf in selected_files
+]
+df_raw = pd.concat(_dfs_per_file, ignore_index=True)
 
 # ── Default trap positions — edit to match your course ────────────────────────
 _EAST_TRAP_LAT =  29.337290   # ← edit me
@@ -92,13 +105,17 @@ _WEST_TRAP_LAT =  29.33716    # ← edit me
 _WEST_TRAP_LON = -95.65612    # ← edit me
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Reset session state when file changes.
-if st.session_state.get("_trap_src_file") != str(selected_file):
+# Reset session state when file selection changes.
+_src_key = str(sorted(f.name for f in selected_files))
+if st.session_state.get("_trap_src_file") != _src_key:
     st.session_state["cfg_east_ctr_lat"] = _EAST_TRAP_LAT
     st.session_state["cfg_east_ctr_lon"] = _EAST_TRAP_LON
     st.session_state["cfg_west_ctr_lat"] = _WEST_TRAP_LAT
     st.session_state["cfg_west_ctr_lon"] = _WEST_TRAP_LON
-    st.session_state["_trap_src_file"] = str(selected_file)
+    st.session_state["_trap_src_file"] = _src_key
+    # Reset run filters so stale values don't hide runs from the new selection
+    for _fk in ("flt_target", "flt_start", "flt_finish"):
+        st.session_state.pop(_fk, None)
 
 trap_east_lat = float(st.session_state.get("cfg_east_ctr_lat", _EAST_TRAP_LAT))
 trap_east     = float(st.session_state.get("cfg_east_ctr_lon", _EAST_TRAP_LON))
@@ -116,21 +133,9 @@ trap = TrapConfig(
 )
 TRAP_DIST_MI = trap.dist_mi   # kept as a local alias for readability in tabs
 
-runs = segment_exercise_runs(df_raw, lat_threshold, min_speed, min_rows, trap=trap)
-
-# ── Transit segments (pre-compute before tabs) ────────────────────────────────
-ex_mask = df_raw["Latitude"] < lat_threshold
-if ex_mask.any():
-    ex_start_elapsed = float(df_raw.loc[ex_mask, "Elapsed time (sec)"].min())
-    ex_end_elapsed   = float(df_raw.loc[ex_mask, "Elapsed time (sec)"].max())
-else:
-    ex_start_elapsed = ex_end_elapsed = None
-
-df_outbound = df_raw[df_raw["Elapsed time (sec)"] <  (ex_start_elapsed or 0)].copy()
-df_inbound  = df_raw[df_raw["Elapsed time (sec)"] >  (ex_end_elapsed   or float("inf"))].copy()
-df_outbound["Leg"] = "To Exercise"
-df_inbound["Leg"]  = "From Exercise"
-df_transit = pd.concat([df_outbound, df_inbound]).reset_index(drop=True)
+runs = []
+for _df_f in _dfs_per_file:
+    runs.extend(segment_exercise_runs(_df_f, lat_threshold, min_speed, min_rows, trap=trap))
 
 # ── Shared map helpers ────────────────────────────────────────────────────────
 
@@ -180,8 +185,8 @@ def _add_trap_lines(fig: go.Figure) -> None:
 
 
 
-tab_map, tab_overview, tab_detail, tab_accel, tab_compare, tab_settings, tab_transit = st.tabs(
-    ["Track Map", "Runs Overview", "Run Detail", "Accel/Decel", "GPS vs Accel", "Settings", "Transit Analysis"]
+tab_overview, tab_detail, tab_accel, tab_compare, tab_settings, tab_map = st.tabs(
+    ["Runs Overview", "Run Detail", "Accel/Decel", "GPS vs Accel", "Settings", "Track Map"]
 )
 
 # ── Module-scope map state (used across multiple tabs) ────────────────────────
@@ -194,15 +199,30 @@ _run_zone_mask = (
 )
 df_raw["Zone"] = np.where(_run_zone_mask, "Exercise Area", "Transit")
 
-df_raw["RunID"] = -1
-for _ri, _r in enumerate(runs):
-    df_raw.loc[
-        (df_raw["Elapsed time (sec)"] >= _r["start_elapsed"]) &
-        (df_raw["Elapsed time (sec)"] <= _r["end_elapsed"]),
-        "RunID"
-    ] = _ri
-
 df_plot = df_raw.iloc[::5].copy()  # downsample for render speed
+
+# ── Run filters (sidebar — fills the top-of-sidebar container) ────────────────
+with _filter_container:
+    _all_targets = sorted({r["target_speed"] for r in runs}) if runs else []
+    sel_target = st.selectbox(
+        "Target speed",
+        ["All"] + _all_targets,
+        format_func=lambda x: "All" if x == "All" else f"{x} mph",
+        key="flt_target",
+    )
+    _start_types = sorted({run_start_type(r, trap, smooth_window) for r in runs}) if runs else []
+    sel_start = st.selectbox("Start type", ["All"] + _start_types, key="flt_start")
+    _finish_types = sorted({run_finish_type(r, trap, smooth_window) for r in runs}) if runs else []
+    sel_finish = st.selectbox("Finish type", ["All"] + _finish_types, key="flt_finish")
+    st.divider()
+
+# Apply run filters
+if sel_target != "All":
+    runs = [r for r in runs if r["target_speed"] == sel_target]
+if sel_start != "All":
+    runs = [r for r in runs if run_start_type(r, trap, smooth_window) == sel_start]
+if sel_finish != "All":
+    runs = [r for r in runs if run_finish_type(r, trap, smooth_window) == sel_finish]
 
 # Trap gate lat bounds (used by _add_trap_lines and all maps)
 _ex_rows = df_raw[
@@ -245,13 +265,13 @@ with tab_map:
             hovertemplate="Transit<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
         ))
         _fig_map.add_trace(go.Scattermap(
-            lat=df_plot.loc[(df_plot["Zone"] == "Exercise Area") & (df_plot["RunID"] == -1), "Latitude"],
-            lon=df_plot.loc[(df_plot["Zone"] == "Exercise Area") & (df_plot["RunID"] == -1), "Longitude"],
-            mode="lines", line=dict(color="#aaaaaa", width=1), name="In zone (no run)",
-            hovertemplate="In zone<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
+            lat=df_plot.loc[df_plot["Zone"] == "Exercise Area", "Latitude"],
+            lon=df_plot.loc[df_plot["Zone"] == "Exercise Area", "Longitude"],
+            mode="lines", line=dict(color="#aaaaaa", width=1), name="Exercise area",
+            hovertemplate="Exercise area<br>lat=%{lat:.5f}<br>lon=%{lon:.5f}<extra></extra>",
         ))
         for _ri, _r in enumerate(runs):
-            _rdf = df_plot[df_plot["RunID"] == _ri]
+            _rdf = _r["data"].iloc[::5]  # downsample for render speed
             _col = _RUN_PALETTE[_ri % len(_RUN_PALETTE)]
             _lbl = f"R{_ri+1} {_r['direction']} {_r['target_speed']}mph"
             _fig_map.add_trace(go.Scattermap(
@@ -575,136 +595,9 @@ with tab_detail:
     # ── Timing references for this run ────────────────────────────────────────
     # Standing → motion-start distance + GPS 1-mile mark.
     # Flying   → GPS trap-crossing geometry with TRAP_DIST_MI fallback.
-    going_west  = r["direction"] == "West"
     entry_d_raw, exit_d_raw = get_run_timing_refs(r, trap, smooth_window)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Tab 4 — Transit Analysis
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_transit:
-    if df_transit.empty:
-        st.info("No transit data found outside the exercise area.")
-        st.stop()
-
-    colors_transit = {"To Exercise": "#457b9d", "From Exercise": "#e76f51"}
-
-    # ── Summary table ─────────────────────────────────────────────────────────
-    def leg_stats(leg_df: pd.DataFrame, label: str) -> dict:
-        moving = leg_df[leg_df["Speed (mph)"] > 2]
-        if moving.empty:
-            return {}
-        dist  = leg_df["Distance (mi)"].iloc[-1] - leg_df["Distance (mi)"].iloc[0]
-        dur_s = leg_df["Elapsed time (sec)"].iloc[-1] - leg_df["Elapsed time (sec)"].iloc[0]
-        return {
-            "Leg": label,
-            "Distance (mi)": round(abs(dist), 2),
-            "Duration (min)": round(dur_s / 60, 1),
-            "Avg speed (mph)": round(moving["Speed (mph)"].mean(), 1),
-            "Max speed (mph)": round(moving["Speed (mph)"].max(), 1),
-        }
-
-    stats_rows = [s for s in [leg_stats(df_outbound, "To Exercise"),
-                               leg_stats(df_inbound,  "From Exercise")] if s]
-    if stats_rows:
-        st.subheader("Transit Summary")
-        st.dataframe(pd.DataFrame(stats_rows), use_container_width=True, hide_index=True)
-
-    # ── Compute derivatives per leg ───────────────────────────────────────────
-    tr_legs = []
-    for leg_label, leg_df, color in [
-        ("To Exercise",   df_outbound, "#457b9d"),
-        ("From Exercise", df_inbound,  "#e76f51"),
-    ]:
-        if leg_df.empty:
-            continue
-        sub = compute_derivatives(leg_df.copy(), smooth_window)
-        t0  = sub["Elapsed time (sec)"].iloc[0]
-        d0  = sub["Distance (mi)"].iloc[0]
-        sub["t_rel"] = sub["Elapsed time (sec)"] - t0
-        sub["d_rel"] = sub["Distance (mi)"] - d0
-        tr_legs.append({"label": leg_label, "df": sub, "color": color})
-
-    # ── X-axis selector ───────────────────────────────────────────────────────
-    tr_use_time = st.radio(
-        "X axis", ["Distance from leg start", "Time from leg start"],
-        horizontal=True, key="transit_xaxis",
-    ) == "Time from leg start"
-    x_col   = "t_rel" if tr_use_time else "d_rel"
-    x_label = ("Time from leg start (s)"
-                if tr_use_time else "Distance from leg start (mi)")
-
-    # ── 3-panel subplot: Speed / Acceleration / Jerk ──────────────────────────
-    fig_tr = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.38, 0.31, 0.31],
-        vertical_spacing=0.04,
-        subplot_titles=["Speed (mph)", "Acceleration (ft/s²)", "Jerk (ft/s³)"],
-    )
-
-    _all_spd = _all_acc = _all_jrk = np.array([])
-    for leg in tr_legs:
-        sub   = leg["df"]
-        color = leg["color"]
-        label = leg["label"]
-        x     = sub[x_col].to_numpy()
-        moving_mask = sub["Speed (mph)"] > 2
-
-        # Row 1 — Speed: raw (faint) + smoothed
-        fig_tr.add_trace(go.Scatter(
-            x=x, y=sub["Speed (mph)"],
-            name=f"{label} (raw)", mode="lines",
-            line=dict(color=color, width=1), opacity=0.35,
-            showlegend=False,
-        ), row=1, col=1)
-        fig_tr.add_trace(go.Scatter(
-            x=x, y=sub["speed_smooth"],
-            name=label, mode="lines",
-            line=dict(color=color, width=2),
-        ), row=1, col=1)
-
-        # Row 2 — Acceleration
-        fig_tr.add_trace(go.Scatter(
-            x=x, y=sub["accel_ft_s2"],
-            name=f"{label} accel", mode="lines",
-            line=dict(color=color, width=2),
-            showlegend=False,
-        ), row=2, col=1)
-
-        # Row 3 — Jerk
-        fig_tr.add_trace(go.Scatter(
-            x=x, y=sub["jerk_ft_s3"],
-            name=f"{label} jerk", mode="lines",
-            line=dict(color=color, width=2),
-            showlegend=False,
-        ), row=3, col=1)
-
-        mv = sub[moving_mask]
-        _all_spd = np.concatenate([_all_spd, mv["speed_smooth"].to_numpy()])
-        _all_acc = np.concatenate([_all_acc, mv["accel_ft_s2"].to_numpy()])
-        _all_jrk = np.concatenate([_all_jrk, mv["jerk_ft_s3"].to_numpy()])
-
-    fig_tr.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
-    fig_tr.add_hline(y=0, line_dash="dot", line_color="gray", row=3, col=1)
-    fig_tr.update_xaxes(title_text=x_label, row=3, col=1)
-    fig_tr.update_yaxes(
-        title_text="mph",
-        range=_sym_range(_all_spd, pad=0.08, min_half=5.0),
-        row=1, col=1,
-    )
-    fig_tr.update_yaxes(
-        title_text="ft/s²",
-        range=_pct_range(_all_acc, pct=1, pad=0.15, min_half=1.0, zero=True),
-        row=2, col=1,
-    )
-    fig_tr.update_yaxes(
-        title_text="ft/s³",
-        range=_pct_range(_all_jrk, pct=1, pad=0.15, min_half=1.0, zero=True),
-        row=3, col=1,
-    )
-    fig_tr.update_layout(height=820, legend=dict(orientation="h", y=-0.06))
-    st.plotly_chart(fig_tr, use_container_width=True)
 
 with tab_detail:
     # ── Idealized Run comparison ──────────────────────────────────────────────
@@ -758,17 +651,14 @@ with tab_detail:
         v_ideal_smooth = np.full(GRID_N, float(r["target_speed"]))
         accel_ideal    = np.zeros(GRID_N)
         jerk_ideal     = np.zeros(GRID_N)
-        v_band_lo      = None
-        v_band_hi      = None
         residual_label = f"Speed Residual — Actual minus Target ({r['target_speed']} mph)"
         speed_residual = v_actual - float(r["target_speed"])
 
     else:
         # ── Standing start: acceleration model from ALL standing-start runs ───
         all_standing = [r for r in runs if run_start_type(r, trap, smooth_window) == "Standing"]
-        peer_labels_str = ", ".join(f"R{runs.index(r)+1} {r['direction']}" for r in all_standing)
 
-        col_info1, col_info2 = st.columns(2)
+        col_info1, _ = st.columns(2)
         col_info1.info(
             f"Start: **{start_type}** (speed at entry ≈ {speed_at_entry:.1f} mph)  |  "
             f"Finish: **{finish_type}** (speed at exit ≈ {speed_at_exit:.1f} mph)"
@@ -832,9 +722,6 @@ with tab_detail:
             np.gradient(v_ideal_smooth * MPH_S_TO_FT_S2, t_grid), smooth_window
         )
         jerk_ideal  = smooth_series(np.gradient(accel_ideal, t_grid), smooth_window)
-
-        v_band_lo = None
-        v_band_hi = None
 
         residual_label = "Speed Residual — Actual minus Ideal (mph)"
         v_ideal_at_actual = np.interp(d_aligned_i, d_grid, v_ideal_smooth,
@@ -986,17 +873,6 @@ with tab_detail:
         name="Actual (raw)", mode="lines",
         line=dict(color="lightsteelblue", width=1), opacity=0.5,
     ), row=2, col=1)
-    # Peer speed band (standing start only)
-    if v_band_lo is not None and v_band_hi is not None:
-        fig_ideal.add_trace(go.Scatter(
-            x=np.concatenate([x_ideal, x_ideal[::-1]]),
-            y=np.concatenate([v_band_hi, v_band_lo[::-1]]),
-            fill="toself",
-            fillcolor="rgba(255,165,0,0.15)",
-            line=dict(width=0),
-            name="Peer range",
-            showlegend=True,
-        ), row=2, col=1)
     ideal_name = "Target speed" if is_flying else "Ideal accel profile"
     fig_ideal.add_trace(go.Scatter(
         x=x_ideal, y=v_ideal_smooth,
@@ -1097,8 +973,6 @@ with tab_detail:
         grp["Speed (mph)"].to_numpy()[trap_mask],
         v_actual[trap_mask],
         v_ideal_smooth[_grid_trap],
-        v_band_lo[_grid_trap] if v_band_lo is not None else np.array([]),
-        v_band_hi[_grid_trap] if v_band_hi is not None else np.array([]),
         np.array([float(r["target_speed"])]),
     ])
     _spd_range = _sym_range(_spd_vals, pad=0.08, min_half=5.0)
@@ -1230,29 +1104,14 @@ with tab_accel:
             return f"R{idx+1} {r_p['direction']} {r_p['start_time']} (~{r_p['target_speed']} mph)"
 
         # ── Acceleration ─────────────────────────────────────────────────────
-        st.subheader("Acceleration — Standing Starts")
         all_ss = [r for r in runs if run_start_type(r, trap, smooth_window) == "Standing"]
         all_sf = [r for r in runs if run_finish_type(r, trap, smooth_window) == "Standing"]
+
+        st.subheader(f"Acceleration — Standing Starts ({len(all_ss)} run{'s' if len(all_ss) != 1 else ''})")
 
         if not all_ss:
             st.info("No standing-start runs found.")
         else:
-            ss_targets = sorted({r["target_speed"] for r in all_ss})
-            _ss_counts = {t: sum(1 for r in all_ss if r["target_speed"] == t) for t in ss_targets}
-            _sf_counts = {t: sum(1 for r in all_sf if r["target_speed"] == t) for t in ss_targets}
-            _ss_default = max(ss_targets, key=lambda t: _ss_counts[t])
-            sel_ss_tgt = st.selectbox(
-                "Target speed (acceleration)",
-                ss_targets,
-                index=ss_targets.index(_ss_default),
-                format_func=lambda x: (
-                    f"{x} mph  —  {_ss_counts[x]} accel / {_sf_counts.get(x, 0)} decel"
-                ),
-                key="acc_tgt",
-            ) if len(ss_targets) > 1 else ss_targets[0]
-
-            ss_sel = [r for r in all_ss if r["target_speed"] == sel_ss_tgt]
-
             fig_acc = make_subplots(
                 rows=3, cols=2, shared_xaxes="columns",
                 column_titles=["vs Distance from Entry", "vs Speed (shift consistency)"],
@@ -1260,7 +1119,7 @@ with tab_accel:
                 vertical_spacing=0.08, horizontal_spacing=0.08,
             )
 
-            for idx, r_p in enumerate(ss_sel):
+            for idx, r_p in enumerate(all_ss):
                 grp_p = _grp_derivs(r_p, smooth_window)
                 en_d, _ = get_run_timing_refs(r_p, trap, smooth_window)
                 if en_d is None:
@@ -1273,8 +1132,9 @@ with tab_accel:
                 d_aln = d_p - en_d  # 0 = trap entry
 
                 # Show from first movement to target speed (+ small margin)
+                _tgt_p   = float(r_p["target_speed"])
                 mv_idx   = int(np.argmax(v_p >= 1.0)) if (v_p >= 1.0).any() else 0
-                tgt_mask = v_p >= sel_ss_tgt * 0.97
+                tgt_mask = v_p >= _tgt_p * 0.97
                 end_idx  = int(np.argmax(tgt_mask)) + 15 if tgt_mask.any() else len(v_p) - 1
                 end_idx  = min(end_idx, len(v_p) - 1)
                 sl       = slice(mv_idx, end_idx + 1)
@@ -1297,7 +1157,7 @@ with tab_accel:
                 ), row=3, col=1)
 
                 # Right column — accel & jerk vs speed (rows 2 & 3, matching left column)
-                acc_phase = (v_p[sl] >= 2) & (v_p[sl] <= sel_ss_tgt * 1.02)
+                acc_phase = (v_p[sl] >= 2) & (v_p[sl] <= _tgt_p * 1.02)
                 v_ap  = v_p[sl][acc_phase]
                 a_ap  = a_p[sl][acc_phase]
                 j_ap  = j_p[sl][acc_phase]
@@ -1312,9 +1172,6 @@ with tab_accel:
                 ), row=3, col=2)
 
             # Reference lines — left column
-            fig_acc.add_hline(y=sel_ss_tgt, line_dash="dot", line_color="gray",
-                              annotation_text=f"Target {sel_ss_tgt} mph",
-                              annotation_position="top right", row=1, col=1)
             for _r in (2, 3):
                 fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=1)
             fig_acc.add_vline(x=0, line_dash="dash", line_color="green",
@@ -1322,8 +1179,6 @@ with tab_accel:
             # Reference lines — right column (rows 2 & 3)
             for _r in (2, 3):
                 fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=2)
-                fig_acc.add_vline(x=sel_ss_tgt, line_dash="dot", line_color="gray",
-                                  annotation_text=f"{sel_ss_tgt} mph", row=_r, col=2)
 
             fig_acc.update_xaxes(title_text="Distance from run start (mi)", row=3, col=1)
             fig_acc.update_xaxes(title_text="Speed (mph)", row=2, col=2)
@@ -1331,7 +1186,6 @@ with tab_accel:
             fig_acc.update_layout(
                 height=800,
                 legend=dict(orientation="h", y=-0.08),
-                title_text=f"Acceleration to {sel_ss_tgt} mph — {len(ss_sel)} run(s)",
             )
             st.plotly_chart(fig_acc, use_container_width=True)
 
@@ -1345,27 +1199,11 @@ with tab_accel:
         st.divider()
 
         # ── Deceleration ─────────────────────────────────────────────────────
-        st.subheader("Deceleration — Standing Stops")
+        st.subheader(f"Deceleration — Standing Stops ({len(all_sf)} run{'s' if len(all_sf) != 1 else ''})")
 
         if not all_sf:
             st.info("No standing-finish runs found.")
         else:
-            sf_targets = sorted({r["target_speed"] for r in all_sf})
-            _sf_dec_counts = {t: sum(1 for r in all_sf if r["target_speed"] == t) for t in sf_targets}
-            _ss_dec_counts  = {t: sum(1 for r in all_ss if r["target_speed"] == t) for t in sf_targets}
-            _sf_default = max(sf_targets, key=lambda t: _sf_dec_counts[t])
-            sel_sf_tgt = st.selectbox(
-                "Target speed (deceleration)",
-                sf_targets,
-                index=sf_targets.index(_sf_default),
-                format_func=lambda x: (
-                    f"{x} mph  —  {_ss_dec_counts.get(x, 0)} accel / {_sf_dec_counts[x]} decel"
-                ),
-                key="dec_tgt",
-            ) if len(sf_targets) > 1 else sf_targets[0]
-
-            sf_sel = [r for r in all_sf if r["target_speed"] == sel_sf_tgt]
-
             fig_dec = make_subplots(
                 rows=3, cols=2, shared_xaxes="columns",
                 column_titles=["vs Distance from Exit", "vs Speed (braking consistency)"],
@@ -1373,7 +1211,7 @@ with tab_accel:
                 vertical_spacing=0.08, horizontal_spacing=0.08,
             )
 
-            for idx, r_p in enumerate(sf_sel):
+            for idx, r_p in enumerate(all_sf):
                 grp_p    = _grp_derivs(r_p, smooth_window)
                 _, ex_d  = get_run_timing_refs(r_p, trap, smooth_window)
                 if ex_d is None:
@@ -1422,17 +1260,12 @@ with tab_accel:
                     name=lbl, line=dict(color=color), showlegend=False, legendgroup=lbl,
                 ), row=3, col=2)
 
-            fig_dec.add_hline(y=sel_sf_tgt, line_dash="dot", line_color="gray",
-                              annotation_text=f"Target {sel_sf_tgt} mph",
-                              annotation_position="top right", row=1, col=1)
             for _r in (2, 3):
                 fig_dec.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=1)
             fig_dec.add_vline(x=0, line_dash="dash", line_color="red",
                               annotation_text="Stop", row=1, col=1)
             for _r in (2, 3):
                 fig_dec.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=2)
-                fig_dec.add_vline(x=sel_sf_tgt, line_dash="dot", line_color="gray",
-                                  annotation_text=f"{sel_sf_tgt} mph", row=_r, col=2)
 
             fig_dec.update_xaxes(title_text="Distance from exit trap (mi)", row=3, col=1)
             fig_dec.update_xaxes(title_text="Speed (mph)", row=2, col=2)
@@ -1440,7 +1273,6 @@ with tab_accel:
             fig_dec.update_layout(
                 height=800,
                 legend=dict(orientation="h", y=-0.08),
-                title_text=f"Deceleration from {sel_sf_tgt} mph — {len(sf_sel)} run(s)",
             )
             st.plotly_chart(fig_dec, use_container_width=True)
             st.caption(
@@ -1454,8 +1286,15 @@ with tab_accel:
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_compare:
     st.subheader("GPS-Derived vs Accelerometer Acceleration")
+    _has_gforce = runs and all(
+        col in r["data"].columns
+        for r in runs
+        for col in ["GForceX", "GForceY", "GForceZ"]
+    )
     if not runs:
         st.info("No exercise runs found.")
+    elif not _has_gforce:
+        st.info("No accelerometer (GForce) data in the selected log file(s). This tab requires a RaceBox file with GForceX/Y/Z columns.")
     else:
         # ── Controls ──────────────────────────────────────────────────────────
         _c1, _c2, _c3 = st.columns([2, 1, 2])
@@ -1640,6 +1479,11 @@ with tab_compare:
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_settings:
     st.subheader("Run Detection")
+    st.slider(
+        "Smoothing window (samples)", 3, 31, step=2,
+        help="Larger = smoother acceleration/jerk curves but less temporal resolution.",
+        key="cfg_smooth",
+    )
     st.slider(
         "Standing detection window (ft)", 10, 500, value=100, step=10,
         help="Half-width of the speed-sampling window centered on each trap crossing.",
