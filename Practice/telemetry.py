@@ -359,6 +359,46 @@ def _first_stopped_after(grp: pd.DataFrame, after_d: float, min_speed: float) ->
     return float(candidates["Distance (mi)"].iloc[0])
 
 
+def _standing_anchor(
+    grp: pd.DataFrame,
+    gate_lon: float,
+    going_west: bool,
+    trap: TrapConfig,
+    side: str,
+) -> float:
+    """Return the zero-velocity anchor distance for a standing start or finish.
+
+    Locates the GPS crossing of *gate_lon* and uses it as a rough positional
+    guide, then finds the nearest stationary sample.  Zero-velocity readings
+    are more accurate than GPS-derived crossing positions, so the search
+    window extends one flying_window_mi past the crossing to accommodate
+    GPS position error (the stationary sample may appear slightly on the
+    'wrong' side of the computed crossing in cumulative-distance space).
+
+    side='before': last stopped sample at or before crossing + flying_window_mi
+                   (standing start — car was stationary just before trap entry).
+    side='after' : first stopped sample at or after crossing - flying_window_mi
+                   (standing finish — car stopped just after trap exit).
+
+    Fallback chain: stationary search → crossing distance → segment edge.
+    """
+    d_vals  = grp["Distance (mi)"]
+    d_start = float(d_vals.iloc[0])
+    d_end   = float(d_vals.iloc[-1])
+    d_mid   = (d_start + d_end) / 2
+
+    crossing = find_crossing_dist(grp, gate_lon, going_west, trap)
+
+    if side == "before":
+        limit  = (crossing + trap.flying_window_mi) if crossing is not None else d_mid
+        anchor = _last_stopped_before(grp, limit, trap.min_speed)
+        return anchor if anchor is not None else (crossing if crossing is not None else d_start)
+    else:
+        limit  = (crossing - trap.flying_window_mi) if crossing is not None else d_mid
+        anchor = _first_stopped_after(grp, limit, trap.min_speed)
+        return anchor if anchor is not None else (crossing if crossing is not None else d_end)
+
+
 def run_start_type(r: dict, trap: TrapConfig, smooth_window: int) -> str:
     """Return 'Standing' or 'Flying' based on min speed in window around trap entry.
 
@@ -410,10 +450,10 @@ def get_run_timing_refs(
 ) -> tuple[float | None, float | None]:
     """Return (entry_d, exit_d) cumulative-odometer distances (mi) for timing.
 
-    Standing finish → exit_d  = GPS distance at the first stationary sample after
-                                 the segment midpoint; entry_d = exit_d - trap.dist_mi.
-    Standing start  → entry_d = GPS distance at the last stationary sample before
-                                 the segment midpoint; exit_d = entry_d + trap.dist_mi.
+    Standing finish → exit_d  = first stationary sample after the trap exit
+                                 crossing; entry_d = exit_d - trap.dist_mi.
+    Standing start  → entry_d = last stationary sample before the trap entry
+                                 crossing; exit_d = entry_d + trap.dist_mi.
     Flying          → GPS trap-crossing geometry, trap.dist_mi fallback.
     """
     if start_type is None:
@@ -423,30 +463,16 @@ def get_run_timing_refs(
     grp = _grp_derivs(r, smooth_window)
     gw  = r["direction"] == "West"
 
-    d_start = float(grp["Distance (mi)"].iloc[0])
-    d_end   = float(grp["Distance (mi)"].iloc[-1])
-    d_mid   = (d_start + d_end) / 2
-
-    # ── Standing finish: anchor on actual stop, derive entry backwards ─────────
+    # ── Standing finish: anchor on trap exit crossing, first stop after it ──────
     if finish_type == "Standing":
-        exit_d = _first_stopped_after(grp, d_mid, trap.min_speed)
-        if exit_d is None:
-            ex_lon = trap.west_lon if gw else trap.east_lon
-            exit_d = find_crossing_dist(grp, ex_lon, gw, trap)
-        if exit_d is None:
-            exit_d = d_end
+        ex_lon = trap.west_lon if gw else trap.east_lon
+        exit_d = _standing_anchor(grp, ex_lon, gw, trap, "after")
         return exit_d - trap.dist_mi, exit_d
 
-    # ── Standing start: anchor on last stopped sample, derive exit forwards ────
+    # ── Standing start: anchor on trap entry crossing, last stop before it ─────
     if start_type == "Standing":
-        entry_d = _last_stopped_before(grp, d_mid, trap.min_speed)
-        if entry_d is None:
-            moving_mask = grp["Speed (mph)"] >= trap.min_speed
-            entry_d = (
-                float(grp["Distance (mi)"].iloc[int(moving_mask.to_numpy().argmax())])
-                if moving_mask.any()
-                else d_start
-            )
+        en_lon  = trap.east_lon if gw else trap.west_lon
+        entry_d = _standing_anchor(grp, en_lon, gw, trap, "before")
         return entry_d, entry_d + trap.dist_mi
 
     # ── Flying start and finish: GPS trap-crossing geometry ───────────────────
