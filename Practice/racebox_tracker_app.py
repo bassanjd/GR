@@ -1129,11 +1129,12 @@ with tab_accel:
                 v_p   = grp_p["speed_smooth"].to_numpy()
                 a_p   = grp_p["accel_ft_s2"].to_numpy()
                 j_p   = grp_p["jerk_ft_s3"].to_numpy()
-                d_aln = d_p - en_d  # 0 = trap entry
+                d_aln = d_p - en_d  # 0 = standing-start anchor (zero-velocity point)
 
-                # Show from first movement to target speed (+ small margin)
+                # Show from the zero-velocity anchor to target speed (+ small margin).
+                # Using en_d as the slice start normalises all runs to the same origin.
                 _tgt_p   = float(r_p["target_speed"])
-                mv_idx   = int(np.argmax(v_p >= 1.0)) if (v_p >= 1.0).any() else 0
+                mv_idx   = int(np.searchsorted(d_p, en_d))
                 tgt_mask = v_p >= _tgt_p * 0.97
                 end_idx  = int(np.argmax(tgt_mask)) + 15 if tgt_mask.any() else len(v_p) - 1
                 end_idx  = min(end_idx, len(v_p) - 1)
@@ -1176,12 +1177,12 @@ with tab_accel:
             for _r in (2, 3):
                 fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=1)
             fig_acc.add_vline(x=0, line_dash="dash", line_color="green",
-                              annotation_text="Run start", row=1, col=1)
+                              annotation_text="Launch (zero velocity)", row=1, col=1)
             # Reference lines — right column (rows 2 & 3)
             for _r in (2, 3):
                 fig_acc.add_hline(y=0, line_dash="dot", line_color="gray", row=_r, col=2)
 
-            fig_acc.update_xaxes(title_text="Distance from run start (mi)", row=3, col=1)
+            fig_acc.update_xaxes(title_text="Distance from zero-velocity point (mi)", row=3, col=1)
             fig_acc.update_xaxes(title_text="Speed (mph)", row=2, col=2)
             fig_acc.update_xaxes(title_text="Speed (mph)", row=3, col=2)
             fig_acc.update_layout(
