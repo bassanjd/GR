@@ -368,11 +368,17 @@ def _standing_anchor(
 ) -> float:
     """Return the zero-velocity anchor distance for a standing start or finish.
 
-    Finds the GPS crossing of *gate_lon*, then searches for the nearest
-    stationary sample on the correct side of that crossing.
+    Locates the GPS crossing of *gate_lon* and uses it as a rough positional
+    guide, then finds the nearest stationary sample.  Zero-velocity readings
+    are more accurate than GPS-derived crossing positions, so the search
+    window extends one flying_window_mi past the crossing to accommodate
+    GPS position error (the stationary sample may appear slightly on the
+    'wrong' side of the computed crossing in cumulative-distance space).
 
-    side='before': last stopped sample before the crossing (standing start).
-    side='after' : first stopped sample after the crossing (standing finish).
+    side='before': last stopped sample at or before crossing + flying_window_mi
+                   (standing start — car was stationary just before trap entry).
+    side='after' : first stopped sample at or after crossing - flying_window_mi
+                   (standing finish — car stopped just after trap exit).
 
     Fallback chain: stationary search → crossing distance → segment edge.
     """
@@ -382,13 +388,14 @@ def _standing_anchor(
     d_mid   = (d_start + d_end) / 2
 
     crossing = find_crossing_dist(grp, gate_lon, going_west, trap)
-    search_d = crossing if crossing is not None else d_mid
 
     if side == "before":
-        anchor = _last_stopped_before(grp, search_d, trap.min_speed)
+        limit  = (crossing + trap.flying_window_mi) if crossing is not None else d_mid
+        anchor = _last_stopped_before(grp, limit, trap.min_speed)
         return anchor if anchor is not None else (crossing if crossing is not None else d_start)
     else:
-        anchor = _first_stopped_after(grp, search_d, trap.min_speed)
+        limit  = (crossing - trap.flying_window_mi) if crossing is not None else d_mid
+        anchor = _first_stopped_after(grp, limit, trap.min_speed)
         return anchor if anchor is not None else (crossing if crossing is not None else d_end)
 
 
