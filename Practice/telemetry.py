@@ -116,6 +116,7 @@ def compute_derivatives(df: pd.DataFrame, smooth_window: int) -> pd.DataFrame:
     # Jerk in ft/s³
     jerk_raw = np.gradient(np.nan_to_num(accel_smooth), t)
     jerk_raw[gap_mask] = np.nan
+    jerk_raw[np.isnan(accel_smooth)] = np.nan  # Null boundary samples adjacent to gaps
     df["jerk_ft_s3"] = smooth_series(jerk_raw, smooth_window)
 
     return df
@@ -133,7 +134,7 @@ def haversine_cumulative_mi(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndar
     lat_prev = np.concatenate([[lat[0]], lat[:-1]])
     a = np.sin(dlat / 2) ** 2 + np.cos(lat) * np.cos(lat_prev) * np.sin(dlon / 2) ** 2
     step_mi = R_MI * 2 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
-    return np.cumsum(step_mi)
+    return np.cumsum(np.nan_to_num(step_mi))  # NaN steps (GPS dropout) → 0 distance
 
 
 # ── Trap crossing ─────────────────────────────────────────────────────────────
@@ -182,7 +183,7 @@ def find_crossing_dist(
     # Linear interpolation between the bracketing samples
     s0, s1 = s[idx - 1], s[idx]
     d0, d1 = dist[idx - 1], dist[idx]
-    frac = (-s0) / (s1 - s0) if s1 != s0 else 0.0
+    frac = (-s0) / (s1 - s0) if abs(s1 - s0) > 1e-12 else 0.0
     return float(d0 + frac * (d1 - d0))
 
 
