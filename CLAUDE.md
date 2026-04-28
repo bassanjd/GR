@@ -21,13 +21,14 @@ All user-facing tools are **Streamlit web applications**. There is no REST API, 
 ```
 GR/
 ├── Practice/                    # Driver practice & coaching apps
+│   ├── racebox_tracker_app.py           # Primary practice analysis app (RaceBox + speed-tracker)
+│   ├── telemetry.py                     # Shared GPS telemetry module (see below)
 │   ├── stopwatch_repeatability_app.py   # Reaction time consistency tester
-│   ├── practice_tracker_app.py          # GPS/speed telemetry analysis
-│   ├── racebox_tracker_app.py           # RaceBox GPS logger analysis (25Hz)
-│   ├── car_performance_app.py           # Generic performance channel browser
+│   ├── car_performance_app.py           # Generic speed-tracker channel browser
+│   ├── make_track_gpx.py                # GPX file generator for east/west track routes
 │   ├── prepare_track_data.py            # Data prep utility
 │   ├── prepare_track_data_with_basic_datalog.py
-│   └── *.parquet                        # Cached telemetry data files
+│   └── *.parquet                        # Dated telemetry files (RaceBox and speed-tracker)
 │
 ├── Results/                     # Competition results analysis
 │   ├── team_analysis_app.py             # Team performance dashboard
@@ -61,7 +62,7 @@ GR/
 
 | Category | Technology |
 |---|---|
-| Language | Python 3.11 |
+| Language | Python 3.13 |
 | UI Framework | Streamlit |
 | Data Manipulation | Pandas, NumPy |
 | Visualization | Plotly Express / Graph Objects |
@@ -83,19 +84,18 @@ Heavy dependencies (OCR, ML, PDF processing) are installed on demand and are not
 
 ## Development Setup
 
-### Devcontainer (primary workflow)
+### Devcontainer (secondary workflow)
 
 The repository ships with a devcontainer. It:
 1. Uses `mcr.microsoft.com/devcontainers/python:1-3.11-bookworm`
 2. Runs `pip3 install --user -r requirements.txt` on container create
-3. Auto-starts `streamlit run Practice/stopwatch_repeatability_app.py` on attach
-4. Forwards port **8501** and opens it as a preview
+3. Forwards port **8501**
 
-### Local setup
+### Local setup (primary workflow)
 
 ```bash
 pip install -r requirements.txt
-streamlit run Practice/stopwatch_repeatability_app.py
+streamlit run Practice/racebox_tracker_app.py
 ```
 
 ### Environment variables
@@ -116,9 +116,8 @@ All apps run on port 8501 (only one at a time):
 
 ```bash
 # Practice apps
+streamlit run Practice/racebox_tracker_app.py       # primary: multi-tab practice analysis
 streamlit run Practice/stopwatch_repeatability_app.py
-streamlit run Practice/practice_tracker_app.py
-streamlit run Practice/racebox_tracker_app.py
 streamlit run Practice/car_performance_app.py
 
 # Results apps
@@ -142,11 +141,68 @@ python "Stage Notes/extract_claude.py" --assemble-only      # rebuild from cache
 # EasyOCR alternative extractor
 python "Stage Notes/extract_stage_instructions.py"
 
+# Generate GPX files for the practice track
+python Practice/make_track_gpx.py                           # produces track_eastbound.gpx, track_westbound.gpx
+
 # Scrape results from HTML
 python Results/GreatRaceResultsScrape.py
 python "Stage Notes/Scrape_Stage_Sheets.py"
 python "Stage Notes/Scrape_Stage_Sheets_Batch.py"
 ```
+
+---
+
+## Practice Analysis Architecture
+
+### `telemetry.py` — shared module
+
+All data-source-agnostic telemetry logic lives here. Apps import from it; they never duplicate physics or geometry code. Key components:
+
+**Standard internal schema** — every loader normalises its source to these columns:
+- `Elapsed time (sec)` — time axis
+- `Distance (mi)` — cumulative GPS odometer (haversine)
+- `Speed (mph)` — vehicle speed
+- `Latitude`, `Longitude` — GPS position (decimal degrees)
+- `Time` — original timestamp string
+- `Date` — date string (YYYY-MM-DD)
+
+**`TrapConfig` dataclass** — all geometric state for the measured section:
+- `east_lon/lat`, `west_lon/lat` — gate endpoint coordinates
+- `dist_mi` — nominal trap length (default 1 mile / 5280 ft)
+- `flying_window_mi` — half-width of speed-sampling window around gate
+- Derived fields (`ux`, `uy`, `chord_mi`, `mi_per_deg_lon`) computed in `__post_init__`
+
+**Signal processing**: `smooth_series`, `compute_derivatives` (adds `speed_smooth`, `accel_ft_s2`, `accel_g`, `jerk_ft_s3`)
+
+**GPS geometry**: `haversine_cumulative_mi`, `find_crossing_dist` (oblique trap gate crossing)
+
+**Run segmentation**: `segment_exercise_runs` — isolates runs in the exercise zone, splits on time gaps > 30 s, detects target speed from mode of in-trap speeds
+
+**Run classification**: `run_start_type`, `run_finish_type` — Flying vs Standing based on speed in window around trap gates; `get_run_timing_refs` — returns `(entry_d, exit_d)` odometer distances appropriate for each start/finish combination
+
+**Data loaders**:
+- `load_racebox(path)` — RaceBox parquet (raw ISO-8601 timestamps, haversine distance)
+- `load_speed_tracker(path)` — pre-processed speed-tracker parquet or CSV
+
+### `racebox_tracker_app.py` — primary practice app
+
+Multi-tab Streamlit app supporting both RaceBox and speed-tracker parquet files. File type is detected by filename prefix (`RaceBox` → `load_racebox`, otherwise → `load_speed_tracker`).
+
+**Tabs:**
+1. **Runs Overview** — summary table with timing/speed/accel stats; speed overlay chart; trap-aligned speed comparison; acceleration & jerk distributions
+2. **Run Detail** — single-run deep dive: 5-panel subplot (cumulative time error, speed, acceleration, jerk, speed residual) vs ideal profile; actual vs ideal comparison table
+3. **Accel/Decel** — standing-start acceleration curves and standing-finish deceleration curves, plotted vs distance and vs speed (for shift-consistency analysis)
+4. **GPS vs Accel** — compares GPS-derived acceleration against RaceBox GForce channels (X/Y/Z or horizontal magnitude); auto-selects best-correlated axis; unity plot and residual histogram
+5. **Settings** — smoothing window, standing-detection window, trap gate lat/lon coordinates (number inputs, 0.00001° step ≈ 3 ft), at-rest point map
+6. **Track Map** — full-session GPS track colored by zone (Transit / Exercise Area) with run overlays and trap gate lines; street or ESRI satellite basemap
+
+**Sidebar filters** (above file checkboxes): target speed, start type, finish type — all reset when the file selection changes.
+
+**Trap coordinates** are hardcoded defaults at the top of the app and overridden via Settings tab `st.session_state` keys (`cfg_east_ctr_lat`, etc.).
+
+### `make_track_gpx.py` — GPX export utility
+
+Reads the most recent RaceBox parquet, finds a representative eastbound and westbound run, and writes `track_eastbound.gpx` / `track_westbound.gpx` with the trap waypoints and GPS track. Used to load the course into navigation devices or mapping apps.
 
 ---
 
@@ -156,17 +212,18 @@ python "Stage Notes/Scrape_Stage_Sheets_Batch.py"
 
 | File | Location | Schema |
 |---|---|---|
-| `long_format_times.parquet` | `Results/` | One row per team per stage leg; columns include `Team`, `Stage`, `Leg`, penalty info, `Discarded` flag |
+| `long_format_times.parquet` | `Results/` | One row per team per stage leg; columns: `RANK`, `CAR`, `YEAR`, `FACTOR`, `ScYR`, `DIV`, `CREW`, `Stage`, `Leg`, `Time`, `Early`, `Discarded`, `Actual_Time` |
 | `stage_instructions.parquet` | `Stage Notes/` | One row per grid instruction (stage, leg, position, direction) |
 | `leg_characteristics.parquet` | `Stage Notes/` | One row per (Stage, Leg) with terrain/type metadata |
 | `great_race_all_stages.parquet` | `Stage Notes/` | Combined stage data |
-| `*.parquet` | `Practice/` | GPS/speed telemetry (Time, Speed (mph), Lat/Lon, Altitude, Acceleration, Jerk) |
+| `RaceBox *.parquet` | `Practice/` | Raw RaceBox GPS logger output (Time, Latitude, Longitude, Speed, GForceX/Y/Z, …) |
+| `*speed_tracker*.parquet` | `Practice/` | Pre-processed speed-tracker output (already in standard schema) |
 
 ### Caching conventions
 
 - Claude API responses are cached as JSON files in `Stage Notes/claude_cache/stage_N_page_M.json` — **never delete these unless re-extracting**
 - Streamlit uses `@st.cache_data` on all expensive loads (parquet reads, data joins)
-- Telemetry Parquet files in `Practice/` are pre-processed from raw GPS data logs
+- `racebox_tracker_app.py` caches per-run derivative DataFrames on the run dict (`r["_grp_with_derivs"]`) to avoid recomputation across tabs
 
 ### Excluded from git
 
@@ -183,7 +240,7 @@ python "Stage Notes/Scrape_Stage_Sheets_Batch.py"
 
 ### Naming
 
-- **Files**: `snake_case_app.py` for Streamlit apps, `snake_case.py` for utilities
+- **Files**: `snake_case_app.py` for Streamlit apps, `snake_case.py` for utilities/modules
 - **Functions**: `snake_case`
 - **Constants**: `UPPER_SNAKE_CASE` (e.g., `MPH_S_TO_FT_S2`, `DATALOGS`, `PARQUET`)
 - **DataFrame columns**: match source data exactly (e.g., `"Speed (mph)"`, `"Elapsed time (sec)"`)
@@ -269,20 +326,28 @@ Never hardcode absolute paths (there is one legacy Windows path in `extract_clau
 - Goal: arrive at each checkpoint at the exact target time (zero seconds early/late = perfect)
 - Penalty is the absolute deviation from the target time in seconds
 - `Discarded` rows in results data mark invalid/DSQ legs
+- `FACTOR` = age-based score multiplier; `DIV` = division (S/E/G/R/X)
 
-### Telemetry columns
+### Telemetry / standard schema columns
 
-Practice apps use these GPS columns:
+Practice apps operate on the standard schema produced by `telemetry.py` loaders:
 - `Speed (mph)` — vehicle speed
-- `Elapsed time (sec)` — time since segment start
+- `Elapsed time (sec)` — time since first record in the file
+- `Distance (mi)` — cumulative haversine GPS odometer
 - `Latitude`, `Longitude` — GPS position
-- `Altitude (ft)` — elevation
-- `Acceleration (ft/s²)` — computed derivative of speed
-- `Jerk (ft/s³)` — computed derivative of acceleration
+- `Time` — original timestamp string
+- `Date` — date string (YYYY-MM-DD)
 
-Physics constants used throughout:
+Computed derivative columns (added by `compute_derivatives`):
+- `speed_smooth` — rolling-mean smoothed speed
+- `accel_ft_s2` — longitudinal acceleration (ft/s²)
+- `accel_g` — acceleration in g
+- `jerk_ft_s3` — jerk (ft/s³)
+
+Physics constants in `telemetry.py`:
 ```python
-MPH_S_TO_FT_S2 = 5280 / 3600  # convert mph/s → ft/s²
+MPH_S_TO_FT_S2 = 5280.0 / 3600.0   # 1 mph/s → ft/s²
+G_FT_S2        = 32.174              # 1 g in ft/s²
 ```
 
 ### Stage instruction extraction
@@ -330,8 +395,7 @@ When modifying data transformation logic, verify against known-good Parquet file
 
 ## Git Workflow
 
-- **Branch**: `claude/add-claude-documentation-GsOMh` (current feature branch)
-- **Remote**: `origin` at the local proxy
+- **Branch**: `main`
 - **No CI/CD** — no GitHub Actions workflows exist
 - Commit message style: `feat:`, `fix:`, `chore:`, `docs:`
 
@@ -349,6 +413,13 @@ git push -u origin <branch-name>
 2. Follow the module structure above (docstring → imports → `set_page_config` → constants → helpers → state init → UI)
 3. Use `@st.cache_data` for any Parquet/file load
 4. Reference data files relative to `Path(__file__).parent`
+
+### Add a new data source to the practice app
+
+1. Write `load_<source>(path: str) -> pd.DataFrame` in `telemetry.py` that produces the standard schema
+2. Add file detection logic in `racebox_tracker_app.py` `load_track()` (the `if Path(path).name.startswith(...)` dispatch)
+3. Optionally initialise a `TrapConfig` from source-specific coordinates
+4. The analysis layer (`segment_exercise_runs`, `compute_derivatives`, etc.) requires no changes
 
 ### Add a new Parquet dataset
 
@@ -376,3 +447,4 @@ Run `Results/GreatRaceResultsScrape.py` pointing at the official results HTML, t
 - **Do not call the Claude API in a Streamlit app** — API calls belong in batch scripts; apps read from Parquet cache
 - **Do not delete `claude_cache/` JSON files** unless you intend to re-run the expensive extraction
 - **Do not use `st.experimental_rerun()`** — use `st.rerun()` (Streamlit ≥1.27)
+- **Do not duplicate telemetry logic in apps** — all GPS/physics/signal processing belongs in `telemetry.py`

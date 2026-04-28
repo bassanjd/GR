@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 PRACTICE_DIR = Path(__file__).parent
+DATA_DIR = PRACTICE_DIR / "DataParquet"
 
 POSITION_COLS = {"Date", "Time", "Latitude", "Longitude", "Altitude (ft)", "Accuracy (ft)"}
 TIME_COLS = {"Elapsed time (sec)", "Elapsed (min)"}
@@ -29,14 +30,14 @@ st.set_page_config(page_title="Car Performance Review", layout="wide")
 st.title("Car Performance Review")
 
 # ── File selector ─────────────────────────────────────────────────────────────
-parquet_files = sorted(PRACTICE_DIR.glob("*speed*.parquet"))
+parquet_files = sorted(DATA_DIR.glob("*speed*.parquet"))
 if not parquet_files:
-    st.error(f"No *.parquet files found in {PRACTICE_DIR}")
+    st.error(f"No *.parquet files found in {DATA_DIR}")
     st.stop()
 
 file_names = [f.name for f in parquet_files]
 selected_name = st.sidebar.selectbox("Parquet file", file_names, index=len(file_names) - 1)
-df = pd.read_parquet(PRACTICE_DIR / selected_name)
+df = pd.read_parquet(DATA_DIR / selected_name)
 
 df = df.sort_values("Elapsed time (sec)").reset_index(drop=True)
 df["Elapsed (min)"] = df["Elapsed time (sec)"] / 60.0
@@ -218,6 +219,111 @@ if "Latitude" in dv_map.columns and dv_map["Latitude"].notna().any():
     st.plotly_chart(fig_map, use_container_width=True, config={"scrollZoom": True})
 else:
     st.warning("No GPS data in the selected time range.")
+
+# ── Correlation Analysis ──────────────────────────────────────────────────────
+st.subheader("Correlation Analysis")
+
+_corr_cols = [c for c in numeric_graphable if dv[c].notna().sum() > 10]
+_corr_df   = dv[_corr_cols].copy()
+
+if len(_corr_cols) < 2:
+    st.info("Need at least two numeric channels for correlation analysis.")
+else:
+    _ctab_matrix, _ctab_scatter, _ctab_splom = st.tabs(
+        ["Correlation Matrix", "Scatter Plot", "Scatter Matrix (SPLOM)"]
+    )
+
+    with _ctab_matrix:
+        _corr = _corr_df.corr()
+        _labels = _corr.columns.tolist()
+        _fig_corr = go.Figure(go.Heatmap(
+            z=_corr.values,
+            x=_labels,
+            y=_labels,
+            colorscale="RdBu",
+            zmid=0,
+            zmin=-1,
+            zmax=1,
+            text=[[f"{v:.2f}" for v in row] for row in _corr.values],
+            texttemplate="%{text}",
+            textfont=dict(size=10),
+            hovertemplate="X: %{x}<br>Y: %{y}<br>r = %{z:.3f}<extra></extra>",
+        ))
+        _fig_corr.update_layout(
+            height=max(420, len(_labels) * 44 + 100),
+            xaxis=dict(tickangle=-45),
+            margin=dict(l=180, b=180, t=40, r=40),
+        )
+        st.plotly_chart(_fig_corr, use_container_width=True)
+
+    with _ctab_scatter:
+        _sc1, _sc2 = st.columns(2)
+        _x_ch = _sc1.selectbox("X channel", _corr_cols, key="scat_x")
+        _y_ch = _sc2.selectbox(
+            "Y channel", _corr_cols,
+            index=min(1, len(_corr_cols) - 1),
+            key="scat_y",
+        )
+        _sd = _corr_df[[_x_ch, _y_ch]].dropna()
+        if len(_sd) < 3:
+            st.info("Not enough data points after dropping NaN.")
+        else:
+            _r_val = float(np.corrcoef(_sd[_x_ch], _sd[_y_ch])[0, 1])
+            _m, _b = np.polyfit(_sd[_x_ch], _sd[_y_ch], 1)
+            _x_line = np.array([float(_sd[_x_ch].min()), float(_sd[_x_ch].max())])
+            _y_line = _m * _x_line + _b
+
+            _fig_sc = go.Figure()
+            _fig_sc.add_trace(go.Scattergl(
+                x=_sd[_x_ch], y=_sd[_y_ch],
+                mode="markers",
+                marker=dict(size=3, opacity=0.4, color="steelblue"),
+                name="Data",
+                hovertemplate=f"{_x_ch}: %{{x:.3g}}<br>{_y_ch}: %{{y:.3g}}<extra></extra>",
+            ))
+            _fig_sc.add_trace(go.Scatter(
+                x=_x_line, y=_y_line,
+                mode="lines",
+                line=dict(color="tomato", width=2),
+                name="OLS fit",
+            ))
+            _fig_sc.update_layout(
+                xaxis_title=_x_ch,
+                yaxis_title=_y_ch,
+                height=460,
+                legend=dict(orientation="h", y=1.06),
+                title=f"Pearson r = {_r_val:.4f}   |   slope = {_m:.4g}   |   N = {len(_sd):,}",
+            )
+            st.plotly_chart(_fig_sc, use_container_width=True)
+
+    with _ctab_splom:
+        _default_splom = _corr_cols[:min(4, len(_corr_cols))]
+        _splom_channels = st.multiselect(
+            "Channels for scatter matrix",
+            options=_corr_cols,
+            default=_default_splom,
+            key="splom_channels",
+        )
+        if len(_splom_channels) < 2:
+            st.info("Select at least 2 channels.")
+        else:
+            _splom_df = _corr_df[_splom_channels].dropna()
+            _dims = [dict(label=c, values=_splom_df[c].tolist()) for c in _splom_channels]
+            _fig_splom = go.Figure(go.Splom(
+                dimensions=_dims,
+                showupperhalf=False,
+                marker=dict(size=2, opacity=0.3, color="steelblue"),
+            ))
+            _fig_splom.update_layout(
+                height=max(500, len(_splom_channels) * 160),
+                dragmode="select",
+                margin=dict(l=120, b=120, t=40, r=40),
+            )
+            st.plotly_chart(_fig_splom, use_container_width=True)
+            st.caption(
+                f"N = {len(_splom_df):,} rows (after dropping any NaN across selected channels). "
+                "Lower triangle only."
+            )
 
 # ── Raw data ──────────────────────────────────────────────────────────────────
 with st.expander("Raw data table"):

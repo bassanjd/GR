@@ -32,7 +32,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-DATALOGS = Path(__file__).parent
+DATALOGS = Path(__file__).parent / "DataParquet"
 
 
 

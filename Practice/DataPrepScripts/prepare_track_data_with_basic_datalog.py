@@ -24,7 +24,10 @@ from io import StringIO
 from pathlib import Path
 import pandas as pd
 
-DATALOGS = Path(__file__).parent / "DataLogs"
+SPEED_DIR   = Path(__file__).parent.parent / "DataLogs" / "SpeedTracker Phone GPS"
+NUMBERS_DIR = Path(__file__).parent.parent / "DataLogs" / "numbers"
+TEMP_DIR    = Path(__file__).parent.parent / "DataLogs" / "4 channel logger"
+DATAPARQUET = Path(__file__).parent.parent / "DataParquet"
 LAT_MAX = 29.66716  # drop everything north of this latitude
 DATE_PREFIX = re.compile(r'^\d{4}-\d{2}-\d{2} ')
 DATE_MDY = re.compile(r'(\d{1,2})-(\d{1,2})-(\d{2})\b')  # M-D-YY in filename
@@ -40,18 +43,22 @@ CHANNEL_LABELS: dict[str, dict[str, str]] = {
 }
 
 
-def find_datestamp_files(datalogs: Path) -> dict:
-    """Return {date_key: [Path, ...]} for all datestamp CSVs and .numbers files."""
+def find_datestamp_files() -> dict:
+    """Return {date_key: [Path, ...]} for all datestamp CSVs and LSA-GPS .numbers files."""
     groups: dict[str, list[Path]] = {}
-    for f in sorted(datalogs.glob("*.csv")):
+    for f in sorted(SPEED_DIR.glob("*.csv")):
         if DATE_PREFIX.match(f.name):
-            date_key = f.name[:10]   # "YYYY-MM-DD"
+            date_key = f.name[:10]
             groups.setdefault(date_key, []).append(f)
-    for f in sorted(datalogs.glob("*.numbers")):
+    for f in sorted(NUMBERS_DIR.glob("LSA-GPS*.numbers")):
         m = DATE_MDY.search(f.name)
         if m:
             month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
             date_key = f"20{year:02d}-{month:02d}-{day:02d}"
+            groups.setdefault(date_key, []).append(f)
+    for f in sorted(TEMP_DIR.glob("*.csv")):
+        if DATE_PREFIX.match(f.name):
+            date_key = f.name[:10]
             groups.setdefault(date_key, []).append(f)
     return groups
 
@@ -154,9 +161,9 @@ def prepare(date_key: str, files: list, force: bool = False) -> None:
 
     for speed_path in all_track_files:
         if speed_path.suffix == '.numbers':
-            pq_path = speed_path.parent / f"{date_key} {speed_path.stem}.parquet"
+            pq_path = DATAPARQUET / f"{date_key} {speed_path.stem}.parquet"
         else:
-            pq_path = speed_path.with_suffix(".parquet")
+            pq_path = DATAPARQUET / speed_path.with_suffix(".parquet").name
         if pq_path.exists() and not force:
             print(f"  skip  {pq_path.name}  (already exists — use --force to regenerate)")
             continue
@@ -197,11 +204,11 @@ def prepare(date_key: str, files: list, force: bool = False) -> None:
 
 if __name__ == "__main__":
     force = "--force" in sys.argv
-    groups = find_datestamp_files(DATALOGS)
+    groups = find_datestamp_files()
     if not groups:
-        print(f"No datestamp files found in {DATALOGS}")
+        print(f"No datestamp files found in {SPEED_DIR}, {NUMBERS_DIR}, or {TEMP_DIR}")
         sys.exit(1)
-    print(f"Processing {len(groups)} date(s) in {DATALOGS}")
+    print(f"Processing {len(groups)} date(s)")
     for date_key, files in sorted(groups.items()):
         prepare(date_key, files, force=force)
     print("Done.")

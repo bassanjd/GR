@@ -4,19 +4,20 @@ Converts speed-tracker CSV files to privacy-filtered parquet files.
 Rows north of LAT_MAX are dropped to hide the starting/home location.
 
 Usage:
-    python prepare_track_data.py              # process all CSVs in DataLogs/
+    python prepare_track_data.py              # process all CSVs in DataLogs/SpeedTracker Phone GPS/
     python prepare_track_data.py --force      # re-generate even if parquet exists
 """
 import sys
 import pandas as pd
 from pathlib import Path
 
-DATALOGS = Path(__file__).parent / "DataLogs"
+DATALOGS = Path(__file__).parent.parent / "DataLogs" / "SpeedTracker Phone GPS"
+DATAPARQUET = Path(__file__).parent.parent / "DataParquet"
 LAT_MAX = 29.66716  # drop everything north of this latitude
 
 
 def prepare(csv_path: Path, force: bool = False) -> Path:
-    pq_path = csv_path.with_suffix(".parquet")
+    pq_path = DATAPARQUET / csv_path.with_suffix(".parquet").name
     if pq_path.exists() and not force:
         print(f"  skip  {pq_path.name}  (already exists — use --force to regenerate)")
         return pq_path
