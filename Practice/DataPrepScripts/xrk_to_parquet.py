@@ -3,6 +3,7 @@
 All channels (data, GPS, GPS-raw) are exported and aligned to a common time
 axis via outer-join + linear interpolation.  SI units are converted to US
 customary (°F, mph, ft, mi, psi) automatically.
+Rows north of LAT_MAX are dropped to hide the starting/home location.
 
 
 https://github.com/laz-/xrk
@@ -22,6 +23,7 @@ import pandas as pd
 
 AIM_DIR     = Path(__file__).parent.parent / "DataLogs" / "AIM"
 DATAPARQUET = Path(__file__).parent.parent / "DataParquet"
+LAT_MAX     = 29.66716  # drop everything north of this latitude
 
 TARGET_HZ = 25  # output sample rate — change to 25 or 100 if you need higher resolution
 
@@ -104,8 +106,14 @@ def main():
         print(myxrk.summary())
         print(f"Channels ({len(myxrk.channels)}):")
         df = channels_to_dataframe(myxrk)
+        before = len(df)
+        lat_col = next((c for c in df.columns if c.lower() == "latitude"), None)
+        if lat_col is not None:
+            df = df[df[lat_col] <= LAT_MAX].reset_index(drop=True)
+        removed = before - len(df)
         df.to_parquet(parquet_file, index=False)
-        print(f"\nWrote {len(df):,} rows x {len(df.columns)} columns -> {parquet_file.name}")
+        privacy_note = f", {removed:,} removed north of {LAT_MAX}" if lat_col is not None else ""
+        print(f"\nWrote {len(df):,} rows x {len(df.columns)} columns -> {parquet_file.name}{privacy_note}")
         print(df.head())
         myxrk.close()
 
