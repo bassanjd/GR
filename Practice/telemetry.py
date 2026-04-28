@@ -513,9 +513,11 @@ def load_racebox(path: str) -> pd.DataFrame:
     df["Elapsed time (sec)"] = (df["_ts"] - df["_ts"].iloc[0]).dt.total_seconds()
     df = df.drop_duplicates(subset="Elapsed time (sec)", keep="first").reset_index(drop=True)
 
-    # Replace zero lat/lon with NaN (GPS lock lost)
+    # Replace zero lat/lon with NaN (GPS lock lost), then interpolate across dropouts
     df.loc[df["Latitude"] == 0, "Latitude"]   = np.nan
     df.loc[df["Longitude"] == 0, "Longitude"] = np.nan
+    df["Latitude"]  = df["Latitude"].interpolate()
+    df["Longitude"] = df["Longitude"].interpolate()
 
     df["Distance (mi)"] = haversine_cumulative_mi(
         df["Latitude"].to_numpy(), df["Longitude"].to_numpy()
