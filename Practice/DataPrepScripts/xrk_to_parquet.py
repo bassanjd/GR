@@ -91,6 +91,12 @@ def channels_to_dataframe(myxrk: xrk.XRK, hz: int = TARGET_HZ) -> pd.DataFrame:
         except Exception as exc:
             print(f"  {name}: SKIPPED — {exc}")
 
+    drop = [c for c in combined.columns
+            if c.upper().startswith("ECEF")
+            or c in {"ITOW (ms)", "Week N (#)","N Satellites (#)"}]
+    if drop:
+        combined.drop(columns=drop, inplace=True)
+
     return combined
 
 
