@@ -321,9 +321,6 @@ with _tab_scatter:
             st.info("Not enough data points after dropping NaN.")
         else:
             _r_val = float(np.corrcoef(_sd[_x_ch], _sd[_y_ch])[0, 1])
-            _m, _b = np.polyfit(_sd[_x_ch], _sd[_y_ch], 1)
-            _x_line = np.array([float(_sd[_x_ch].min()), float(_sd[_x_ch].max())])
-            _y_line = _m * _x_line + _b
 
             _fig_sc = go.Figure()
             _fig_sc.add_trace(go.Scattergl(
@@ -333,18 +330,12 @@ with _tab_scatter:
                 name="Data",
                 hovertemplate=f"{_x_ch}: %{{x:.3g}}<br>{_y_ch}: %{{y:.3g}}<extra></extra>",
             ))
-            _fig_sc.add_trace(go.Scatter(
-                x=_x_line, y=_y_line,
-                mode="lines",
-                line=dict(color="tomato", width=2),
-                name="OLS fit",
-            ))
             _fig_sc.update_layout(
                 xaxis_title=_x_ch,
                 yaxis_title=_y_ch,
                 height=460,
-                legend=dict(orientation="h", y=1.06),
-                title=f"Pearson r = {_r_val:.4f}   |   slope = {_m:.4g}   |   N = {len(_sd):,}",
+                showlegend=False,
+                title=f"Pearson r = {_r_val:.4f}   |   N = {len(_sd):,}",
             )
             st.plotly_chart(_fig_sc, use_container_width=True)
 
