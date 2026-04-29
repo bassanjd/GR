@@ -51,3 +51,4 @@ Stage Notes/raw_data/
 *.dll
 *.jpeg
 Practice/DataPrepScripts/xrk.py
+.coverage
