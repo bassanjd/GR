@@ -320,8 +320,6 @@ with _tab_scatter:
         if len(_sd) < 3:
             st.info("Not enough data points after dropping NaN.")
         else:
-            _r_val = float(np.corrcoef(_sd[_x_ch], _sd[_y_ch])[0, 1])
-
             _fig_sc = go.Figure()
             _fig_sc.add_trace(go.Scattergl(
                 x=_sd[_x_ch], y=_sd[_y_ch],
@@ -335,7 +333,7 @@ with _tab_scatter:
                 yaxis_title=_y_ch,
                 height=460,
                 showlegend=False,
-                title=f"Pearson r = {_r_val:.4f}   |   N = {len(_sd):,}",
+                title=f"N = {len(_sd):,}",
             )
             st.plotly_chart(_fig_sc, use_container_width=True)
 
