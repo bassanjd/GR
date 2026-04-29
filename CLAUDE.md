@@ -21,14 +21,15 @@ All user-facing tools are **Streamlit web applications**. There is no REST API, 
 ```
 GR/
 ├── Practice/                    # Driver practice & coaching apps
-│   ├── racebox_tracker_app.py           # Primary practice analysis app (RaceBox + speed-tracker)
-│   ├── telemetry.py                     # Shared GPS telemetry module (see below)
+│   ├── driver_performance_app.py        # Primary practice analysis app (all sources)
+│   ├── car_performance_app.py           # Multi-source channel browser / data explorer
 │   ├── stopwatch_repeatability_app.py   # Reaction time consistency tester
-│   ├── car_performance_app.py           # Generic speed-tracker channel browser
+│   ├── telemetry.py                     # GPS/physics analysis module (see below)
+│   ├── loaders.py                       # Schema-translating parquet loaders (see below)
+│   ├── test_loaders.py                  # pytest tests for loaders.py
 │   ├── make_track_gpx.py                # GPX file generator for east/west track routes
-│   ├── prepare_track_data.py            # Data prep utility
 │   ├── prepare_track_data_with_basic_datalog.py
-│   └── *.parquet                        # Dated telemetry files (RaceBox and speed-tracker)
+│   └── DataParquet/                     # Telemetry parquet files (RaceBox, speed-tracker, Generic)
 │
 ├── Results/                     # Competition results analysis
 │   ├── team_analysis_app.py             # Team performance dashboard
@@ -95,7 +96,7 @@ The repository ships with a devcontainer. It:
 
 ```bash
 pip install -r requirements.txt
-streamlit run Practice/racebox_tracker_app.py
+streamlit run Practice/driver_performance_app.py
 ```
 
 ### Environment variables
@@ -116,9 +117,9 @@ All apps run on port 8501 (only one at a time):
 
 ```bash
 # Practice apps
-streamlit run Practice/racebox_tracker_app.py       # primary: multi-tab practice analysis
+streamlit run Practice/driver_performance_app.py    # primary: multi-tab practice analysis
+streamlit run Practice/car_performance_app.py       # channel browser / data explorer
 streamlit run Practice/stopwatch_repeatability_app.py
-streamlit run Practice/car_performance_app.py
 
 # Results apps
 streamlit run Results/team_analysis_app.py
@@ -154,17 +155,30 @@ python "Stage Notes/Scrape_Stage_Sheets_Batch.py"
 
 ## Practice Analysis Architecture
 
-### `telemetry.py` — shared module
+### `loaders.py` — schema translation layer
 
-All data-source-agnostic telemetry logic lives here. Apps import from it; they never duplicate physics or geometry code. Key components:
+Converts source-specific parquet formats to the **standard internal schema**. Apps call `loaders.load_any(path)` wrapped with `@st.cache_data`; they never read parquets directly.
 
-**Standard internal schema** — every loader normalises its source to these columns:
+**Standard internal schema** — every loader produces these columns:
 - `Elapsed time (sec)` — time axis
 - `Distance (mi)` — cumulative GPS odometer (haversine)
 - `Speed (mph)` — vehicle speed
 - `Latitude`, `Longitude` — GPS position (decimal degrees)
-- `Time` — original timestamp string
+- `Time` — timestamp string (HH:MM:SS)
 - `Date` — date string (YYYY-MM-DD)
+
+Extra source-specific columns are preserved and available to apps.
+
+**Three source formats handled:**
+- `load_racebox(path)` — raw RaceBox logger: parses ISO-8601 `Time`, renames `Speed` → `Speed (mph)`, computes haversine `Distance (mi)`, preserves GForce channels
+- `load_speed_tracker(path)` — pre-processed speed-tracker output: already in standard schema, just sorts and deduplicates; supports `.parquet` and `.csv`
+- `load_generic(path)` — proprietary datalogger: renames `GPS Speed (mph)` → `Speed (mph)`, `GPS Latitude/Longitude (deg)` → `Latitude/Longitude`, converts `Datetime` → `Time`/`Date` strings, computes haversine distance; preserves IMU/RPM/temperature channels
+
+**Dispatch**: `load_any(path)` routes by filename — `RaceBox*` → `load_racebox`, `*speed_tracker*` → `load_speed_tracker`, everything else → `load_generic`.
+
+### `telemetry.py` — analysis and physics module
+
+All data-source-agnostic telemetry logic lives here. Schema translation is in `loaders.py`; `telemetry.py` imports `haversine_cumulative_mi` is the only function used by loaders. Apps import analysis functions directly from `telemetry`.
 
 **`TrapConfig` dataclass** — all geometric state for the measured section:
 - `east_lon/lat`, `west_lon/lat` — gate endpoint coordinates
@@ -176,17 +190,13 @@ All data-source-agnostic telemetry logic lives here. Apps import from it; they n
 
 **GPS geometry**: `haversine_cumulative_mi`, `find_crossing_dist` (oblique trap gate crossing)
 
-**Run segmentation**: `segment_exercise_runs` — isolates runs in the exercise zone, splits on time gaps > 30 s, detects target speed from mode of in-trap speeds
+**Run segmentation**: `segment_exercise_runs` — isolates runs in the exercise zone (lat ≈ 29.33715, east-west track), splits on time gaps > 30 s, detects target speed from mode of in-trap speeds
 
 **Run classification**: `run_start_type`, `run_finish_type` — Flying vs Standing based on speed in window around trap gates; `get_run_timing_refs` — returns `(entry_d, exit_d)` odometer distances appropriate for each start/finish combination
 
-**Data loaders**:
-- `load_racebox(path)` — RaceBox parquet (raw ISO-8601 timestamps, haversine distance)
-- `load_speed_tracker(path)` — pre-processed speed-tracker parquet or CSV
+### `driver_performance_app.py` — primary practice app
 
-### `racebox_tracker_app.py` — primary practice app
-
-Multi-tab Streamlit app supporting both RaceBox and speed-tracker parquet files. File type is detected by filename prefix (`RaceBox` → `load_racebox`, otherwise → `load_speed_tracker`).
+Multi-tab Streamlit app supporting all parquet sources (RaceBox, speed-tracker, Generic). Loads all files from `DataParquet/` via `loaders.load_any()`.
 
 **Tabs:**
 1. **Runs Overview** — summary table with timing/speed/accel stats; speed overlay chart; trap-aligned speed comparison; acceleration & jerk distributions
@@ -216,14 +226,15 @@ Reads the most recent RaceBox parquet, finds a representative eastbound and west
 | `stage_instructions.parquet` | `Stage Notes/` | One row per grid instruction (stage, leg, position, direction) |
 | `leg_characteristics.parquet` | `Stage Notes/` | One row per (Stage, Leg) with terrain/type metadata |
 | `great_race_all_stages.parquet` | `Stage Notes/` | Combined stage data |
-| `RaceBox *.parquet` | `Practice/` | Raw RaceBox GPS logger output (Time, Latitude, Longitude, Speed, GForceX/Y/Z, …) |
-| `*speed_tracker*.parquet` | `Practice/` | Pre-processed speed-tracker output (already in standard schema) |
+| `RaceBox *.parquet` | `Practice/DataParquet/` | Raw RaceBox GPS logger output (Time, Latitude, Longitude, Speed, GForceX/Y/Z, …) |
+| `*speed_tracker*.parquet` | `Practice/DataParquet/` | Pre-processed speed-tracker output (already in standard schema); may include attached datalogger temperature channels |
+| `*Generic*.parquet` | `Practice/DataParquet/` | Proprietary datalogger output (GPS Speed/Lat/Lon/Altitude, Datetime, IMU channels InlineAcc/LateralAcc/VerticalAcc, RPM, temperatures) |
 
 ### Caching conventions
 
 - Claude API responses are cached as JSON files in `Stage Notes/claude_cache/stage_N_page_M.json` — **never delete these unless re-extracting**
 - Streamlit uses `@st.cache_data` on all expensive loads (parquet reads, data joins)
-- `racebox_tracker_app.py` caches per-run derivative DataFrames on the run dict (`r["_grp_with_derivs"]`) to avoid recomputation across tabs
+- `driver_performance_app.py` caches per-run derivative DataFrames on the run dict (`r["_grp_with_derivs"]`) to avoid recomputation across tabs
 
 ### Excluded from git
 
@@ -330,7 +341,7 @@ Never hardcode absolute paths (there is one legacy Windows path in `extract_clau
 
 ### Telemetry / standard schema columns
 
-Practice apps operate on the standard schema produced by `telemetry.py` loaders:
+Practice apps operate on the standard schema produced by `loaders.py`:
 - `Speed (mph)` — vehicle speed
 - `Elapsed time (sec)` — time since first record in the file
 - `Distance (mi)` — cumulative haversine GPS odometer
@@ -383,13 +394,35 @@ response = client.messages.create(
 
 ## Testing
 
-There is **no automated test suite**. Verification is manual:
+### Automated tests — `Practice/test_loaders.py`
 
-1. Run the target Streamlit app
+Run from the repo root:
+
+```bash
+pytest Practice/test_loaders.py
+```
+
+Or from `Practice/`:
+
+```bash
+pytest test_loaders.py
+```
+
+The test file covers all three loaders and the `load_any()` dispatcher:
+
+- **Individual loader tests** — schema correctness, sort/dedup, source-specific column presence (GForce channels, datalogger channels, GPS rename)
+- **`load_any` dispatch tests** — verifies routing by filename prefix
+- **Parametrized contract tests** (run over every `.parquet` in `DataParquet/`) — required schema columns, monotonic elapsed time, no duplicate timestamps, non-negative speed, non-decreasing distance, lat/lon in valid range, non-empty result
+
+When adding a new loader or modifying schema translation, run the full suite and ensure all parametrized contract tests pass for every file in `DataParquet/`.
+
+### Manual verification
+
+For Streamlit app changes, visual verification remains necessary:
+
+1. Run the target app
 2. Load a known data file
-3. Visually verify charts and tables match expectations
-
-When modifying data transformation logic, verify against known-good Parquet files before committing.
+3. Verify charts and tables match expectations
 
 ---
 
@@ -416,10 +449,10 @@ git push -u origin <branch-name>
 
 ### Add a new data source to the practice app
 
-1. Write `load_<source>(path: str) -> pd.DataFrame` in `telemetry.py` that produces the standard schema
-2. Add file detection logic in `racebox_tracker_app.py` `load_track()` (the `if Path(path).name.startswith(...)` dispatch)
-3. Optionally initialise a `TrapConfig` from source-specific coordinates
-4. The analysis layer (`segment_exercise_runs`, `compute_derivatives`, etc.) requires no changes
+1. Write `load_<source>(path: str) -> pd.DataFrame` in `loaders.py` that produces the standard internal schema (see `loaders.py` docstring)
+2. Add a detection branch in `loaders.load_any()` based on the filename pattern
+3. The analysis layer (`segment_exercise_runs`, `compute_derivatives`, etc.) and both Streamlit apps require no changes — they consume the standard schema via `load_any()`
+4. Add contract tests in `test_loaders.py` for the new source and confirm the parametrized suite passes
 
 ### Add a new Parquet dataset
 
@@ -447,4 +480,5 @@ Run `Results/GreatRaceResultsScrape.py` pointing at the official results HTML, t
 - **Do not call the Claude API in a Streamlit app** — API calls belong in batch scripts; apps read from Parquet cache
 - **Do not delete `claude_cache/` JSON files** unless you intend to re-run the expensive extraction
 - **Do not use `st.experimental_rerun()`** — use `st.rerun()` (Streamlit ≥1.27)
-- **Do not duplicate telemetry logic in apps** — all GPS/physics/signal processing belongs in `telemetry.py`
+- **Do not duplicate telemetry logic in apps** — GPS/physics/signal processing belongs in `telemetry.py`; schema translation belongs in `loaders.py`
+- **Do not add loaders to `telemetry.py`** — schema translation lives in `loaders.py`; `telemetry.py` is analysis-only
