@@ -17,7 +17,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from calibration_helpers import (
+from navigator_chart_helpers import (
     build_reference_workbook,
     compute_losses,
     load_calibration_runs,

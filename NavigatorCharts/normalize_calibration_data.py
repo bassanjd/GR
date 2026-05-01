@@ -27,6 +27,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 EXCEL_IN = Path(__file__).parent / "2026 Great Race Charts April 29th.xlsx"
 EXCEL_OUT = Path(__file__).parent / "navigator_chart_normalized.xlsx"
+PARQUET_OUT = Path(__file__).parent / "navigator_chart_calibration_runs.parquet"
 
 SPEEDS_MPH = [15, 20, 25, 30, 35, 40, 45, 50]
 DIRECTIONS_ALT = ['E', 'W', 'E', 'W', 'E', 'W', 'E', 'W']
@@ -292,5 +293,10 @@ if __name__ == "__main__":
     cal = write_excel(raw_rows, df_raw)
 
     print(f"\nWrote {EXCEL_OUT.name}")
+    try:
+        df_raw.to_parquet(PARQUET_OUT, index=False)
+        print(f"Wrote {PARQUET_OUT.name}")
+    except Exception as e:
+        print(f"Warning: failed to write parquet {PARQUET_OUT}: {e}")
     print("\n2026 Calibration Summary:")
     print(cal.to_string(index=False, float_format="%.2f"))
