@@ -10,9 +10,7 @@ Export buttons produce in-memory Excel files containing the four
 reference matrices (same format as make_reference_charts.py).
 """
 import io
-from pathlib import Path
 
-import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st

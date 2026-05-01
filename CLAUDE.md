@@ -11,6 +11,7 @@ This is a **motorsport data analysis toolkit** for the Great Race — a cross-co
 - Driver **practice and coaching** (reaction time, GPS telemetry, acceleration metrics)
 - **Competition results** analysis and team comparison
 - **Stage notes** extraction from PDFs using OCR and Claude vision API
+- **Navigator reference charts** — speedometer calibration and speed-transition time matrices for in-car use
 
 All user-facing tools are **Streamlit web applications**. There is no REST API, backend server, or database — data flows through Parquet files and in-memory Pandas DataFrames.
 
@@ -27,6 +28,7 @@ GR/
 │   ├── telemetry.py                     # GPS/physics analysis module (see below)
 │   ├── loaders.py                       # Schema-translating parquet loaders (see below)
 │   ├── test_loaders.py                  # pytest tests for loaders.py
+│   ├── test_telemetry.py                # pytest tests for telemetry.py
 │   ├── make_track_gpx.py                # GPX file generator for east/west track routes
 │   ├── prepare_track_data_with_basic_datalog.py
 │   └── DataParquet/                     # Telemetry parquet files (RaceBox, speed-tracker, Generic)
@@ -50,6 +52,14 @@ GR/
 │   ├── leg_characteristics.parquet      # Per-leg metadata
 │   └── great_race_all_stages.parquet    # All stages combined
 │
+├── NavigatorCharts/             # Speedometer calibration & navigator reference charts
+│   ├── navigator_chart_helpers.py       # Shared matrix math, data loading, Excel utilities
+│   ├── navigator_chart_app.py           # Interactive Streamlit app (calibration runs + export)
+│   ├── make_navigator_charts.py         # Batch script: build reference charts from calibration data
+│   ├── normalize_calibration_data.py    # Parse raw timing Excel → normalized parquet/xlsx
+│   ├── test_navigator_chart_helpers.py  # pytest tests for navigator_chart_helpers.py
+│   └── navigator_chart_calibration_runs.parquet  # Normalized calibration run data
+│
 ├── .devcontainer/
 │   └── devcontainer.json                # Docker dev environment config
 ├── requirements.txt                     # Core Python dependencies
@@ -63,7 +73,7 @@ GR/
 
 | Category | Technology |
 |---|---|
-| Language | Python 3.13 |
+| Language | Python 3.11 |
 | UI Framework | Streamlit |
 | Data Manipulation | Pandas, NumPy |
 | Visualization | Plotly Express / Graph Objects |
@@ -129,6 +139,9 @@ streamlit run Results/group_sum_montecarlo_explorer_app.py
 # Stage Notes apps
 streamlit run "Stage Notes/field_comparison_app.py"
 streamlit run "Stage Notes/pdf_table_operator_app.py"
+
+# NavigatorCharts app
+streamlit run NavigatorCharts/navigator_chart_app.py
 ```
 
 ### Data extraction scripts (not Streamlit apps)
@@ -149,6 +162,10 @@ python Practice/make_track_gpx.py                           # produces track_eas
 python Results/GreatRaceResultsScrape.py
 python "Stage Notes/Scrape_Stage_Sheets.py"
 python "Stage Notes/Scrape_Stage_Sheets_Batch.py"
+
+# Navigator charts: normalize raw calibration data then build reference charts
+python NavigatorCharts/normalize_calibration_data.py        # parse raw Excel → navigator_chart_normalized.xlsx
+python NavigatorCharts/make_navigator_charts.py             # build reference matrices from normalized data
 ```
 
 ---
@@ -216,6 +233,42 @@ Reads the most recent RaceBox parquet, finds a representative eastbound and west
 
 ---
 
+## Navigator Charts Architecture
+
+### `navigator_chart_helpers.py` — shared matrix math and Excel utilities
+
+Constants, pure matrix functions, loss computation, and openpyxl writing helpers shared by both the batch script and the Streamlit app.
+
+**Constants**: `SPEEDS = [0, 15, 20, 25, 30, 35, 40, 45, 50]`, `STOP_SIGN_SECONDS = 15.0`, `COURSE_MI = 1.0`, `DATE_2026`
+
+**Matrix functions** (all return a `len(SPEEDS) × len(SPEEDS)` list-of-lists):
+- `matrix_transition(accel, decel)` — extra seconds for any speed change; diagonal is `BLANK`
+- `matrix_stop_go(accel, decel)` — standstill seconds remaining inside a mandatory stop
+- `matrix_turn_loss(accel, decel, ref_mph)` — time lost vs arriving/leaving at `ref_mph`
+
+**Data pipeline**:
+- `load_calibration_runs()` — reads the *Calibration Runs* sheet from `navigator_chart_normalized.xlsx`
+- `compute_losses(df)` — pivots 2026 rows into per-speed accel/decel loss table; returns `None` if data incomplete
+- `losses_to_dicts(losses)` — converts loss DataFrame to `(accel, decel)` dicts keyed by MPH; missing speeds fill with `NaN`
+
+**Excel writing**: `write_matrix(...)`, `write_reference_charts_to_sheet(...)`, `build_reference_workbook(...)` — write four labeled, color-scaled matrices to openpyxl worksheets.
+
+### `normalize_calibration_data.py` — raw data normalization
+
+Reads `2026 Great Race Charts April 29th.xlsx` (three worksheets: *Straight Speed*, *Speed Stop*, *Start Speed*), parses timing strings in both `MM:SS.cs` and `MM:SS:cs` formats, and writes:
+- `navigator_chart_normalized.xlsx` — *Calibration Runs* sheet (all raw runs) + *2026 Calibration* sheet (per-speed averages, actual MPH, error %, accel/decel losses)
+- `navigator_chart_calibration_runs.parquet` — same calibration runs as Parquet
+
+### `make_navigator_charts.py` — batch reference chart generator
+
+Calls `load_calibration_runs()` → `compute_losses()` → `losses_to_dicts()` → `build_reference_workbook()` and saves the result to `navigator_chart_normalized.xlsx` (*Reference Charts* sheet).
+
+### `navigator_chart_app.py` — interactive Streamlit app
+
+Three-column layout (no tabs). Left column: raw calibration runs table with per-row *Exclude* checkboxes. Middle/right columns: strip charts and loss line charts computed from all data vs. filtered data. Two download buttons export in-memory Excel workbooks with the four reference matrices.
+
+---
+
 ## Data Architecture
 
 ### Primary data stores (Parquet files)
@@ -229,6 +282,7 @@ Reads the most recent RaceBox parquet, finds a representative eastbound and west
 | `RaceBox *.parquet` | `Practice/DataParquet/` | Raw RaceBox GPS logger output (Time, Latitude, Longitude, Speed, GForceX/Y/Z, …) |
 | `*speed_tracker*.parquet` | `Practice/DataParquet/` | Pre-processed speed-tracker output (already in standard schema); may include attached datalogger temperature channels |
 | `*Generic*.parquet` | `Practice/DataParquet/` | Proprietary datalogger output (GPS Speed/Lat/Lon/Altitude, Datetime, IMU channels InlineAcc/LateralAcc/VerticalAcc, RPM, temperatures) |
+| `navigator_chart_calibration_runs.parquet` | `NavigatorCharts/` | Normalized calibration run data (date, test_type, target_mph, run_number, direction, time_s) |
 
 ### Caching conventions
 
@@ -394,27 +448,31 @@ response = client.messages.create(
 
 ## Testing
 
-### Automated tests — `Practice/test_loaders.py`
+### Automated tests
 
-Run from the repo root:
-
-```bash
-pytest Practice/test_loaders.py
-```
-
-Or from `Practice/`:
+Run all tests from the repo root:
 
 ```bash
-pytest test_loaders.py
+pytest Practice/test_loaders.py Practice/test_telemetry.py NavigatorCharts/test_navigator_chart_helpers.py
 ```
 
-The test file covers all three loaders and the `load_any()` dispatcher:
+#### `Practice/test_loaders.py`
+
+Covers all three loaders and the `load_any()` dispatcher:
 
 - **Individual loader tests** — schema correctness, sort/dedup, source-specific column presence (GForce channels, datalogger channels, GPS rename)
 - **`load_any` dispatch tests** — verifies routing by filename prefix
 - **Parametrized contract tests** (run over every `.parquet` in `DataParquet/`) — required schema columns, monotonic elapsed time, no duplicate timestamps, non-negative speed, non-decreasing distance, lat/lon in valid range, non-empty result
 
 When adding a new loader or modifying schema translation, run the full suite and ensure all parametrized contract tests pass for every file in `DataParquet/`.
+
+#### `Practice/test_telemetry.py`
+
+Covers all pure analysis functions in `telemetry.py`: `TrapConfig` geometry, `haversine_cumulative_mi`, `smooth_series`, `compute_derivatives`, `find_crossing_dist`, `run_start_type`/`run_finish_type`, `get_run_timing_refs`, and `segment_exercise_runs`.
+
+#### `NavigatorCharts/test_navigator_chart_helpers.py`
+
+Covers all pure functions in `navigator_chart_helpers.py` and the time-parsing helpers in `normalize_calibration_data.py`: matrix math (`matrix_transition`, `matrix_stop_go`, `matrix_turn_loss`), loss pipeline (`compute_losses`, `losses_to_dicts`), Excel style helpers, `build_reference_workbook`, `parse_time_str`, `time_obj_to_s`, `fmt_mm_ss_cs`.
 
 ### Manual verification
 

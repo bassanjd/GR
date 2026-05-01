@@ -11,7 +11,6 @@ from plotly.subplots import make_subplots
 from pathlib import Path
 
 import loaders
-import telemetry
 from telemetry import (
     TrapConfig,
     MPH_S_TO_FT_S2, G_FT_S2,
@@ -1385,7 +1384,6 @@ with tab_compare:
             })
 
         # ── Row 1: Overlay for selected run ───────────────────────────────────
-        # st.markdown("#### Overlay — Selected Run")
         _sel_r   = runs[_cmp_run_idx]
         _sel_grp = _grp_derivs(_sel_r, smooth_window)
         _sel_gps = _sel_grp["accel_ft_s2"].to_numpy()

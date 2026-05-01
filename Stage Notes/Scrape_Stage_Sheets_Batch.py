@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import cv2
 import pytesseract
-import os
 import string
 import time
 from pathlib import Path
