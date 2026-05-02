@@ -11,7 +11,7 @@ This is a **motorsport data analysis toolkit** for the Great Race — a cross-co
 - Driver **practice and coaching** (reaction time, GPS telemetry, acceleration metrics)
 - **Competition results** analysis and team comparison
 - **Stage notes** extraction from PDFs using OCR and Claude vision API
-- **Navigator reference charts** — speedometer calibration and speed-transition time matrices for in-car use
+- **Navigator reference charts** — speed-transition time matrices and stop-sign timing tables for in-car use
 
 All user-facing tools are **Streamlit web applications**. There is no REST API, backend server, or database — data flows through Parquet files and in-memory Pandas DataFrames.
 
@@ -52,7 +52,7 @@ GR/
 │   ├── leg_characteristics.parquet      # Per-leg metadata
 │   └── great_race_all_stages.parquet    # All stages combined
 │
-├── NavigatorCharts/             # Speedometer calibration & navigator reference charts
+├── NavigatorCharts/             # Navigator reference charts
 │   ├── navigator_chart_helpers.py       # Shared matrix math, data loading, Excel utilities
 │   ├── navigator_chart_app.py           # Interactive Streamlit app (calibration runs + export)
 │   ├── make_navigator_charts.py         # Batch script: build reference charts from calibration data
@@ -256,7 +256,7 @@ Constants, pure matrix functions, loss computation, and openpyxl writing helpers
 ### `normalize_calibration_data.py` — raw data normalization
 
 Reads `2026 Great Race Charts April 29th.xlsx` (three worksheets: *Straight Speed*, *Speed Stop*, *Start Speed*), parses timing strings in both `MM:SS.cs` and `MM:SS:cs` formats, and writes:
-- `navigator_chart_normalized.xlsx` — *Calibration Runs* sheet (all raw runs) + *2026 Calibration* sheet (per-speed averages, actual MPH, error %, accel/decel losses)
+- `navigator_chart_normalized.xlsx` — *Calibration Runs* sheet (all raw runs) + *2026 Timing Data* sheet (per-speed averages, actual MPH, error %, accel/decel losses)
 - `navigator_chart_calibration_runs.parquet` — same calibration runs as Parquet
 
 ### `make_navigator_charts.py` — batch reference chart generator

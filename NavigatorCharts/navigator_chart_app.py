@@ -7,7 +7,7 @@ Three-column layout — no tabs:
   Right  — charts recomputed after excluded rows are removed
 
 Export buttons produce in-memory Excel files containing the four
-reference matrices (same format as make_reference_charts.py).
+reference matrices (same format as make_navigator_charts.py).
 """
 import io
 
