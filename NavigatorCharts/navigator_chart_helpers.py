@@ -14,8 +14,6 @@ CALIBRATION_PARQUET = Path(__file__).parent / "navigator_chart_calibration_runs.
 
 SPEEDS = [0, 15, 20, 25, 30, 35, 40, 45, 50]
 STOP_SIGN_SECONDS = 15.0
-COURSE_MI = 1.0
-DATE_2026 = "2026-04-29"
 
 
 # ── Matrix computation ────────────────────────────────────────────────────────
@@ -75,12 +73,14 @@ def load_calibration_runs():
 
 def compute_losses(df):
     """
-    Return per-speed loss table (DataFrame) from 2026 rows in df.
+    Return per-speed loss table (DataFrame) from the latest date's rows in df.
     Returns None if there are not enough rows to compute all three test types.
 
-    Columns: MPH, Straight (s), Accel Loss (s), Decel Loss (s), Actual MPH, Error (%)
+    Columns: MPH, Straight (s), Accel Loss (s), Decel Loss (s)
     """
-    df26 = df[df["date"] == DATE_2026]
+    if df.empty:
+        return None
+    df26 = df[df["date"] == df["date"].max()]
     if df26.empty:
         return None
     grp = df26.groupby(["test_type", "target_mph"])["time_s"].mean().unstack("test_type")
@@ -91,15 +91,12 @@ def compute_losses(df):
     if grp.empty:
         return None
     straight = grp["straight_speed"]
-    result = pd.DataFrame({
+    return pd.DataFrame({
         "MPH":            straight.index.tolist(),
         "Straight (s)":   straight.values,
         "Accel Loss (s)": (grp["start_speed"] - straight).values,
         "Decel Loss (s)": (grp["speed_stop"]  - straight).values,
     })
-    result["Actual MPH"] = COURSE_MI / (result["Straight (s)"] / 3600)
-    result["Error (%)"]  = (result["Actual MPH"] - result["MPH"]) / result["MPH"] * 100
-    return result
 
 
 def losses_to_dicts(losses):
@@ -161,7 +158,7 @@ def apply(cell, style_dict):
 
 def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
                  color_lo, color_mid, color_hi, mid_value=0.0,
-                 hide_zero_axis=False):
+                 hide_zero_axis=False, color_scale=True):
     """
     Write one labeled matrix block to the worksheet.
 
@@ -223,14 +220,14 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
                 cell.fill = BLACK_FILL
                 cell.font = BLACK_FONT
                 if val is not BLANK:
-                    cell.number_format = "0.00"
+                    cell.number_format = "0.0"
                 cell.alignment = Alignment(horizontal="center")
             elif val is BLANK:
                 cell.value = None
                 cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
             else:
                 cell.value = round(val, 2)
-                cell.number_format = "0.00"
+                cell.number_format = "0.0"
                 cell.alignment = Alignment(horizontal="center")
             cell.border = thin_border()
 
@@ -242,17 +239,18 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
     cs_start_row = data_start_row + (1 if hide_zero_axis else 0)
     cs_range = f"{cs_start_col}{cs_start_row}:{cs_end_col}{data_end_row}"
 
-    rule = ColorScaleRule(
-        start_type="min",  start_color=color_lo,
-        mid_type="num",    mid_value=mid_value, mid_color=color_mid,
-        end_type="max",    end_color=color_hi,
-    )
-    ws.conditional_formatting.add(cs_range, rule)
+    if color_scale:
+        rule = ColorScaleRule(
+            start_type="min",  start_color=color_lo,
+            mid_type="num",    mid_value=mid_value, mid_color=color_mid,
+            end_type="max",    end_color=color_hi,
+        )
+        ws.conditional_formatting.add(cs_range, rule)
 
     return R + n  # next available row
 
 
-def write_reference_charts_to_sheet(ws, accel, decel, label=""):
+def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True):
     """
     Write 4 reference matrices directly into an existing openpyxl worksheet.
     label: optional string appended to each matrix title.
@@ -277,6 +275,7 @@ def write_reference_charts_to_sheet(ws, accel, decel, label=""):
         top_row=1, left_col=1,
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
+        color_scale=color_scale,
     )
     next_row = write_matrix(
         ws, m2,
@@ -289,6 +288,7 @@ def write_reference_charts_to_sheet(ws, accel, decel, label=""):
         color_lo="F8696B", color_mid="FFEB84", color_hi="63BE7B",
         mid_value=STOP_SIGN_SECONDS / 2,
         hide_zero_axis=True,
+        color_scale=color_scale,
     )
     next_row = write_matrix(
         ws, m3,
@@ -298,6 +298,7 @@ def write_reference_charts_to_sheet(ws, accel, decel, label=""):
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
         hide_zero_axis=True,
+        color_scale=color_scale,
     )
     next_row = write_matrix(
         ws, m4,
@@ -307,19 +308,19 @@ def write_reference_charts_to_sheet(ws, accel, decel, label=""):
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
         hide_zero_axis=True,
+        color_scale=color_scale,
     )
 
     note_row = next_row + 2
     note = ws.cell(note_row, 1,
-                   f"Source: {DATE_2026} calibration runs · {COURSE_MI}-mile measured course"
-                   + (f" · {label}" if label else ""))
+                   "Source: latest calibration runs" + (f" · {label}" if label else ""))
     note.font = Font(italic=True, size=8, color="808080")
 
 
-def build_reference_workbook(accel, decel, label=""):
+def build_reference_workbook(accel, decel, label="", color_scale=True):
     """Return a new openpyxl Workbook with 4 reference matrices (for in-memory export)."""
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Reference Charts"
-    write_reference_charts_to_sheet(ws, accel, decel, label)
+    ws.title = "Navigator Charts"
+    write_reference_charts_to_sheet(ws, accel, decel, label, color_scale=color_scale)
     return wb

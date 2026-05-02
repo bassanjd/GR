@@ -15,6 +15,7 @@ Tab "Charts" — the four reference matrices styled to match the Excel export
 "All Data" always uses every visible row; exclusions only affect "Filtered".
 """
 import io
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -36,7 +37,6 @@ from navigator_chart_helpers import (
 
 st.set_page_config(page_title="Navigator Charts", layout="wide", page_icon="🏎️")
 
-DATE_2026 = "2026-04-29"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -46,8 +46,8 @@ def load_runs():
     return load_calibration_runs()
 
 
-def build_export_bytes(accel, decel, label):
-    wb = build_reference_workbook(accel, decel, label)
+def build_export_bytes(accel, decel, label, color_scale=True):
+    wb = build_reference_workbook(accel, decel, label, color_scale=color_scale)
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -59,8 +59,8 @@ def compute_auto_excludes(df, n_excl):
     Return (mask, excl_order) where mask is a boolean Series and excl_order is an
     integer Series (1 = first excluded, 2 = second, …; 0 = not excluded).
 
-    Greedy degree-2 polynomial fit: at each step selects the single 2026 run (any
-    test type — a straight-speed exclusion improves both curves simultaneously) whose
+    Greedy degree-2 polynomial fit: at each step selects the single run from the latest
+    date (any test type — a straight-speed exclusion improves both curves simultaneously) whose
     removal most reduces the total sum of squared residuals from quadratic fits to
     both the accel and decel loss curves.  Ties broken by the run's z-score within
     its own group (prefer the most extreme run).  Stops at n_excl exclusions.
@@ -69,7 +69,7 @@ def compute_auto_excludes(df, n_excl):
     excl_order = pd.Series(0, index=df.index)
     if n_excl == 0:
         return mask, excl_order
-    df26 = df[df["date"] == DATE_2026]
+    df26 = df[df["date"] == df["date"].max()]
 
     gstats = (df26.groupby(["test_type", "target_mph"])["time_s"]
               .agg(["mean", "std"]))
@@ -178,13 +178,8 @@ def loss_line_chart(losses, title, show_fit=True):
         if ca is not None:
             x_fine = np.linspace(x[0], x[-1], 200)
 
-            def r2(y, coef):
-                ss_res = float(np.sum((y - np.polyval(coef, x)) ** 2))
-                ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-                return 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
-
-            r2a = r2(a, ca)
-            r2d = r2(d, cd)
+            r2a = _r2(a, ca, x)
+            r2d = _r2(d, cd, x)
             accel_name = f"Accel (R²={r2a:.4f})"
             decel_name = f"Decel (R²={r2d:.4f})"
             traces += [
@@ -223,7 +218,7 @@ def _r2(y, coef, x):
 
 def losses_table(losses, ca=None, cd=None):
     if losses is None:
-        st.caption("Insufficient 2026 data to compute losses.")
+        st.caption("Insufficient data to compute losses.")
         return
     display_cols = ["MPH", "Straight (s)", "Accel Loss (s)", "Decel Loss (s)"]
     df = losses[display_cols].copy()
@@ -357,7 +352,7 @@ _S_BLACK  = ("background:#000;color:#000;font-size:10px;text-align:center;"
 
 
 def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
-                mid_value, hide_zero_axis=False):
+                mid_value, hide_zero_axis=False, color_scale=True):
     """HTML string for one reference matrix, styled like the Excel export."""
     visible = [
         round(val, 1)
@@ -394,8 +389,11 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
             elif val is None:
                 h.append(f'<td style="{_S_BLANK}"></td>')
             else:
-                bg = _scale_color(round(val, 1), vmin, vmid, vmax, c_lo, c_mid, c_hi)
-                fg = "000000" if _luminance(bg) > 140 else "FFFFFF"
+                if color_scale:
+                    bg = _scale_color(round(val, 1), vmin, vmid, vmax, c_lo, c_mid, c_hi)
+                    fg = "000000" if _luminance(bg) > 140 else "FFFFFF"
+                else:
+                    bg, fg = "F2F2F2", "000000"
                 s = (f"background:#{bg};color:#{fg};font-size:10px;"
                      f"text-align:center;padding:4px 10px;border:1px solid #9DC3E6;")
                 h.append(f'<td style="{s}">{val:.1f}</td>')
@@ -405,10 +403,10 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
     return "".join(h)
 
 
-def render_matrix_html(accel, decel):
+def render_matrix_html(accel, decel, color_scale=True):
     """Render all four reference matrices as styled HTML tables."""
     if accel is None:
-        st.caption("Insufficient 2026 data to build matrices.")
+        st.caption("Insufficient data to build matrices.")
         return
 
     m1 = matrix_transition(accel, decel)
@@ -423,6 +421,7 @@ def render_matrix_html(accel, decel):
         subtitle="Extra seconds vs. flying straight through · blank diagonal = no change",
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
+        color_scale=color_scale,
     )
     html += matrix_html(
         m2,
@@ -432,6 +431,7 @@ def render_matrix_html(accel, decel):
         c_lo="F8696B", c_mid="FFEB84", c_hi="63BE7B",
         mid_value=STOP_SIGN_SECONDS / 2,
         hide_zero_axis=True,
+        color_scale=color_scale,
     )
     html += matrix_html(
         m3,
@@ -440,6 +440,7 @@ def render_matrix_html(accel, decel):
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
         hide_zero_axis=True,
+        color_scale=color_scale,
     )
     html += matrix_html(
         m4,
@@ -448,6 +449,7 @@ def render_matrix_html(accel, decel):
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
         hide_zero_axis=True,
+        color_scale=color_scale,
     )
     html += '</div>'
     st.markdown(html, unsafe_allow_html=True)
@@ -469,7 +471,7 @@ with st.sidebar:
     )
 
     all_dates = sorted(df_all["date"].unique(), reverse=True)
-    sel_dates = st.multiselect("Date", all_dates, default=[DATE_2026])
+    sel_dates = st.multiselect("Date", all_dates, default=[all_dates[0]] if all_dates else [])
 
     df_visible = df_all[df_all["date"].isin(sel_dates)].reset_index(drop=True)
 
@@ -514,6 +516,7 @@ with st.sidebar:
         disabled=[c for c in df_edit.columns if c != "Excl."],
     )
 
+
 n_excl   = int(edited["Excl."].sum())
 df_kept  = edited[~edited["Excl."]].drop(columns=["Excl."])
 
@@ -531,7 +534,7 @@ filt_label = f"Filtered ({n_excl} excluded)" if n_excl else "Filtered (none excl
 
 st.title("Navigator Charts")
 
-tab_summary, tab_charts = st.tabs(["Summary", "Charts"])
+tab_summary, tab_charts, tab_method = st.tabs(["Summary", "Charts", "Help"])
 
 # ── Tab: Data Summary ─────────────────────────────────────────────────────────
 
@@ -559,35 +562,122 @@ with tab_summary:
 # ── Tab: Charts ───────────────────────────────────────────────────────────────
 
 with tab_charts:
+    use_color_scale = st.toggle("Conditional formatting", value=True)
+
     col_charts_all, col_charts_filt = st.columns(2)
+
+    _ts = datetime.now().strftime("%Y-%m-%d-%H%M")
 
     with col_charts_all:
         st.subheader("All Data")
         if accel_all is not None:
             st.download_button(
-                "⬇ Export reference charts (all data)",
-                data=build_export_bytes(accel_all, decel_all, "all data"),
-                file_name="reference_charts_all.xlsx",
+                "⬇ Export navigator charts (all data)",
+                data=build_export_bytes(accel_all, decel_all, "all data",
+                                        color_scale=use_color_scale),
+                file_name=f"{_ts}_navigator_charts_all.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
         else:
-            st.button("⬇ Export reference charts (all data)", disabled=True,
+            st.button("⬇ Export navigator charts (all data)", disabled=True,
                       use_container_width=True)
-        render_matrix_html(accel_all, decel_all)
+        render_matrix_html(accel_all, decel_all, color_scale=use_color_scale)
 
     with col_charts_filt:
         st.subheader(filt_label)
         if accel_filt is not None:
             st.download_button(
-                "⬇ Export reference charts (filtered)",
-                data=build_export_bytes(accel_filt, decel_filt, "filtered"),
-                file_name="reference_charts_filtered.xlsx",
+                "⬇ Export navigator charts (filtered)",
+                data=build_export_bytes(accel_filt, decel_filt, "filtered",
+                                        color_scale=use_color_scale),
+                file_name=f"{_ts}_navigator_charts_filtered.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
         else:
-            st.button("⬇ Export reference charts (filtered)", disabled=True,
+            st.button("⬇ Export navigator charts (filtered)", disabled=True,
                       use_container_width=True)
-        render_matrix_html(accel_filt, decel_filt)
-1
+        render_matrix_html(accel_filt, decel_filt, color_scale=use_color_scale)
+
+# ── Tab: Methodology ──────────────────────────────────────────────────────────
+
+with tab_method:
+    st.markdown("""
+## About This App
+
+This app processes timed calibration runs to produce the **navigator charts**
+used in-car during the Great Race. The charts give the navigator a lookup table showing
+how many seconds are gained or lost whenever the car changes speed — for example,
+accelerating from a stop sign to cruise speed, or slowing from 45 mph to make a turn.
+
+---
+
+## Intent
+
+The goal is to build reference matrices that are as accurate as possible for *this car*
+with *this driver and navigator*. Because every car accelerates and decelerates differently,
+the charts must be derived from actual timed runs rather than theoretical calculations.
+Three run types are collected:
+
+- **Straight** — timed over a measured course at a constant target speed; establishes
+  the baseline time for that speed.
+- **Start** — standing start to the end of the same measured course at target speed;
+  the excess over the straight time is the acceleration loss.
+- **Stop** — run over the same measured course ending in a full stop; the excess over
+  the straight time is the deceleration loss.
+
+All three run types must be performed over the same course distance. The loss values
+are pure time differences and are valid regardless of what that distance is.
+
+Polynomial curve fits (degree 2) are applied across speeds so the matrices can be
+populated at all speed combinations, including those not directly measured.
+
+---
+
+## How to Use
+
+1. **Select calibration date(s)** in the sidebar. Typically use the most recent session.
+2. **Set the auto-exclude count** with the slider. The algorithm automatically identifies
+   and removes the runs that most degrade the curve fits. Six is a reasonable starting
+   point — reduce it if data is sparse, increase it if outliers are visible in the charts.
+3. **Review the sidebar table.** Excluded runs appear at the top in the order they were
+   removed. Uncheck any row to manually override the exclusion.
+4. **Check the Summary tab** to compare the all-data and filtered results side by side.
+   The loss charts, fit equations, R² values, and run-time pivot table all update live.
+5. **Open the Charts tab** to inspect the four reference matrices and export them to
+   Excel for printing and in-car use.
+
+---
+
+## Interpreting the Results
+
+- **R² values** near 1.0 indicate a smooth, reliable fit. Values below ~0.95 suggest
+  the data is noisy or that more exclusions may be warranted.
+- **Fit Accel Loss / Fit Decel Loss columns** in the Summary table show what the curve
+  fit predicts at each speed. Large differences between the raw average and the fit
+  value at the same speed indicate a noisy data point.
+- **The filtered column is the one that feeds the navigator charts.** The all-data
+  column is provided for comparison — to help judge whether exclusions are improving
+  or distorting the result.
+- **Highlighted N cells** in the pivot tables flag where the filtered run count differs
+  from the full dataset, making it easy to see which speed/type combinations lost runs
+  to exclusion.
+- If the filtered and all-data fits are very similar, the exclusions had little effect
+  and the data is consistent. If they diverge significantly, review the excluded runs
+  carefully before trusting the charts.
+
+---
+
+## Auto-Exclude Methodology
+
+Runs are excluded one at a time using a greedy search. At each step, every remaining
+run from the latest date is trialled for removal and the one whose exclusion most reduces the total
+sum of squared residuals from degree-2 polynomial fits to both the accel-loss and
+decel-loss curves is permanently excluded. Ties are broken by choosing the run with
+the highest z-score within its speed/type group (i.e. the most statistically extreme
+run). The process repeats until the requested number of exclusions is reached.
+Excluded runs are listed first in the sidebar calibration runs table, in the order
+they were removed.
+""")
+

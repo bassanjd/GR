@@ -25,8 +25,6 @@ from openpyxl.styles import Border, Font, PatternFill
 
 from navigator_chart_helpers import (
     BLANK,
-    COURSE_MI,
-    DATE_2026,
     SPEEDS,
     STOP_SIGN_SECONDS,
     _build_matrix,
@@ -41,6 +39,8 @@ from navigator_chart_helpers import (
     matrix_turn_loss,
     thin_border,
 )
+
+_TEST_DATE = "2026-01-01"   # arbitrary; tests use df["date"].max() semantics
 from normalize_calibration_data import fmt_mm_ss_cs, parse_time_str, time_obj_to_s
 
 
@@ -58,7 +58,7 @@ def linear_decel():
     return {s: float(s * 3) for s in SPEEDS}
 
 
-def _make_losses_df(straight, accel_loss, decel_loss, date=DATE_2026):
+def _make_losses_df(straight, accel_loss, decel_loss, date=_TEST_DATE):
     """Build a minimal DataFrame accepted by compute_losses."""
     rows = []
     for mph, st, al, dl in zip(SPEEDS[1:], straight, accel_loss, decel_loss):
@@ -68,10 +68,10 @@ def _make_losses_df(straight, accel_loss, decel_loss, date=DATE_2026):
             ("speed_stop",     st + dl),
         ]:
             rows.append({
-                "Date":       date,
-                "Test Type":  test_type,
-                "Target MPH": mph,
-                "Time (s)":   t,
+                "date":       date,
+                "test_type":  test_type,
+                "target_mph": mph,
+                "time_s":     t,
             })
     return pd.DataFrame(rows)
 
@@ -237,22 +237,29 @@ class TestMatrixTurnLoss:
 # ── compute_losses ────────────────────────────────────────────────────────────
 
 class TestComputeLosses:
-    def test_none_when_no_date_2026_rows(self):
-        df = _make_losses_df([240] * 8, [10] * 8, [8] * 8, date="2025-01-01")
+    def test_none_when_empty(self):
+        assert compute_losses(pd.DataFrame()) is None
+
+    def test_uses_latest_date_only(self):
+        """Rows from an earlier date must not contribute to the result."""
+        old = _make_losses_df([240] * 8, [10] * 8, [8] * 8, date="2025-01-01")
+        # Latest date has only straight_speed rows → missing test types → None
+        new_rows = [{"date": "2026-01-01", "test_type": "straight_speed",
+                     "target_mph": mph, "time_s": 240.0} for mph in SPEEDS[1:]]
+        df = pd.concat([old, pd.DataFrame(new_rows)], ignore_index=True)
         assert compute_losses(df) is None
 
     def test_none_when_missing_test_type(self):
         df = _make_losses_df([240] * 8, [10] * 8, [8] * 8)
         # Remove all speed_stop rows
-        df = df[df["Test Type"] != "speed_stop"]
+        df = df[df["test_type"] != "speed_stop"]
         assert compute_losses(df) is None
 
     def test_returns_dataframe_with_required_columns(self):
         df = _make_losses_df([240] * 8, [10] * 8, [8] * 8)
         result = compute_losses(df)
         assert result is not None
-        for col in ("MPH", "Straight (s)", "Accel Loss (s)", "Decel Loss (s)",
-                    "Actual MPH", "Error (%)"):
+        for col in ("MPH", "Straight (s)", "Accel Loss (s)", "Decel Loss (s)"):
             assert col in result.columns
 
     def test_accel_loss_correct(self):
@@ -269,24 +276,6 @@ class TestComputeLosses:
         result = compute_losses(df)
         assert result["Decel Loss (s)"].iloc[0] == pytest.approx(7.5)
 
-    def test_actual_mph_from_course_length(self):
-        """Actual MPH = COURSE_MI / (straight_time_s / 3600)."""
-        straight_s = 240.0   # 4 minutes for 1 mile → 15 mph
-        df = _make_losses_df([straight_s] * 8, [0.0] * 8, [0.0] * 8)
-        result = compute_losses(df)
-        mph_row = result[result["MPH"] == 15].iloc[0]
-        expected_actual = COURSE_MI / (straight_s / 3600)
-        assert mph_row["Actual MPH"] == pytest.approx(expected_actual)
-
-    def test_error_pct_sign(self):
-        """Positive error % means vehicle is faster than indicated speed."""
-        # At 15 mph indicated, straight = 3 min = 180 s → actual = 1/(180/3600) = 20 mph → +33 %
-        straight_s = 180.0
-        df = _make_losses_df([straight_s] * 8, [0.0] * 8, [0.0] * 8)
-        result = compute_losses(df)
-        mph_row = result[result["MPH"] == 15].iloc[0]
-        assert mph_row["Error (%)"] > 0
-
     def test_row_count_matches_speeds(self):
         df = _make_losses_df([200.0] * 8, [5.0] * 8, [4.0] * 8)
         result = compute_losses(df)
@@ -295,11 +284,9 @@ class TestComputeLosses:
 
     def test_none_when_empty_after_dropna(self):
         """If pivot has NaN in all rows after dropna, return None."""
-        rows = []
-        for mph in SPEEDS[1:]:
-            # Only provide straight_speed; no start/stop rows → unstacked will have NaN cols
-            rows.append({"Date": DATE_2026, "Test Type": "straight_speed",
-                         "Target MPH": mph, "Time (s)": 200.0})
+        rows = [{"date": _TEST_DATE, "test_type": "straight_speed",
+                 "target_mph": mph, "time_s": 200.0}
+                for mph in SPEEDS[1:]]
         df = pd.DataFrame(rows)
         assert compute_losses(df) is None
 
@@ -334,9 +321,9 @@ class TestLossesToDicts:
         """Speeds in SPEEDS that weren't in losses fill with NaN."""
         # Only one target MPH in the DataFrame
         rows = [
-            {"Date": DATE_2026, "Test Type": "straight_speed", "Target MPH": 25, "Time (s)": 144.0},
-            {"Date": DATE_2026, "Test Type": "start_speed",    "Target MPH": 25, "Time (s)": 154.0},
-            {"Date": DATE_2026, "Test Type": "speed_stop",     "Target MPH": 25, "Time (s)": 152.0},
+            {"date": _TEST_DATE, "test_type": "straight_speed", "target_mph": 25, "time_s": 144.0},
+            {"date": _TEST_DATE, "test_type": "start_speed",    "target_mph": 25, "time_s": 154.0},
+            {"date": _TEST_DATE, "test_type": "speed_stop",     "target_mph": 25, "time_s": 152.0},
         ]
         df = pd.DataFrame(rows)
         losses = compute_losses(df)
@@ -430,22 +417,22 @@ class TestBuildReferenceWorkbook:
         assert isinstance(workbook, openpyxl.Workbook)
 
     def test_has_reference_charts_sheet(self, workbook):
-        assert "Reference Charts" in workbook.sheetnames
+        assert "Navigator Charts" in workbook.sheetnames
 
     def test_sheet_has_data(self, workbook):
-        ws = workbook["Reference Charts"]
+        ws = workbook["Navigator Charts"]
         non_empty = [c for row in ws.iter_rows() for c in row if c.value is not None]
         assert len(non_empty) > 0
 
     def test_label_appears_in_sheet(self, linear_accel, linear_decel):
         wb = build_reference_workbook(linear_accel, linear_decel, label="TestLabel")
-        ws = wb["Reference Charts"]
+        ws = wb["Navigator Charts"]
         values = [str(c.value) for row in ws.iter_rows() for c in row if c.value]
         assert any("TestLabel" in v for v in values)
 
     def test_empty_label_no_brackets(self, linear_accel, linear_decel):
         wb = build_reference_workbook(linear_accel, linear_decel, label="")
-        ws = wb["Reference Charts"]
+        ws = wb["Navigator Charts"]
         values = [str(c.value) for row in ws.iter_rows() for c in row if c.value]
         assert not any("[]" in v for v in values)
 

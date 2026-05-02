@@ -239,7 +239,9 @@ Reads the most recent RaceBox parquet, finds a representative eastbound and west
 
 Constants, pure matrix functions, loss computation, and openpyxl writing helpers shared by both the batch script and the Streamlit app.
 
-**Constants**: `SPEEDS = [0, 15, 20, 25, 30, 35, 40, 45, 50]`, `STOP_SIGN_SECONDS = 15.0`, `COURSE_MI = 1.0`, `DATE_2026`
+**Constants**: `SPEEDS = [0, 15, 20, 25, 30, 35, 40, 45, 50]`, `STOP_SIGN_SECONDS = 15.0`, `COURSE_MI = 1.0`
+
+**No hardcoded dates** — `compute_losses(df)` always filters to `df["date"].max()` so the module works with any calibration year's data without modification.
 
 **Matrix functions** (all return a `len(SPEEDS) × len(SPEEDS)` list-of-lists):
 - `matrix_transition(accel, decel)` — extra seconds for any speed change; diagonal is `BLANK`
@@ -248,15 +250,15 @@ Constants, pure matrix functions, loss computation, and openpyxl writing helpers
 
 **Data pipeline**:
 - `load_calibration_runs()` — reads the *Calibration Runs* sheet from `navigator_chart_normalized.xlsx`
-- `compute_losses(df)` — pivots 2026 rows into per-speed accel/decel loss table; returns `None` if data incomplete
+- `compute_losses(df)` — pivots rows from the latest date into per-speed accel/decel loss table; returns `None` if data incomplete
 - `losses_to_dicts(losses)` — converts loss DataFrame to `(accel, decel)` dicts keyed by MPH; missing speeds fill with `NaN`
 
 **Excel writing**: `write_matrix(...)`, `write_reference_charts_to_sheet(...)`, `build_reference_workbook(...)` — write four labeled, color-scaled matrices to openpyxl worksheets.
 
 ### `normalize_calibration_data.py` — raw data normalization
 
-Reads `2026 Great Race Charts April 29th.xlsx` (three worksheets: *Straight Speed*, *Speed Stop*, *Start Speed*), parses timing strings in both `MM:SS.cs` and `MM:SS:cs` formats, and writes:
-- `navigator_chart_normalized.xlsx` — *Calibration Runs* sheet (all raw runs) + *2026 Timing Data* sheet (per-speed averages, actual MPH, error %, accel/decel losses)
+Reads the raw calibration Excel workbook (three worksheets: *Straight Speed*, *Speed Stop*, *Start Speed*), parses timing strings in both `MM:SS.cs` and `MM:SS:cs` formats, and writes:
+- `navigator_chart_normalized.xlsx` — *Calibration Runs* sheet (all raw runs) + timing data sheet (per-speed averages, actual MPH, error %, accel/decel losses)
 - `navigator_chart_calibration_runs.parquet` — same calibration runs as Parquet
 
 ### `make_navigator_charts.py` — batch reference chart generator
@@ -265,7 +267,29 @@ Calls `load_calibration_runs()` → `compute_losses()` → `losses_to_dicts()` �
 
 ### `navigator_chart_app.py` — interactive Streamlit app
 
-Three-column layout (no tabs). Left column: raw calibration runs table with per-row *Exclude* checkboxes. Middle/right columns: strip charts and loss line charts computed from all data vs. filtered data. Two download buttons export in-memory Excel workbooks with the four reference matrices.
+Three-tab layout (**Summary**, **Charts**, **Help**). Sidebar holds the date filter, auto-exclude slider, and editable calibration runs table.
+
+**Sidebar**:
+- Date multiselect — defaults to the most recent date in the data
+- Auto-exclude slider — greedy polynomial-fit algorithm selects the N runs whose removal most improves the accel/decel curve fits; excluded rows appear first in the table sorted by exclusion order
+- Editable runs table — columns: Excl. (checkbox), MPH, Type, Sec, #, Notes, Date; uncheck any row to override auto-exclusion
+
+**Summary tab** — two columns: *All Data* (all visible rows) vs *Filtered* (auto-excludes applied):
+- Accel/Decel loss line chart (curve fit shown for filtered only)
+- Loss table with Fit Accel Loss and Fit Decel Loss columns; polynomial equations and R² values shown as captions
+- Run-times pivot table: rows = target speed, columns = run type (Straight / Start / Stop) with nested Avg / Std / N sub-columns; N cells highlighted where filtered count differs from the other column
+
+**Charts tab** — two columns (All Data / Filtered): download buttons for Excel export + four HTML reference matrices with green-yellow-red conditional formatting based on displayed (rounded) values.
+
+**Help tab** — app overview, usage guide, result interpretation guidance, and auto-exclude methodology.
+
+**Key helpers in the app** (not in `navigator_chart_helpers.py`):
+- `compute_auto_excludes(df, n)` — returns `(mask, excl_order)` boolean mask and integer order Series
+- `fit_losses(losses)` — returns `(ca, cd)` degree-2 polynomial coefficients or `(None, None)`
+- `_r2(y, coef, x)` — R² of a polynomial fit
+- `loss_line_chart(losses, title, show_fit)` — Plotly loss chart; `show_fit=False` omits curve and R² (used for All Data column)
+- `losses_table(losses, ca, cd)` — renders loss DataFrame; when `ca`/`cd` supplied adds fit columns and equation captions
+- `run_pivot_table(df, df_ref)` — pivot of count/mean/std by speed × run type; highlights N cells that differ from `df_ref`
 
 ---
 
@@ -474,6 +498,8 @@ Covers all pure analysis functions in `telemetry.py`: `TrapConfig` geometry, `ha
 
 Covers all pure functions in `navigator_chart_helpers.py` and the time-parsing helpers in `normalize_calibration_data.py`: matrix math (`matrix_transition`, `matrix_stop_go`, `matrix_turn_loss`), loss pipeline (`compute_losses`, `losses_to_dicts`), Excel style helpers, `build_reference_workbook`, `parse_time_str`, `time_obj_to_s`, `fmt_mm_ss_cs`.
 
+Test fixture `_make_losses_df` uses the correct parquet schema (`date`, `test_type`, `target_mph`, `time_s`). The `_TEST_DATE` local constant is used instead of a hardcoded year — `compute_losses` filters to `df["date"].max()` so any date works. `test_uses_latest_date_only` verifies that only the most recent date's rows contribute to losses.
+
 ### Manual verification
 
 For Streamlit app changes, visual verification remains necessary:
@@ -540,3 +566,4 @@ Run `Results/GreatRaceResultsScrape.py` pointing at the official results HTML, t
 - **Do not use `st.experimental_rerun()`** — use `st.rerun()` (Streamlit ≥1.27)
 - **Do not duplicate telemetry logic in apps** — GPS/physics/signal processing belongs in `telemetry.py`; schema translation belongs in `loaders.py`
 - **Do not add loaders to `telemetry.py`** — schema translation lives in `loaders.py`; `telemetry.py` is analysis-only
+- **Do not hardcode calibration dates** — `compute_losses()` and `compute_auto_excludes()` filter to `df["date"].max()` dynamically; the app defaults to the most recent date in the data; no year-specific constants belong in the codebase

@@ -114,7 +114,7 @@ def extract_rows():
             t_s = parse_time_str(val)
             append("2026-04-29", "straight_speed", mph,
                    col - 1, DIRECTIONS_ALT[col - 2], t_s,
-                   str(val) if val else "", "1-mile course")
+                   str(val) if val else "", "")
 
     # ── Speed Stop ────────────────────────────────────────────────────────────
 
@@ -137,7 +137,7 @@ def extract_rows():
             t_s = parse_time_str(val)
             append("2026-04-29", "speed_stop", mph,
                    col - 1, DIRECTIONS_ALT[col - 2], t_s,
-                   str(val) if val else "", "1-mile course")
+                   str(val) if val else "", "")
 
     # ── Start Speed ───────────────────────────────────────────────────────────
 
@@ -160,15 +160,12 @@ def extract_rows():
             t_s = parse_time_str(val)
             append("2026-04-29", "start_speed", mph,
                    col - 1, DIRECTIONS_ALT[col - 2], t_s,
-                   str(val) if val else "", "1-mile course")
+                   str(val) if val else "", "")
 
     return rows
 
 
 # ── Derived calculations ──────────────────────────────────────────────────────
-
-COURSE_MI = 1.0  # 2026 measured course length (highway mile markers)
-
 
 def compute_summary(df):
     """Per (date, test_type, target_mph): average time and std dev."""
@@ -176,29 +173,6 @@ def compute_summary(df):
              .agg(avg_time_s="mean", std_time_s="std")
              .reset_index())
     return agg
-
-
-def compute_calibration(df):
-    """2026 timing data: actual vs indicated speed,
-    acceleration loss, and deceleration loss per indicated MPH."""
-    df26 = df[df["date"] == "2026-04-29"]
-    agg = (df26.groupby(["test_type", "target_mph"])["time_s"]
-               .mean().unstack("test_type").reset_index())
-    agg.columns.name = None
-
-    agg["actual_mph"] = COURSE_MI / (agg["straight_speed"] / 3600)
-    agg["speed_error_mph"] = agg["actual_mph"] - agg["target_mph"]
-    agg["speed_error_pct"] = agg["speed_error_mph"] / agg["target_mph"] * 100
-    agg["accel_loss_s"] = agg["start_speed"] - agg["straight_speed"]
-    agg["decel_loss_s"] = agg["speed_stop"] - agg["straight_speed"]
-    agg = agg.rename(columns={
-        "straight_speed": "straight_avg_s",
-        "start_speed": "start_avg_s",
-        "speed_stop": "stop_avg_s",
-    })
-    return agg[["target_mph", "straight_avg_s", "start_avg_s", "stop_avg_s",
-                "actual_mph", "speed_error_mph", "speed_error_pct",
-                "accel_loss_s", "decel_loss_s"]]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

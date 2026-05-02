@@ -1,10 +1,10 @@
 """
-Build reference navigation charts from calibration run data.
+Build navigator charts from calibration run data.
 
 Reads:  navigator_chart_calibration_runs.parquet
 Writes: navigator_chart_normalized.xlsx
 
-Four matrices, all using 2026 1-mile-course data:
+Four matrices:
 
   1. Speed Transition Time (s)
   2. Available Pause at Stop Sign (s)
@@ -21,13 +21,13 @@ from pathlib import Path
 
 NORMALIZED_XLSX = Path(__file__).parent / "navigator_charts.xlsx"
 
-def build_reference_charts():
+def build_navigator_charts():
     df = load_calibration_runs()
     losses = compute_losses(df)
     accel, decel = losses_to_dicts(losses)
 
     if accel is None:
-        print("ERROR: Could not compute losses from 2026 data.")
+        print("ERROR: Could not compute losses from calibration data.")
         return
 
     wb = build_reference_workbook(accel, decel)
@@ -40,4 +40,4 @@ def build_reference_charts():
 
 
 if __name__ == "__main__":
-    build_reference_charts()
+    build_navigator_charts()
