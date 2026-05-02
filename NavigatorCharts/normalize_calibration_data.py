@@ -1,8 +1,8 @@
 """
-Normalize navigator chart timing data to a single Excel table.
+Normalize navigator chart timing data to a parquet file.
 
 Reads:  2026 Great Race Charts April 29th.xlsx
-Writes: navigator_chart_normalized.xlsx
+Writes: navigator_chart_calibration_runs.parquet
 
 Three test types over a fixed measured course:
   straight_speed  — flying start and finish (baseline)
@@ -21,12 +21,8 @@ from pathlib import Path
 
 import openpyxl
 import pandas as pd
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
 EXCEL_IN = Path(__file__).parent / "2026 Great Race Charts April 29th.xlsx"
-EXCEL_OUT = Path(__file__).parent / "navigator_chart_normalized.xlsx"
 PARQUET_OUT = Path(__file__).parent / "navigator_chart_calibration_runs.parquet"
 
 SPEEDS_MPH = [15, 20, 25, 30, 35, 40, 45, 50]
@@ -205,82 +201,6 @@ def compute_calibration(df):
                 "accel_loss_s", "decel_loss_s"]]
 
 
-# ── Excel output ──────────────────────────────────────────────────────────────
-
-HEADER_FILL = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-HEADER_FONT = Font(color="FFFFFF", bold=True)
-ALT_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
-
-
-def _write_table(ws, df, table_name, col_specs, start_row=1):
-    """Write a DataFrame as a formatted Excel table.
-
-    col_specs: list of (col_name, header_label, width, num_fmt)
-    """
-    n_cols = len(col_specs)
-    for c_idx, (_, label, width, _) in enumerate(col_specs, start=1):
-        cell = ws.cell(start_row, c_idx, label)
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center")
-        ws.column_dimensions[get_column_letter(c_idx)].width = width
-
-    for r_idx, row in enumerate(df.itertuples(index=False), start=start_row + 1):
-        for c_idx, (col_name, _, _, num_fmt) in enumerate(col_specs, start=1):
-            val = getattr(row, col_name)
-            cell = ws.cell(r_idx, c_idx, val)
-            if num_fmt:
-                cell.number_format = num_fmt
-
-    end_row = start_row + len(df)
-    ref = f"A{start_row}:{get_column_letter(n_cols)}{end_row}"
-    tbl = Table(displayName=table_name, ref=ref)
-    tbl.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium2",
-        showRowStripes=True, showColumnStripes=False,
-    )
-    ws.add_table(tbl)
-    ws.freeze_panes = ws.cell(start_row + 1, 1)
-
-
-def write_excel(raw_rows, df_raw):
-    wb = openpyxl.Workbook()
-
-    # ── Sheet 1: all raw runs ────────────────────────────────────────────────
-    ws1 = wb.active
-    ws1.title = "Calibration Runs"
-    col_specs_raw = [
-        ("date",        "Date",        12, None),
-        ("test_type",   "Test Type",   18, None),
-        ("target_mph",  "Target MPH",  12, "0"),
-        ("run_number",  "Run #",       8,  "0"),
-        ("direction",   "Direction",   10, None),
-        ("time_raw",    "Time (raw)",  12, None),
-        ("time_s",      "Time (s)",    10, "0.00"),
-        ("notes",       "Notes",       18, None),
-    ]
-    _write_table(ws1, df_raw, "CalibrationRuns", col_specs_raw)
-
-    # ── Sheet 2: 2026 timing data ────────────────────────────────────────────
-    ws2 = wb.create_sheet("2026 Timing Data")
-    cal = compute_calibration(df_raw)
-    col_specs_cal = [
-        ("target_mph",      "Indicated MPH",   14, "0"),
-        ("straight_avg_s",  "Straight Avg (s)",16, "0.00"),
-        ("start_avg_s",     "Start Avg (s)",   14, "0.00"),
-        ("stop_avg_s",      "Stop Avg (s)",    14, "0.00"),
-        ("actual_mph",      "Actual MPH",      12, "0.00"),
-        ("speed_error_mph", "Error (mph)",     12, "0.00"),
-        ("speed_error_pct", "Error (%)",       10, "0.00"),
-        ("accel_loss_s",    "Accel Loss (s)",  14, "0.00"),
-        ("decel_loss_s",    "Decel Loss (s)",  14, "0.00"),
-    ]
-    _write_table(ws2, cal, "TimingData2026", col_specs_cal)
-
-    wb.save(EXCEL_OUT)
-    return cal
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -290,13 +210,5 @@ if __name__ == "__main__":
     print(f"\nExtracted {len(df_raw)} timing runs\n")
     print(df_raw.groupby(["date", "test_type"]).size().to_string())
 
-    cal = write_excel(raw_rows, df_raw)
-
-    print(f"\nWrote {EXCEL_OUT.name}")
-    try:
-        df_raw.to_parquet(PARQUET_OUT, index=False)
-        print(f"Wrote {PARQUET_OUT.name}")
-    except Exception as e:
-        print(f"Warning: failed to write parquet {PARQUET_OUT}: {e}")
-    print("\n2026 Timing Data:")
-    print(cal.to_string(index=False, float_format="%.2f"))
+    df_raw.to_parquet(PARQUET_OUT, index=False)
+    print(f"\nWrote {PARQUET_OUT.name}")

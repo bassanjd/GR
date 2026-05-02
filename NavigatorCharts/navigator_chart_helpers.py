@@ -10,7 +10,7 @@ from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-NORMALIZED_XLSX = Path(__file__).parent / "navigator_chart_normalized.xlsx"
+CALIBRATION_PARQUET = Path(__file__).parent / "navigator_chart_calibration_runs.parquet"
 
 SPEEDS = [0, 15, 20, 25, 30, 35, 40, 45, 50]
 STOP_SIGN_SECONDS = 15.0
@@ -67,9 +67,9 @@ def matrix_turn_loss(accel, decel, ref_mph):
 # ── Data loading / loss computation ──────────────────────────────────────────
 
 def load_calibration_runs():
-    """Return full normalized DataFrame from the Excel Calibration Runs sheet."""
-    df = pd.read_excel(NORMALIZED_XLSX, sheet_name="Calibration Runs")
-    df["Date"] = df["Date"].astype(str).str[:10]
+    """Return full normalized DataFrame from the calibration runs parquet."""
+    df = pd.read_parquet(CALIBRATION_PARQUET)
+    df["date"] = df["date"].astype(str).str[:10]
     return df
 
 
@@ -80,10 +80,10 @@ def compute_losses(df):
 
     Columns: MPH, Straight (s), Accel Loss (s), Decel Loss (s), Actual MPH, Error (%)
     """
-    df26 = df[df["Date"] == DATE_2026]
+    df26 = df[df["date"] == DATE_2026]
     if df26.empty:
         return None
-    grp = df26.groupby(["Test Type", "Target MPH"])["Time (s)"].mean().unstack("Test Type")
+    grp = df26.groupby(["test_type", "target_mph"])["time_s"].mean().unstack("test_type")
     need = {"straight_speed", "start_speed", "speed_stop"}
     if not need.issubset(grp.columns):
         return None

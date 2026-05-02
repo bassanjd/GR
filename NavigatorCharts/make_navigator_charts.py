@@ -1,8 +1,8 @@
 """
-Build reference navigation charts from normalized calibration data.
+Build reference navigation charts from calibration run data.
 
-Reads:  navigator_chart_normalized.xlsx  (Calibration Runs sheet)
-Writes: Adds / overwrites a "Reference Charts" sheet in the same file.
+Reads:  navigator_chart_calibration_runs.parquet
+Writes: navigator_chart_normalized.xlsx
 
 Four matrices, all using 2026 1-mile-course data:
 
@@ -11,18 +11,15 @@ Four matrices, all using 2026 1-mile-course data:
   3. Turn Time Lost vs 15↔15 reference (s)
   4. Turn Time Lost vs 20↔20 reference (s)
 """
-import openpyxl
-
 from navigator_chart_helpers import (
-    NORMALIZED_XLSX,
+    build_reference_workbook,
     compute_losses,
     load_calibration_runs,
     losses_to_dicts,
-    write_reference_charts_to_sheet,
 )
+from pathlib import Path
 
-SHEET_NAME = "Reference Charts"
-
+NORMALIZED_XLSX = Path(__file__).parent / "navigator_charts.xlsx"
 
 def build_reference_charts():
     df = load_calibration_runs()
@@ -33,15 +30,9 @@ def build_reference_charts():
         print("ERROR: Could not compute losses from 2026 data.")
         return
 
-    wb = openpyxl.load_workbook(NORMALIZED_XLSX)
-    if SHEET_NAME in wb.sheetnames:
-        del wb[SHEET_NAME]
-    ws = wb.create_sheet(SHEET_NAME)
-
-    write_reference_charts_to_sheet(ws, accel, decel)
-
+    wb = build_reference_workbook(accel, decel)
     wb.save(NORMALIZED_XLSX)
-    print(f"Wrote '{SHEET_NAME}' sheet to {NORMALIZED_XLSX.name}")
+    print(f"Wrote {NORMALIZED_XLSX.name}")
 
     mph_keys = [int(m) for m in losses["MPH"]]
     print(f"\nAccel losses (s): { {k: round(accel[k], 3) for k in [0] + mph_keys} }")
