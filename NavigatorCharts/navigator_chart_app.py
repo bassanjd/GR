@@ -56,7 +56,8 @@ def build_export_bytes(accel, decel, label):
 
 def compute_auto_excludes(df, n_excl):
     """
-    Return a boolean mask of the n_excl 2026 rows to exclude for the Filtered column.
+    Return (mask, excl_order) where mask is a boolean Series and excl_order is an
+    integer Series (1 = first excluded, 2 = second, …; 0 = not excluded).
 
     Greedy degree-2 polynomial fit: at each step selects the single 2026 run (any
     test type — a straight-speed exclusion improves both curves simultaneously) whose
@@ -65,8 +66,9 @@ def compute_auto_excludes(df, n_excl):
     its own group (prefer the most extreme run).  Stops at n_excl exclusions.
     """
     mask = pd.Series(False, index=df.index)
+    excl_order = pd.Series(0, index=df.index)
     if n_excl == 0:
-        return mask
+        return mask, excl_order
     df26 = df[df["date"] == DATE_2026]
 
     gstats = (df26.groupby(["test_type", "target_mph"])["time_s"]
@@ -96,7 +98,7 @@ def compute_auto_excludes(df, n_excl):
             return float(np.sum((y - np.polyval(np.polyfit(x, y, 2), x)) ** 2))
         return ss(a) + ss(d)
 
-    for _ in range(n_excl):
+    for step in range(1, n_excl + 1):
         cur = _ssr(mask)
         if cur == 0.0:
             break
@@ -111,8 +113,9 @@ def compute_auto_excludes(df, n_excl):
         if best_idx is None or best_red <= 0:
             break
         mask.loc[best_idx] = True
+        excl_order.loc[best_idx] = step
 
-    return mask
+    return mask, excl_order
 
 
 # ── Chart builders ────────────────────────────────────────────────────────────
@@ -148,33 +151,60 @@ def time_strip_chart(df, title):
     return fig
 
 
-def loss_line_chart(losses, title):
+def fit_losses(losses):
+    """Return (ca, cd) degree-2 polynomial coefficients, or (None, None) if insufficient data."""
+    if losses is None or len(losses) < 3:
+        return None, None
+    x = losses["MPH"].values.astype(float)
+    return np.polyfit(x, losses["Accel Loss (s)"].values, 2), np.polyfit(x, losses["Decel Loss (s)"].values, 2)
+
+
+def _poly_eq(coef, var="x"):
+    a2, a1, a0 = coef
+    parts = [f"{a2:.6f}{var}²", f"{'+' if a1 >= 0 else '-'} {abs(a1):.6f}{var}", f"{'+' if a0 >= 0 else '-'} {abs(a0):.6f}"]
+    return " ".join(parts)
+
+
+def loss_line_chart(losses, title, show_fit=True):
     if losses is None:
         return go.Figure().update_layout(title=title, height=280)
     x = losses["MPH"].values.astype(float)
     a = losses["Accel Loss (s)"].values
     d = losses["Decel Loss (s)"].values
-    x_fine = np.linspace(x[0], x[-1], 200)
-    ca = np.polyfit(x, a, 2)
-    cd = np.polyfit(x, d, 2)
 
-    def r2(y, coef):
-        ss_res = float(np.sum((y - np.polyval(coef, x)) ** 2))
-        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-        return 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    traces = []
+    if show_fit:
+        ca, cd = fit_losses(losses)
+        if ca is not None:
+            x_fine = np.linspace(x[0], x[-1], 200)
 
-    r2a = r2(a, ca)
-    r2d = r2(d, cd)
+            def r2(y, coef):
+                ss_res = float(np.sum((y - np.polyval(coef, x)) ** 2))
+                ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                return 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+
+            r2a = r2(a, ca)
+            r2d = r2(d, cd)
+            accel_name = f"Accel (R²={r2a:.4f})"
+            decel_name = f"Decel (R²={r2d:.4f})"
+            traces += [
+                go.Scatter(x=x_fine, y=np.polyval(ca, x_fine), mode="lines",
+                           showlegend=False, line=dict(color="#388E3C", width=1.5, dash="dash")),
+                go.Scatter(x=x_fine, y=np.polyval(cd, x_fine), mode="lines",
+                           showlegend=False, line=dict(color="#D32F2F", width=1.5, dash="dash")),
+            ]
+        else:
+            accel_name, decel_name = "Accel", "Decel"
+    else:
+        accel_name = "Accel"
+        decel_name = "Decel"
 
     fig = go.Figure([
-        go.Scatter(x=x, y=a, name=f"Accel (R²={r2a:.4f})", mode="lines+markers",
+        go.Scatter(x=x, y=a, name=accel_name, mode="lines+markers",
                    line=dict(color="#388E3C", width=2), marker_size=7),
-        go.Scatter(x=x, y=d, name=f"Decel (R²={r2d:.4f})", mode="lines+markers",
+        go.Scatter(x=x, y=d, name=decel_name, mode="lines+markers",
                    line=dict(color="#D32F2F", width=2), marker_size=7),
-        go.Scatter(x=x_fine, y=np.polyval(ca, x_fine), mode="lines",
-                   showlegend=False, line=dict(color="#388E3C", width=1.5, dash="dash")),
-        go.Scatter(x=x_fine, y=np.polyval(cd, x_fine), mode="lines",
-                   showlegend=False, line=dict(color="#D32F2F", width=1.5, dash="dash")),
+        *traces,
     ])
     fig.update_layout(
         title=title, height=280,
@@ -185,18 +215,101 @@ def loss_line_chart(losses, title):
     return fig
 
 
-def losses_table(losses):
+def _r2(y, coef, x):
+    ss_res = float(np.sum((y - np.polyval(coef, x)) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+
+
+def losses_table(losses, ca=None, cd=None):
     if losses is None:
         st.caption("Insufficient 2026 data to compute losses.")
         return
-    styled = losses.style.format({
+    display_cols = ["MPH", "Straight (s)", "Accel Loss (s)", "Decel Loss (s)"]
+    df = losses[display_cols].copy()
+    fmt = {
         "Straight (s)":   "{:.2f}",
         "Accel Loss (s)": "{:.2f}",
         "Decel Loss (s)": "{:.2f}",
-        "Actual MPH":     "{:.2f}",
-        "Error (%)":      "{:.2f}",
-    })
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    }
+    if ca is not None and cd is not None:
+        x = losses["MPH"].values.astype(float)
+        df["Fit Accel Loss (s)"] = np.polyval(ca, x)
+        df["Fit Decel Loss (s)"] = np.polyval(cd, x)
+        fmt["Fit Accel Loss (s)"] = "{:.2f}"
+        fmt["Fit Decel Loss (s)"] = "{:.2f}"
+    st.dataframe(df.style.format(fmt), use_container_width=True, hide_index=True)
+    if ca is not None and cd is not None:
+        x = losses["MPH"].values.astype(float)
+        r2a = _r2(losses["Accel Loss (s)"].values, ca, x)
+        r2d = _r2(losses["Decel Loss (s)"].values, cd, x)
+        st.caption(f"Accel fit (R²={r2a:.4f}): {_poly_eq(ca)}")
+        st.caption(f"Decel fit (R²={r2d:.4f}): {_poly_eq(cd)}")
+
+
+_TYPE_LABELS = {
+    "straight_speed": "Straight",
+    "start_speed":    "Start",
+    "speed_stop":     "Stop",
+}
+
+
+def run_pivot_table(df, df_ref=None):
+    """Pivot of count/mean/std time_s by speed (rows) × run type (columns).
+
+    When df_ref is provided, N cells that differ from the reference pivot are highlighted.
+    """
+    if df is None or df.empty:
+        st.caption("No data.")
+        return
+    _STAT_ORDER = ["Avg", "Std", "N"]
+    piv = (
+        df.groupby(["target_mph", "test_type"])["time_s"]
+        .agg(N="count", Avg="mean", Std="std")
+        .unstack("test_type")
+        .swaplevel(axis=1)
+    )
+    piv.columns = pd.MultiIndex.from_tuples(
+        [(_TYPE_LABELS.get(t, t), stat) for t, stat in piv.columns]
+    )
+    types_sorted = sorted(piv.columns.get_level_values(0).unique())
+    piv = piv[[(t, s) for t in types_sorted for s in _STAT_ORDER if (t, s) in piv.columns]]
+    piv.index.name = "MPH"
+    fmt = {c: ("{:.0f}" if c[1] == "N" else "{:.2f}") for c in piv.columns}
+
+    if df_ref is not None and not df_ref.empty:
+        piv_ref = (
+            df_ref.groupby(["target_mph", "test_type"])["time_s"]
+            .agg(N="count")
+            .unstack("test_type")
+            .swaplevel(axis=1)
+        )
+        piv_ref.columns = pd.MultiIndex.from_tuples(
+            [(_TYPE_LABELS.get(t, t), stat) for t, stat in piv_ref.columns]
+        )
+
+        def _highlight_n(val, ref_val):
+            if pd.isna(val) or pd.isna(ref_val) or val != ref_val:
+                return "background-color: #1C3352; color: #E8EFF7"
+            return ""
+
+        def _apply_n_highlight(df_style):
+            styles = pd.DataFrame("", index=piv.index, columns=piv.columns)
+            for col in piv.columns:
+                if col[1] == "N":
+                    ref_col = piv_ref[col] if col in piv_ref.columns else None
+                    for idx in piv.index:
+                        val = piv.loc[idx, col]
+                        ref_val = piv_ref.loc[idx, col] if (ref_col is not None and idx in piv_ref.index) else None
+                        if ref_val is None or pd.isna(val) or val != ref_val:
+                            styles.loc[idx, col] = "background-color: #1C3352; color: #E8EFF7"
+            return styles
+
+        styled = piv.style.format(fmt, na_rep="—").apply(_apply_n_highlight, axis=None)
+    else:
+        styled = piv.style.format(fmt, na_rep="—")
+
+    st.dataframe(styled, use_container_width=True)
 
 
 # ── HTML matrix rendering (matches Excel export styling) ──────────────────────
@@ -247,7 +360,7 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
                 mid_value, hide_zero_axis=False):
     """HTML string for one reference matrix, styled like the Excel export."""
     visible = [
-        val
+        round(val, 1)
         for i, row in enumerate(matrix)
         for j, val in enumerate(row)
         if val is not None and not (hide_zero_axis and (i == 0 or j == 0))
@@ -281,7 +394,7 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
             elif val is None:
                 h.append(f'<td style="{_S_BLANK}"></td>')
             else:
-                bg = _scale_color(val, vmin, vmid, vmax, c_lo, c_mid, c_hi)
+                bg = _scale_color(round(val, 1), vmin, vmid, vmax, c_lo, c_mid, c_hi)
                 fg = "000000" if _luminance(bg) > 140 else "FFFFFF"
                 s = (f"background:#{bg};color:#{fg};font-size:10px;"
                      f"text-align:center;padding:4px 10px;border:1px solid #9DC3E6;")
@@ -360,11 +473,22 @@ with st.sidebar:
 
     df_visible = df_all[df_all["date"].isin(sel_dates)].reset_index(drop=True)
 
-    auto_excl = compute_auto_excludes(df_visible, n_excl_auto)
+    auto_excl, excl_order = compute_auto_excludes(df_visible, n_excl_auto)
     n_auto = int(auto_excl.sum())
 
     df_edit = df_visible.copy()
     df_edit.insert(0, "Excl.", auto_excl.values)
+    _ordered = ["Excl.", "target_mph", "test_type", "time_s", "run_number", "notes", "date"]
+    _hidden = [c for c in df_edit.columns if c not in _ordered]
+    df_edit = df_edit[_ordered + _hidden]
+
+    # Sort: excluded rows first (in exclusion order), then included rows in original order
+    df_edit["_excl_order"] = excl_order.values
+    df_edit["_orig_order"] = range(len(df_edit))
+    df_edit = df_edit.sort_values(
+        ["Excl.", "_excl_order", "_orig_order"],
+        ascending=[False, True, True],
+    ).drop(columns=["_excl_order", "_orig_order"]).reset_index(drop=True)
 
     st.caption(
         f"{n_auto} run(s) auto-excluded (degree-2 polynomial fit). "
@@ -416,19 +540,21 @@ with tab_summary:
 
     with col_all:
         st.subheader("All Data")
-        st.plotly_chart(time_strip_chart(df_visible, "Run Times"),
+        st.plotly_chart(loss_line_chart(losses_all, "Accel / Decel Losses", show_fit=False),
                         use_container_width=True)
-        st.plotly_chart(loss_line_chart(losses_all, "Accel / Decel Losses"),
-                        use_container_width=True)
-        losses_table(losses_all)
+        ca_all, cd_all = fit_losses(losses_all)
+        losses_table(losses_all, ca=ca_all, cd=cd_all)
+        st.subheader("Run Times by Speed & Type")
+        run_pivot_table(df_visible, df_ref=df_kept)
 
     with col_filt:
         st.subheader(filt_label)
-        st.plotly_chart(time_strip_chart(df_kept, "Run Times (filtered)"),
-                        use_container_width=True)
         st.plotly_chart(loss_line_chart(losses_filt, "Accel / Decel Losses (filtered)"),
                         use_container_width=True)
-        losses_table(losses_filt)
+        ca_filt, cd_filt = fit_losses(losses_filt)
+        losses_table(losses_filt, ca=ca_filt, cd=cd_filt)
+        st.subheader("Run Times by Speed & Type")
+        run_pivot_table(df_kept, df_ref=df_visible)
 
 # ── Tab: Charts ───────────────────────────────────────────────────────────────
 
