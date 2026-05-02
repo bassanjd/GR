@@ -1,5 +1,5 @@
 """
-Normalize speedometer calibration timing data to a single Excel table.
+Normalize navigator chart timing data to a single Excel table.
 
 Reads:  2026 Great Race Charts April 29th.xlsx
 Writes: navigator_chart_normalized.xlsx
@@ -183,7 +183,7 @@ def compute_summary(df):
 
 
 def compute_calibration(df):
-    """2026 speedometer calibration table: actual vs indicated speed,
+    """2026 timing data: actual vs indicated speed,
     acceleration loss, and deceleration loss per indicated MPH."""
     df26 = df[df["date"] == "2026-04-29"]
     agg = (df26.groupby(["test_type", "target_mph"])["time_s"]
@@ -261,8 +261,8 @@ def write_excel(raw_rows, df_raw):
     ]
     _write_table(ws1, df_raw, "CalibrationRuns", col_specs_raw)
 
-    # ── Sheet 2: 2026 calibration summary ───────────────────────────────────
-    ws2 = wb.create_sheet("2026 Calibration")
+    # ── Sheet 2: 2026 timing data ────────────────────────────────────────────
+    ws2 = wb.create_sheet("2026 Timing Data")
     cal = compute_calibration(df_raw)
     col_specs_cal = [
         ("target_mph",      "Indicated MPH",   14, "0"),
@@ -275,7 +275,7 @@ def write_excel(raw_rows, df_raw):
         ("accel_loss_s",    "Accel Loss (s)",  14, "0.00"),
         ("decel_loss_s",    "Decel Loss (s)",  14, "0.00"),
     ]
-    _write_table(ws2, cal, "Cal2026", col_specs_cal)
+    _write_table(ws2, cal, "TimingData2026", col_specs_cal)
 
     wb.save(EXCEL_OUT)
     return cal
@@ -298,5 +298,5 @@ if __name__ == "__main__":
         print(f"Wrote {PARQUET_OUT.name}")
     except Exception as e:
         print(f"Warning: failed to write parquet {PARQUET_OUT}: {e}")
-    print("\n2026 Calibration Summary:")
+    print("\n2026 Timing Data:")
     print(cal.to_string(index=False, float_format="%.2f"))

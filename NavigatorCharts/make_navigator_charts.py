@@ -1,7 +1,7 @@
 """
-Build reference navigation charts from normalized  calibration data.
+Build reference navigation charts from normalized calibration data.
 
-Reads:  speedometer_calibration_normalized.xlsx  (Calibration Runs sheet)
+Reads:  navigator_chart_normalized.xlsx  (Calibration Runs sheet)
 Writes: Adds / overwrites a "Reference Charts" sheet in the same file.
 
 Four matrices, all using 2026 1-mile-course data:

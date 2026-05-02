@@ -31,11 +31,6 @@ for file in files:
 # Combine all stages
 combined_df = pd.concat(all_dfs, ignore_index=True)
 
-# Optional: clean time fields (remove leading *)
-# time_cols = [c for c in combined_df.columns if "LEG" in c or c in ["TOTAL", "SCORE"]]
-# for col in time_cols:
-#     combined_df[col] = combined_df[col].astype(str).str.replace("*", "", regex=False)
-
 # Drop unwanted columns
 combined_df = combined_df.drop(columns=[c for c in combined_df.columns if c in ["Unnamed: 15", "Unnamed: 16"]])
 
