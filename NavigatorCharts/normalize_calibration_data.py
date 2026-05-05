@@ -22,6 +22,31 @@ from pathlib import Path
 import openpyxl
 import pandas as pd
 
+_MONTH_MAP = {
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+
+def _date_from_filename(path):
+    """Parse ISO date from a filename like '2026 Great Race Charts April 29th.xlsx'."""
+    stem = Path(path).stem
+    m = re.search(r'(\d{4}).*\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$', stem)
+    if not m:
+        raise ValueError(f"Cannot parse calibration date from filename: {stem!r}")
+    year, month_str, day = int(m.group(1)), m.group(2).lower()[:3], int(m.group(3))
+    return f"{year}-{_MONTH_MAP[month_str]:02d}-{day:02d}"
+
+
+def _col_dates(ws, col_start, col_end):
+    """Read ISO date strings from row 2 for columns col_start..col_end (inclusive)."""
+    return {
+        col: ws.cell(2, col).value.strftime('%Y-%m-%d')
+        for col in range(col_start, col_end + 1)
+        if isinstance(ws.cell(2, col).value, (datetime.date, datetime.datetime))
+    }
+
+
 EXCEL_IN = Path(__file__).parent / "2026 Great Race Charts April 29th.xlsx"
 PARQUET_OUT = Path(__file__).parent / "navigator_chart_calibration_runs.parquet"
 
@@ -89,76 +114,77 @@ def extract_rows():
             "notes": notes,
         })
 
+    new_date = _date_from_filename(EXCEL_IN)
+
     # ── Straight Speed ────────────────────────────────────────────────────────
 
-    # 2024/2025 data (rows 3–10, datetime.time values, cols B–H)
-    # Column dates from row 2: B–F = 2024-04-12, G–H = 2025-04-19
+    # Old data (rows 3–10, datetime.time values, cols B–H); dates from row 2
     ws = wb_v["Straight Speed"]
-    col_date_ss = {2: "2024-04-12", 3: "2024-04-12", 4: "2024-04-12",
-                   5: "2024-04-12", 6: "2024-04-12",
-                   7: "2025-04-19", 8: "2025-04-19"}
+    col_dates = _col_dates(ws, 2, 8)
     for row, mph in zip(range(3, 11), SPEEDS_MPH):
         for col in range(2, 9):          # B–H = runs 1–7
             val = ws.cell(row, col).value
             if not isinstance(val, datetime.time):
                 continue
             t_s = time_obj_to_s(val)
-            append(col_date_ss[col], "straight_speed", mph,
+            append(col_dates[col], "straight_speed", mph,
                    col - 1, "", t_s, fmt_mm_ss_cs(t_s), "short course")
 
-    # 2026 data (rows 21–28, raw "MM:SS:cs" strings, cols B–G = runs 1–6)
+    # New data (rows 21–28, raw "MM:SS:cs" strings, cols B–G = runs 1–6)
     ws_f = wb_f["Straight Speed"]
     for row, mph in zip(range(21, 29), SPEEDS_MPH):
         for col in range(2, 8):          # B–G = runs 1–6
             val = ws_f.cell(row, col).value
             t_s = parse_time_str(val)
-            append("2026-04-29", "straight_speed", mph,
+            append(new_date, "straight_speed", mph,
                    col - 1, DIRECTIONS_ALT[col - 2], t_s,
                    str(val) if val else "", "")
 
     # ── Speed Stop ────────────────────────────────────────────────────────────
 
-    # 2025 data (rows 3–10, datetime.time, cols B–H = runs 1–7)
+    # Old data (rows 3–10, datetime.time, cols B–H = runs 1–7); dates from row 2
     ws = wb_v["Speed Stop"]
+    col_dates = _col_dates(ws, 2, 8)
     for row, mph in zip(range(3, 11), SPEEDS_MPH):
         for col in range(2, 9):
             val = ws.cell(row, col).value
             if not isinstance(val, datetime.time):
                 continue
             t_s = time_obj_to_s(val)
-            append("2025-04-19", "speed_stop", mph,
+            append(col_dates[col], "speed_stop", mph,
                    col - 1, "", t_s, fmt_mm_ss_cs(t_s), "short course")
 
-    # 2026 data (rows 33–40, raw strings, cols B–G = runs 1–6; H is AVG)
+    # New data (rows 33–40, raw strings, cols B–G = runs 1–6; H is AVG)
     ws_f = wb_f["Speed Stop"]
     for row, mph in zip(range(33, 41), SPEEDS_MPH):
         for col in range(2, 8):
             val = ws_f.cell(row, col).value
             t_s = parse_time_str(val)
-            append("2026-04-29", "speed_stop", mph,
+            append(new_date, "speed_stop", mph,
                    col - 1, DIRECTIONS_ALT[col - 2], t_s,
                    str(val) if val else "", "")
 
     # ── Start Speed ───────────────────────────────────────────────────────────
 
-    # 2025 data (rows 3–10, datetime.time, cols B–G = runs 1–6; H is AVG)
+    # Old data (rows 3–10, datetime.time, cols B–G = runs 1–6; H is AVG); dates from row 2
     ws = wb_v["Start Speed"]
+    col_dates = _col_dates(ws, 2, 7)
     for row, mph in zip(range(3, 11), SPEEDS_MPH):
         for col in range(2, 8):
             val = ws.cell(row, col).value
             if not isinstance(val, datetime.time):
                 continue
             t_s = time_obj_to_s(val)
-            append("2025-04-12", "start_speed", mph,
+            append(col_dates[col], "start_speed", mph,
                    col - 1, "", t_s, fmt_mm_ss_cs(t_s), "short course")
 
-    # 2026 data (rows 34–41, raw strings, cols B–G = runs 1–6; H is AVG)
+    # New data (rows 34–41, raw strings, cols B–G = runs 1–6; H is AVG)
     ws_f = wb_f["Start Speed"]
     for row, mph in zip(range(34, 42), SPEEDS_MPH):
         for col in range(2, 8):
             val = ws_f.cell(row, col).value
             t_s = parse_time_str(val)
-            append("2026-04-29", "start_speed", mph,
+            append(new_date, "start_speed", mph,
                    col - 1, DIRECTIONS_ALT[col - 2], t_s,
                    str(val) if val else "", "")
 
