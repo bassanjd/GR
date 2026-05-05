@@ -69,30 +69,32 @@ def load_calibration_runs():
 
 def compute_losses(df):
     """
-    Return per-speed loss table (DataFrame) from the latest date's rows in df.
-    Returns None if there are not enough rows to compute all three test types.
+    Return per-speed loss table (DataFrame) from all rows in df.
+    Returns None if the three required test types are not all present.
 
     Columns: MPH, Straight (s), Accel Loss (s), Decel Loss (s)
     """
     if df.empty:
         return None
-    df26 = df[df["date"] == df["date"].max()]
-    if df26.empty:
-        return None
-    grp = df26.groupby(["test_type", "target_mph"])["time_s"].mean().unstack("test_type")
+    # Group by course (notes) so losses are computed within matched courses only
+    grp = (df.groupby(["notes", "test_type", "target_mph"])["time_s"]
+             .mean()
+             .unstack("test_type"))
     need = {"straight_speed", "start_speed", "speed_stop"}
     if not need.issubset(grp.columns):
         return None
     grp = grp.dropna()
     if grp.empty:
         return None
-    straight = grp["straight_speed"]
-    return pd.DataFrame({
-        "MPH":            straight.index.tolist(),
-        "Straight (s)":   straight.values,
-        "Accel Loss (s)": (grp["start_speed"] - straight).values,
-        "Decel Loss (s)": (grp["speed_stop"]  - straight).values,
+    per_course = pd.DataFrame({
+        "Straight (s)":   grp["straight_speed"],
+        "Accel Loss (s)": grp["start_speed"] - grp["straight_speed"],
+        "Decel Loss (s)": grp["speed_stop"]  - grp["straight_speed"],
     })
+    result = per_course.groupby("target_mph").mean().reset_index()
+    return result.rename(columns={"target_mph": "MPH"})[
+        ["MPH", "Straight (s)", "Accel Loss (s)", "Decel Loss (s)"]
+    ]
 
 
 def losses_to_dicts(losses):

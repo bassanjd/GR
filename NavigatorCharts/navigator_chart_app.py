@@ -69,31 +69,23 @@ def compute_auto_excludes(df, n_excl):
     excl_order = pd.Series(0, index=df.index)
     if n_excl == 0:
         return mask, excl_order
-    df26 = df[df["date"] == df["date"].max()]
-
-    gstats = (df26.groupby(["test_type", "target_mph"])["time_s"]
+    gstats = (df.groupby(["notes", "test_type", "target_mph"])["time_s"]
               .agg(["mean", "std"]))
     gstats["std"] = gstats["std"].clip(lower=0.01)
 
     def _z(idx):
-        row = df26.loc[idx]
-        s = gstats.loc[(row["test_type"], row["target_mph"])]
+        row = df.loc[idx]
+        s = gstats.loc[(row["notes"], row["test_type"], row["target_mph"])]
         return abs(row["time_s"] - s["mean"]) / s["std"]
 
     def _ssr(excl_mask):
         """Sum of squared residuals from degree-2 polynomial fits on both curves."""
-        kept = df26[~excl_mask.loc[df26.index]]
-        grp = kept.groupby(["test_type", "target_mph"])["time_s"].mean().unstack("test_type")
-        need = {"straight_speed", "start_speed", "speed_stop"}
-        if not need.issubset(grp.columns):
+        kept = df[~excl_mask.loc[df.index]]
+        losses = compute_losses(kept)
+        if losses is None or len(losses) < 4:
             return float("inf")
-        grp = grp.dropna()
-        if len(grp) < 4:
-            return float("inf")
-        x = np.array(grp.index.tolist(), dtype=float)
-        s = grp["straight_speed"].values
-        a = grp["start_speed"].values - s
-        d = grp["speed_stop"].values  - s
+        x = losses["MPH"].values.astype(float)
+        a, d = losses["Accel Loss (s)"].values, losses["Decel Loss (s)"].values
         def ss(y):
             return float(np.sum((y - np.polyval(np.polyfit(x, y, 2), x)) ** 2))
         return ss(a) + ss(d)
@@ -103,7 +95,7 @@ def compute_auto_excludes(df, n_excl):
         if cur == 0.0:
             break
         best_red, best_z, best_idx = 0.0, -1.0, None
-        for idx in df26.index[~mask.loc[df26.index]]:
+        for idx in df.index[~mask.loc[df.index]]:
             trial = mask.copy()
             trial.loc[idx] = True
             red = cur - _ssr(trial)
@@ -220,10 +212,9 @@ def losses_table(losses, ca=None, cd=None):
     if losses is None:
         st.caption("Insufficient data to compute losses.")
         return
-    display_cols = ["MPH", "Straight (s)", "Accel Loss (s)", "Decel Loss (s)"]
+    display_cols = ["MPH", "Accel Loss (s)", "Decel Loss (s)"]
     df = losses[display_cols].copy()
     fmt = {
-        "Straight (s)":   "{:.2f}",
         "Accel Loss (s)": "{:.2f}",
         "Decel Loss (s)": "{:.2f}",
     }
@@ -250,7 +241,7 @@ _TYPE_LABELS = {
 
 
 def run_pivot_table(df, df_ref=None):
-    """Pivot of count/mean/std time_s by speed (rows) × run type (columns).
+    """Pivot of count/mean/std time_s by (course, speed) rows × run type columns.
 
     When df_ref is provided, N cells that differ from the reference pivot are highlighted.
     """
@@ -259,7 +250,7 @@ def run_pivot_table(df, df_ref=None):
         return
     _STAT_ORDER = ["Avg", "Std", "N"]
     piv = (
-        df.groupby(["target_mph", "test_type"])["time_s"]
+        df.groupby(["notes", "target_mph", "test_type"])["time_s"]
         .agg(N="count", Avg="mean", Std="std")
         .unstack("test_type")
         .swaplevel(axis=1)
@@ -269,12 +260,12 @@ def run_pivot_table(df, df_ref=None):
     )
     types_sorted = sorted(piv.columns.get_level_values(0).unique())
     piv = piv[[(t, s) for t in types_sorted for s in _STAT_ORDER if (t, s) in piv.columns]]
-    piv.index.name = "MPH"
+    piv.index.names = ["Course", "MPH"]
     fmt = {c: ("{:.0f}" if c[1] == "N" else "{:.2f}") for c in piv.columns}
 
     if df_ref is not None and not df_ref.empty:
         piv_ref = (
-            df_ref.groupby(["target_mph", "test_type"])["time_s"]
+            df_ref.groupby(["notes", "target_mph", "test_type"])["time_s"]
             .agg(N="count")
             .unstack("test_type")
             .swaplevel(axis=1)
@@ -282,11 +273,6 @@ def run_pivot_table(df, df_ref=None):
         piv_ref.columns = pd.MultiIndex.from_tuples(
             [(_TYPE_LABELS.get(t, t), stat) for t, stat in piv_ref.columns]
         )
-
-        def _highlight_n(val, ref_val):
-            if pd.isna(val) or pd.isna(ref_val) or val != ref_val:
-                return "background-color: #1C3352; color: #E8EFF7"
-            return ""
 
         def _apply_n_highlight(df_style):
             styles = pd.DataFrame("", index=piv.index, columns=piv.columns)

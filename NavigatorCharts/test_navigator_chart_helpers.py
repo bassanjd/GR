@@ -40,7 +40,6 @@ from navigator_chart_helpers import (
     thin_border,
 )
 
-_TEST_DATE = "2026-01-01"   # arbitrary; tests use df["date"].max() semantics
 from normalize_calibration_data import fmt_mm_ss_cs, parse_time_str, time_obj_to_s
 
 
@@ -58,21 +57,25 @@ def linear_decel():
     return {s: float(s * 3) for s in SPEEDS}
 
 
-def _make_losses_df(straight, accel_loss, decel_loss, date=_TEST_DATE):
-    """Build a minimal DataFrame accepted by compute_losses."""
+def _make_losses_df(straight, accel_loss=None, decel_loss=None, notes="course"):
+    """Build a minimal DataFrame for compute_losses testing.
+
+    notes identifies the course; compute_losses matches test types within the same course
+    before computing differences, so tests that model multi-course pooling should pass
+    distinct notes values to each call.
+
+    Omit accel_loss to exclude start_speed rows; omit decel_loss to exclude speed_stop rows.
+    """
     rows = []
-    for mph, st, al, dl in zip(SPEEDS[1:], straight, accel_loss, decel_loss):
-        for test_type, t in [
-            ("straight_speed", st),
-            ("start_speed",    st + al),
-            ("speed_stop",     st + dl),
-        ]:
-            rows.append({
-                "date":       date,
-                "test_type":  test_type,
-                "target_mph": mph,
-                "time_s":     t,
-            })
+    for i, mph in enumerate(SPEEDS[1:]):
+        rows.append({"notes": notes, "test_type": "straight_speed",
+                     "target_mph": mph, "time_s": straight[i]})
+        if accel_loss is not None:
+            rows.append({"notes": notes, "test_type": "start_speed",
+                         "target_mph": mph, "time_s": straight[i] + accel_loss[i]})
+        if decel_loss is not None:
+            rows.append({"notes": notes, "test_type": "speed_stop",
+                         "target_mph": mph, "time_s": straight[i] + decel_loss[i]})
     return pd.DataFrame(rows)
 
 
@@ -236,20 +239,36 @@ class TestComputeLosses:
     def test_none_when_empty(self):
         assert compute_losses(pd.DataFrame()) is None
 
-    def test_uses_latest_date_only(self):
-        """Rows from an earlier date must not contribute to the result."""
-        old = _make_losses_df([240] * 8, [10] * 8, [8] * 8, date="2025-01-01")
-        # Latest date has only straight_speed rows → missing test types → None
-        new_rows = [{"date": "2026-01-01", "test_type": "straight_speed",
-                     "target_mph": mph, "time_s": 240.0} for mph in SPEEDS[1:]]
-        df = pd.concat([old, pd.DataFrame(new_rows)], ignore_index=True)
-        assert compute_losses(df) is None
+    def test_pools_across_courses(self):
+        """Losses from two courses (different notes) are averaged in the final result."""
+        course_a = _make_losses_df([240] * 8, [10] * 8, [8] * 8, notes="short course")
+        course_b = _make_losses_df([250] * 8, [12] * 8, [9] * 8, notes="1-mile course")
+        result = compute_losses(pd.concat([course_a, course_b], ignore_index=True))
+        assert result is not None
+        assert result["Straight (s)"].iloc[0]  == pytest.approx(245.0)    # (240+250)/2
+        assert result["Accel Loss (s)"].iloc[0] == pytest.approx(11.0)    # (10+12)/2
+        assert result["Decel Loss (s)"].iloc[0] == pytest.approx(8.5)     # (8+9)/2
 
     def test_none_when_missing_test_type(self):
-        df = _make_losses_df([240] * 8, [10] * 8, [8] * 8)
-        # Remove all speed_stop rows
-        df = df[df["test_type"] != "speed_stop"]
+        df = _make_losses_df([240] * 8, accel_loss=[10] * 8)  # no decel_loss → no speed_stop
         assert compute_losses(df) is None
+
+    def test_pools_types_from_separate_sessions(self):
+        """Types collected on different dates but the same course combine correctly."""
+        straight_runs = _make_losses_df([240] * 8, notes="course")
+        start_runs    = pd.DataFrame([                                     # start_speed only
+            {"notes": "course", "test_type": "start_speed", "target_mph": mph, "time_s": 250.0}
+            for mph in SPEEDS[1:]
+        ])
+        stop_runs     = pd.DataFrame([                                     # speed_stop only
+            {"notes": "course", "test_type": "speed_stop", "target_mph": mph, "time_s": 248.0}
+            for mph in SPEEDS[1:]
+        ])
+        result = compute_losses(pd.concat([straight_runs, start_runs, stop_runs], ignore_index=True))
+        assert result is not None
+        assert result["Straight (s)"].iloc[0]  == pytest.approx(240.0)
+        assert result["Accel Loss (s)"].iloc[0] == pytest.approx(10.0)    # 250 - 240
+        assert result["Decel Loss (s)"].iloc[0] == pytest.approx(8.0)     # 248 - 240
 
     def test_returns_dataframe_with_required_columns(self):
         df = _make_losses_df([240] * 8, [10] * 8, [8] * 8)
@@ -280,10 +299,7 @@ class TestComputeLosses:
 
     def test_none_when_empty_after_dropna(self):
         """If pivot has NaN in all rows after dropna, return None."""
-        rows = [{"date": _TEST_DATE, "test_type": "straight_speed",
-                 "target_mph": mph, "time_s": 200.0}
-                for mph in SPEEDS[1:]]
-        df = pd.DataFrame(rows)
+        df = _make_losses_df([200.0] * 8)   # straight_speed only → dropna removes all rows
         assert compute_losses(df) is None
 
 
@@ -317,9 +333,9 @@ class TestLossesToDicts:
         """Speeds in SPEEDS that weren't in losses fill with NaN."""
         # Only one target MPH in the DataFrame
         rows = [
-            {"date": _TEST_DATE, "test_type": "straight_speed", "target_mph": 25, "time_s": 144.0},
-            {"date": _TEST_DATE, "test_type": "start_speed",    "target_mph": 25, "time_s": 154.0},
-            {"date": _TEST_DATE, "test_type": "speed_stop",     "target_mph": 25, "time_s": 152.0},
+            {"notes": "course", "test_type": "straight_speed", "target_mph": 25, "time_s": 144.0},
+            {"notes": "course", "test_type": "start_speed",    "target_mph": 25, "time_s": 154.0},
+            {"notes": "course", "test_type": "speed_stop",     "target_mph": 25, "time_s": 152.0},
         ]
         df = pd.DataFrame(rows)
         losses = compute_losses(df)
