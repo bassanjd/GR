@@ -534,7 +534,7 @@ filt_label = f"Filtered ({n_excl} excluded)" if n_excl else "Filtered (none excl
 
 st.title("Navigator Charts")
 
-tab_summary, tab_charts, tab_method = st.tabs(["Summary", "Charts", "Help"])
+tab_charts, tab_summary, tab_method = st.tabs(["Charts", "Analysis", "Help"])
 
 # ── Tab: Data Summary ─────────────────────────────────────────────────────────
 
