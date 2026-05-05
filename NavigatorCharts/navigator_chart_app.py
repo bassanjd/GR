@@ -436,7 +436,7 @@ def render_matrix_html(accel, decel, color_scale=True):
     html += matrix_html(
         m3,
         title="3.  Turn Time Lost vs. 15 mph reference (seconds)",
-        subtitle="Extra seconds vs. In=15→15 · In=0 row / Out=0 col = raw accel/decel costs",
+        subtitle="Extra seconds vs. In=15→15 · cells where In or Out < 15 mph are blank",
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
         hide_zero_axis=True,
@@ -445,7 +445,7 @@ def render_matrix_html(accel, decel, color_scale=True):
     html += matrix_html(
         m4,
         title="4.  Turn Time Lost vs. 20 mph reference (seconds)",
-        subtitle="Extra seconds vs. In=20→20 · In=0 row / Out=0 col = raw accel/decel costs",
+        subtitle="Extra seconds vs. In=20→20 · cells where In or Out < 20 mph are blank",
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
         hide_zero_axis=True,

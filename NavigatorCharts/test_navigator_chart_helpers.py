@@ -185,27 +185,23 @@ class TestMatrixStopGo:
 # ── matrix_turn_loss ──────────────────────────────────────────────────────────
 
 class TestMatrixTurnLoss:
-    def test_zero_zero_is_blank(self, linear_accel, linear_decel):
-        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=20)
-        assert m[0][0] is BLANK
-
-    def test_from_stop_is_raw_accel(self, linear_accel, linear_decel):
-        """in=0 row: raw accel cost, ignoring ref."""
-        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=20)
-        i = SPEEDS.index(0)
-        for j, out_s in enumerate(SPEEDS):
-            if out_s == 0:
-                continue
-            assert m[i][j] == pytest.approx(linear_accel[out_s])
-
-    def test_to_stop_is_raw_decel(self, linear_accel, linear_decel):
-        """out=0 column: raw decel cost."""
-        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=20)
-        j = SPEEDS.index(0)
+    def test_entrance_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where in_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
         for i, in_s in enumerate(SPEEDS):
-            if in_s == 0:
-                continue
-            assert m[i][j] == pytest.approx(linear_decel[in_s])
+            for j in range(len(SPEEDS)):
+                if in_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_exit_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where out_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j, out_s in enumerate(SPEEDS):
+                if out_s < ref:
+                    assert m[i][j] is BLANK
 
     def test_ref_diagonal_is_zero(self, linear_accel, linear_decel):
         """At the reference speed, turn loss is zero."""
@@ -215,10 +211,10 @@ class TestMatrixTurnLoss:
         assert m[i][j] == pytest.approx(0.0)
 
     def test_general_cell_formula(self, linear_accel, linear_decel):
-        """(decel[in] - decel[ref]) + (accel[out] - accel[ref])."""
+        """(decel[in] - decel[ref]) + (accel[out] - accel[ref]) for in > ref and out > ref."""
         ref = 20
         m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
-        in_s, out_s = 30, 15
+        in_s, out_s = 30, 25
         i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
         expected = (
             (linear_decel[in_s] - linear_decel[ref])

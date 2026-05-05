@@ -50,14 +50,10 @@ def matrix_stop_go(accel, decel):
 
 
 def matrix_turn_loss(accel, decel, ref_mph):
-    """Extra seconds vs arriving and leaving at ref_mph."""
+    """Extra seconds vs arriving and leaving at ref_mph; blank when entrance or exit < ref_mph."""
     def f(in_s, out_s):
-        if in_s == 0 and out_s == 0:
+        if in_s < ref_mph or out_s < ref_mph:
             return BLANK
-        if in_s == 0:
-            return accel[out_s]
-        if out_s == 0:
-            return decel[in_s]
         return (decel[in_s] - decel[ref_mph]) + (accel[out_s] - accel[ref_mph])
     return _build_matrix(f)
 
@@ -293,7 +289,7 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
     next_row = write_matrix(
         ws, m3,
         title=f"3.  Turn Time Lost vs. 15 mph reference (seconds){tag}",
-        subtitle="Extra seconds vs. In=15→15 · In=0 row / Out=0 col = raw accel/decel costs",
+        subtitle="Extra seconds vs. In=15→15 · cells where In or Out < 15 mph are blank",
         top_row=next_row + 2, left_col=1,
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
@@ -303,7 +299,7 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
     next_row = write_matrix(
         ws, m4,
         title=f"4.  Turn Time Lost vs. 20 mph reference (seconds){tag}",
-        subtitle="Extra seconds vs. In=20→20 · In=0 row / Out=0 col = raw accel/decel costs",
+        subtitle="Extra seconds vs. In=20→20 · cells where In or Out < 20 mph are blank",
         top_row=next_row + 2, left_col=1,
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
