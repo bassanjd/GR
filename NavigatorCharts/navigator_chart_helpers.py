@@ -4,6 +4,7 @@ for the navigator charts scripts and Streamlit app.
 """
 from pathlib import Path
 
+import numpy as np
 import openpyxl
 import pandas as pd
 from openpyxl.formatting.rule import ColorScaleRule
@@ -321,4 +322,121 @@ def build_reference_workbook(accel, decel, label="", color_scale=True):
     ws = wb.active
     ws.title = "Navigator Charts"
     write_reference_charts_to_sheet(ws, accel, decel, label, color_scale=color_scale)
+    return wb
+
+
+def _poly_eq_str(coef, var="x"):
+    a2, a1, a0 = coef
+    parts = [
+        f"{a2:.6f}{var}²",
+        f"{'+' if a1 >= 0 else '-'} {abs(a1):.6f}{var}",
+        f"{'+' if a0 >= 0 else '-'} {abs(a0):.6f}",
+    ]
+    return " ".join(parts)
+
+
+def _r2_poly(y, coef, x):
+    ss_res = float(np.sum((y - np.polyval(coef, x)) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+
+
+def _write_reference_section(ws, start_row, losses, ca, cd, df_runs, label):
+    """Write losses table, polynomial fit equations, and raw run data below the matrices."""
+    r = start_row
+
+    title_cell = ws.cell(r, 1, f"Reference Data — {label}")
+    title_cell.font = Font(bold=True, size=11, color="1F4E79")
+    r += 2
+
+    if losses is not None and not losses.empty:
+        has_fit = ca is not None and cd is not None
+        hdrs = ["MPH", "Accel Loss (s)", "Decel Loss (s)"]
+        if has_fit:
+            hdrs += ["Fit Accel (s)", "Fit Decel (s)"]
+        for j, h in enumerate(hdrs):
+            c = ws.cell(r, 1 + j, h)
+            c.font = Font(bold=True, color="FFFFFF", size=10)
+            c.fill = PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid")
+            c.alignment = Alignment(horizontal="center")
+            c.border = thin_border()
+        r += 1
+
+        x = losses["MPH"].values.astype(float)
+        fit_a = np.polyval(ca, x) if has_fit else None
+        fit_d = np.polyval(cd, x) if has_fit else None
+
+        for i, (_, row_data) in enumerate(losses.iterrows()):
+            ws.cell(r, 1, int(row_data["MPH"]))
+            ws.cell(r, 2, round(float(row_data["Accel Loss (s)"]), 3))
+            ws.cell(r, 3, round(float(row_data["Decel Loss (s)"]), 3))
+            if has_fit:
+                ws.cell(r, 4, round(float(fit_a[i]), 3))
+                ws.cell(r, 5, round(float(fit_d[i]), 3))
+            r += 1
+        r += 1
+
+        if has_fit:
+            r2a = _r2_poly(losses["Accel Loss (s)"].values, ca, x)
+            r2d = _r2_poly(losses["Decel Loss (s)"].values, cd, x)
+            eq_a = ws.cell(r, 1, f"Accel fit (R²={r2a:.4f}): {_poly_eq_str(ca)}")
+            eq_a.font = Font(italic=True, size=9, color="595959")
+            r += 1
+            eq_d = ws.cell(r, 1, f"Decel fit (R²={r2d:.4f}): {_poly_eq_str(cd)}")
+            eq_d.font = Font(italic=True, size=9, color="595959")
+            r += 2
+
+    if df_runs is not None and not df_runs.empty:
+        cell = ws.cell(r, 1, "Calibration Runs")
+        cell.font = Font(bold=True, size=10, color="1F4E79")
+        r += 1
+
+        run_cols = [c for c in
+                    ["excluded", "date", "notes", "target_mph", "test_type", "run_number", "time_s", "direction"]
+                    if c in df_runs.columns]
+        for j, h in enumerate(run_cols):
+            c = ws.cell(r, 1 + j, h)
+            c.font = Font(bold=True, color="FFFFFF", size=10)
+            c.fill = PatternFill(start_color=C_AXIS_BG, end_color=C_AXIS_BG, fill_type="solid")
+            c.alignment = Alignment(horizontal="center")
+            c.border = thin_border()
+        r += 1
+
+        _EXCL_FILL = PatternFill(start_color="FFFFD9D9", end_color="FFFFD9D9", fill_type="solid")
+        _has_excl = "excluded" in run_cols
+
+        for _, row_data in df_runs.iterrows():
+            is_excluded = _has_excl and bool(row_data["excluded"])
+            for j, col in enumerate(run_cols):
+                val = row_data[col]
+                if hasattr(val, "item"):
+                    val = val.item()
+                cell = ws.cell(r, 1 + j, val)
+                if is_excluded:
+                    cell.fill = _EXCL_FILL
+            r += 1
+
+
+def build_combined_workbook(
+    accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
+    accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
+    color_scale=True,
+):
+    """Return a two-sheet workbook: All Data and Filtered, each with matrices + reference data."""
+    wb = openpyxl.Workbook()
+
+    ws_all = wb.active
+    ws_all.title = "All Data"
+    if accel_all is not None:
+        write_reference_charts_to_sheet(ws_all, accel_all, decel_all, "all data",
+                                        color_scale=color_scale)
+        _write_reference_section(ws_all, 60, losses_all, ca_all, cd_all, df_all_runs, "All Data")
+
+    ws_filt = wb.create_sheet("Filtered")
+    if accel_filt is not None:
+        write_reference_charts_to_sheet(ws_filt, accel_filt, decel_filt, "filtered",
+                                        color_scale=color_scale)
+        _write_reference_section(ws_filt, 60, losses_filt, ca_filt, cd_filt, df_filt_runs,
+                                 "Filtered")
+
     return wb

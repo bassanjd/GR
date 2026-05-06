@@ -26,7 +26,7 @@ import streamlit as st
 from navigator_chart_helpers import (
     SPEEDS,
     STOP_SIGN_SECONDS,
-    build_reference_workbook,
+    build_combined_workbook,
     compute_losses,
     load_calibration_runs,
     losses_to_dicts,
@@ -46,8 +46,17 @@ def load_runs():
     return load_calibration_runs()
 
 
-def build_export_bytes(accel, decel, label, color_scale=True):
-    wb = build_reference_workbook(accel, decel, label, color_scale=color_scale)
+
+def build_combined_export_bytes(
+    accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
+    accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
+    color_scale=True,
+):
+    wb = build_combined_workbook(
+        accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
+        accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
+        color_scale=color_scale,
+    )
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -506,6 +515,11 @@ with st.sidebar:
 n_excl   = int(edited["Excl."].sum())
 df_kept  = edited[~edited["Excl."]].drop(columns=["Excl."])
 
+# All visible runs with exclusion status for the export's raw-data section
+df_all_with_excl = edited.copy()
+df_all_with_excl["excluded"] = edited["Excl."]
+df_all_with_excl = df_all_with_excl.drop(columns=["Excl."])
+
 # ── Precompute losses for both views ──────────────────────────────────────────
 
 losses_all  = compute_losses(df_visible)
@@ -515,6 +529,11 @@ losses_filt = compute_losses(df_kept)
 accel_filt, decel_filt = losses_to_dicts(losses_filt)
 
 filt_label = f"Filtered ({n_excl} excluded)" if n_excl else "Filtered (none excluded)"
+
+# ── Fit coefficients (used in both Summary tab and export) ────────────────────
+
+ca_all, cd_all   = fit_losses(losses_all)
+ca_filt, cd_filt = fit_losses(losses_filt)
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
 
@@ -531,7 +550,6 @@ with tab_summary:
         st.subheader("All Data")
         st.plotly_chart(loss_line_chart(losses_all, "Accel / Decel Losses", show_fit=False),
                         use_container_width=True)
-        ca_all, cd_all = fit_losses(losses_all)
         losses_table(losses_all, ca=ca_all, cd=cd_all)
         st.subheader("Run Times by Speed & Type")
         run_pivot_table(df_visible, df_ref=df_kept)
@@ -540,7 +558,6 @@ with tab_summary:
         st.subheader(filt_label)
         st.plotly_chart(loss_line_chart(losses_filt, "Accel / Decel Losses (filtered)"),
                         use_container_width=True)
-        ca_filt, cd_filt = fit_losses(losses_filt)
         losses_table(losses_filt, ca=ca_filt, cd=cd_filt)
         st.subheader("Run Times by Speed & Type")
         run_pivot_table(df_kept, df_ref=df_visible)
@@ -550,40 +567,32 @@ with tab_summary:
 with tab_charts:
     use_color_scale = st.toggle("Conditional formatting", value=True)
 
-    col_charts_all, col_charts_filt = st.columns(2)
-
     _ts = datetime.now().strftime("%Y-%m-%d-%H%M")
+    _can_export = accel_all is not None or accel_filt is not None
+    if _can_export:
+        st.download_button(
+            "⬇ Export navigator charts (All Data + Filtered)",
+            data=build_combined_export_bytes(
+                accel_all, decel_all, losses_all, ca_all, cd_all, df_visible,
+                accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_all_with_excl,
+                color_scale=use_color_scale,
+            ),
+            file_name=f"{_ts}_navigator_charts.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    else:
+        st.button("⬇ Export navigator charts (All Data + Filtered)", disabled=True,
+                  use_container_width=True)
+
+    col_charts_all, col_charts_filt = st.columns(2)
 
     with col_charts_all:
         st.subheader("All Data")
-        if accel_all is not None:
-            st.download_button(
-                "⬇ Export navigator charts (all data)",
-                data=build_export_bytes(accel_all, decel_all, "all data",
-                                        color_scale=use_color_scale),
-                file_name=f"{_ts}_navigator_charts_all.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        else:
-            st.button("⬇ Export navigator charts (all data)", disabled=True,
-                      use_container_width=True)
         render_matrix_html(accel_all, decel_all, color_scale=use_color_scale)
 
     with col_charts_filt:
         st.subheader(filt_label)
-        if accel_filt is not None:
-            st.download_button(
-                "⬇ Export navigator charts (filtered)",
-                data=build_export_bytes(accel_filt, decel_filt, "filtered",
-                                        color_scale=use_color_scale),
-                file_name=f"{_ts}_navigator_charts_filtered.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        else:
-            st.button("⬇ Export navigator charts (filtered)", disabled=True,
-                      use_container_width=True)
         render_matrix_html(accel_filt, decel_filt, color_scale=use_color_scale)
 
 # ── Tab: Methodology ──────────────────────────────────────────────────────────
