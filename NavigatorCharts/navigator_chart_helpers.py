@@ -284,7 +284,7 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
             "mandatory stop · Out=0 col = raw brake cost"
         ),
         top_row=next_row + 2, left_col=1,
-        color_lo="F8696B", color_mid="FFEB84", color_hi="63BE7B",
+        color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=STOP_SIGN_SECONDS / 2,
         hide_zero_axis=True,
         color_scale=color_scale,

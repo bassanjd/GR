@@ -160,6 +160,19 @@ def fit_losses(losses):
     return np.polyfit(x, losses["Accel Loss (s)"].values, 2), np.polyfit(x, losses["Decel Loss (s)"].values, 2)
 
 
+def fit_losses_to_dicts(ca, cd, fallback_losses=None):
+    """Evaluate polynomial fit at each speed and return (accel, decel) dicts.
+
+    Falls back to losses_to_dicts(fallback_losses) if coefficients are unavailable.
+    Speed 0 is always 0.0 regardless of polynomial value.
+    """
+    if ca is None or cd is None:
+        return losses_to_dicts(fallback_losses)
+    accel = {s: 0.0 if s == 0 else float(np.polyval(ca, s)) for s in SPEEDS}
+    decel = {s: 0.0 if s == 0 else float(np.polyval(cd, s)) for s in SPEEDS}
+    return accel, decel
+
+
 def _poly_eq(coef, var="x"):
     a2, a1, a0 = coef
     parts = [f"{a2:.6f}{var}²", f"{'+' if a1 >= 0 else '-'} {abs(a1):.6f}{var}", f"{'+' if a0 >= 0 else '-'} {abs(a0):.6f}"]
@@ -240,6 +253,9 @@ def losses_table(losses, ca=None, cd=None):
         r2d = _r2(losses["Decel Loss (s)"].values, cd, x)
         st.caption(f"Accel fit (R²={r2a:.4f}): {_poly_eq(ca)}")
         st.caption(f"Decel fit (R²={r2d:.4f}): {_poly_eq(cd)}")
+    else:
+        st.caption("No accel fit performed.")
+        st.caption("No decel fit performed.")
 
 
 _TYPE_LABELS = {
@@ -423,7 +439,7 @@ def render_matrix_html(accel, decel, color_scale=True):
         title="2.  Available Pause at Stop Sign (seconds)",
         subtitle=(f"Standstill seconds remaining inside a {int(STOP_SIGN_SECONDS)}-second "
                   "mandatory stop · Out=0 col = raw brake cost"),
-        c_lo="F8696B", c_mid="FFEB84", c_hi="63BE7B",
+        c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=STOP_SIGN_SECONDS / 2,
         hide_zero_axis=True,
         color_scale=color_scale,
@@ -460,7 +476,7 @@ with st.sidebar:
     st.title("Calibration Runs")
 
     n_excl_auto = st.slider(
-        "Auto-exclude runs", min_value=0, max_value=15, value=6,
+        "Auto-exclude runs", min_value=0, max_value=15, value=3,
         help="Greedy degree-2 polynomial fit selects which runs to exclude. "
              "6 is a good default — gives smooth curves with minimal data loss.",
     )
@@ -534,6 +550,7 @@ filt_label = f"Filtered ({n_excl} excluded)" if n_excl else "Filtered (none excl
 
 ca_all, cd_all   = fit_losses(losses_all)
 ca_filt, cd_filt = fit_losses(losses_filt)
+accel_filt_fit, decel_filt_fit = fit_losses_to_dicts(ca_filt, cd_filt, fallback_losses=losses_filt)
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
 
@@ -550,7 +567,7 @@ with tab_summary:
         st.subheader("All Data")
         st.plotly_chart(loss_line_chart(losses_all, "Accel / Decel Losses", show_fit=False),
                         use_container_width=True)
-        losses_table(losses_all, ca=ca_all, cd=cd_all)
+        losses_table(losses_all)
         st.subheader("Run Times by Speed & Type")
         run_pivot_table(df_visible, df_ref=df_kept)
 
@@ -574,7 +591,7 @@ with tab_charts:
             "⬇ Export navigator charts (All Data + Filtered)",
             data=build_combined_export_bytes(
                 accel_all, decel_all, losses_all, ca_all, cd_all, df_visible,
-                accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_all_with_excl,
+                accel_filt_fit, decel_filt_fit, losses_filt, ca_filt, cd_filt, df_all_with_excl,
                 color_scale=use_color_scale,
             ),
             file_name=f"{_ts}_navigator_charts.xlsx",
@@ -593,7 +610,7 @@ with tab_charts:
 
     with col_charts_filt:
         st.subheader(filt_label)
-        render_matrix_html(accel_filt, decel_filt, color_scale=use_color_scale)
+        render_matrix_html(accel_filt_fit, decel_filt_fit, color_scale=use_color_scale)
 
 # ── Tab: Methodology ──────────────────────────────────────────────────────────
 
