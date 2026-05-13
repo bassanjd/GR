@@ -358,12 +358,12 @@ _S_CORNER = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:11px;"
              "text-align:center;padding:4px 8px;border:1px solid #9DC3E6;"
              "white-space:nowrap;")
 _S_HDR    = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:12px;"
-             "text-align:center;padding:5px 12px;border:1px solid #9DC3E6;")
+             "text-align:center;padding:5px 12px;min-width:52px;border:1px solid #9DC3E6;")
 _S_AXIS   = ("background:#2E75B6;color:#FFF;font-weight:bold;font-size:12px;"
-             "text-align:center;padding:5px 12px;border:1px solid #9DC3E6;")
-_S_BLANK  = "background:#D9D9D9;border:1px solid #9DC3E6;padding:5px 12px;"
+             "text-align:center;padding:5px 12px;min-width:52px;border:1px solid #9DC3E6;")
+_S_BLANK  = "background:#D9D9D9;border:1px solid #9DC3E6;padding:4px 8px;min-width:52px;"
 _S_BLACK  = ("background:#000;color:#000;font-size:12px;text-align:center;"
-             "padding:5px 12px;border:1px solid #333;")
+             "padding:4px 8px;min-width:52px;border:1px solid #333;")
 
 
 def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
@@ -394,7 +394,7 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
 
     for i, in_spd in enumerate(SPEEDS):
         zero_row = hide_zero_axis and i == 0
-        h.append('<tr>')
+        h.append('<tr style="height:52px">')
         h.append(f'<td style="{_S_BLACK if zero_row else _S_AXIS}">{in_spd}</td>')
         for j, val in enumerate(matrix[i]):
             zero_col = hide_zero_axis and j == 0
@@ -410,7 +410,8 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
                 else:
                     bg, fg = "F2F2F2", "000000"
                 s = (f"background:#{bg};color:#{fg};font-size:12px;"
-                     f"text-align:center;padding:5px 12px;border:1px solid #9DC3E6;")
+                     f"text-align:center;vertical-align:middle;padding:4px 8px;"
+                     f"min-width:52px;border:1px solid #9DC3E6;")
                 h.append(f'<td style="{s}">{val:.1f}</td>')
         h.append('</tr>')
 
@@ -454,7 +455,7 @@ def matrix_combined_html(matrix, title, subtitle, delta_mph,
 
     for i, in_spd in enumerate(SPEEDS):
         zero_row = hide_zero_axis and i == 0
-        h.append('<tr>')
+        h.append('<tr style="height:52px">')
         h.append(f'<td style="{_S_BLACK if zero_row else _S_AXIS}">{in_spd}</td>')
         for j, val in enumerate(matrix[i]):
             zero_col = hide_zero_axis and j == 0
@@ -471,8 +472,8 @@ def matrix_combined_html(matrix, title, subtitle, delta_mph,
                     bg, fg = "F2F2F2", "000000"
                 comp_color = "#444" if fg == "000000" else "#DDD"
                 s = (f"background:#{bg};color:#{fg};font-size:12px;"
-                     f"text-align:center;padding:4px 8px;border:1px solid #9DC3E6;"
-                     f"line-height:1.5;")
+                     f"text-align:center;vertical-align:middle;padding:4px 8px;"
+                     f"min-width:52px;border:1px solid #9DC3E6;line-height:1.5;")
                 if comp is None:
                     cell_html = f'<span style="font-size:13px;font-weight:bold">{loss:.1f}s</span>'
                 else:

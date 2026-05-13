@@ -182,7 +182,7 @@ C_AXIS_FG   = "FFFFFF"
 C_TITLE_BG  = "D6E4F0"
 C_BORDER    = "9DC3E6"
 
-_ROW_H      = 28   # uniform row height for all data rows (px)
+_ROW_H      = 42   # uniform row height for all data rows (px) — 50% taller than original 28
 _COL_W_LBL  = 14   # label column width (col A)
 _COL_W_DATA = 11   # data column width (cols B-J)
 
@@ -281,7 +281,7 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
                 cell.font = BLACK_FONT
                 if val is not BLANK:
                     cell.number_format = "0.0"
-                cell.alignment = Alignment(horizontal="center")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
             elif val is BLANK:
                 cell.value = None
                 cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
@@ -289,7 +289,7 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
                 cell.value = round(val, 2)
                 cell.number_format = "0.0"
                 cell.font = Font(size=12)
-                cell.alignment = Alignment(horizontal="center")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = thin_border()
 
     data_end_row = R + n - 1
