@@ -351,19 +351,19 @@ def _luminance(hex_color):
 
 
 # Inline style strings matching Excel constants (C_HEADER_BG, C_AXIS_BG, etc.)
-_S_TITLE  = ("background:#D6E4F0;color:#1F4E79;font-weight:bold;font-size:12px;"
+_S_TITLE  = ("background:#D6E4F0;color:#1F4E79;font-weight:bold;font-size:14px;"
               "padding:5px 7px;")
-_S_SUB    = "color:#595959;font-style:italic;font-size:9px;padding:2px 7px 5px;"
-_S_CORNER = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:9px;"
-             "text-align:center;padding:3px 6px;border:1px solid #9DC3E6;"
+_S_SUB    = "color:#595959;font-style:italic;font-size:11px;padding:2px 7px 5px;"
+_S_CORNER = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:11px;"
+             "text-align:center;padding:4px 8px;border:1px solid #9DC3E6;"
              "white-space:nowrap;")
-_S_HDR    = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:10px;"
-             "text-align:center;padding:4px 10px;border:1px solid #9DC3E6;")
-_S_AXIS   = ("background:#2E75B6;color:#FFF;font-weight:bold;font-size:10px;"
-             "text-align:center;padding:4px 10px;border:1px solid #9DC3E6;")
-_S_BLANK  = "background:#D9D9D9;border:1px solid #9DC3E6;padding:4px 10px;"
-_S_BLACK  = ("background:#000;color:#000;font-size:10px;text-align:center;"
-             "padding:4px 10px;border:1px solid #333;")
+_S_HDR    = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:12px;"
+             "text-align:center;padding:5px 12px;border:1px solid #9DC3E6;")
+_S_AXIS   = ("background:#2E75B6;color:#FFF;font-weight:bold;font-size:12px;"
+             "text-align:center;padding:5px 12px;border:1px solid #9DC3E6;")
+_S_BLANK  = "background:#D9D9D9;border:1px solid #9DC3E6;padding:5px 12px;"
+_S_BLACK  = ("background:#000;color:#000;font-size:12px;text-align:center;"
+             "padding:5px 12px;border:1px solid #333;")
 
 
 def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
@@ -409,8 +409,8 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
                     fg = "000000" if _luminance(bg) > 140 else "FFFFFF"
                 else:
                     bg, fg = "F2F2F2", "000000"
-                s = (f"background:#{bg};color:#{fg};font-size:10px;"
-                     f"text-align:center;padding:4px 10px;border:1px solid #9DC3E6;")
+                s = (f"background:#{bg};color:#{fg};font-size:12px;"
+                     f"text-align:center;padding:5px 12px;border:1px solid #9DC3E6;")
                 h.append(f'<td style="{s}">{val:.1f}</td>')
         h.append('</tr>')
 
@@ -470,15 +470,15 @@ def matrix_combined_html(matrix, title, subtitle, delta_mph,
                 else:
                     bg, fg = "F2F2F2", "000000"
                 comp_color = "#444" if fg == "000000" else "#DDD"
-                s = (f"background:#{bg};color:#{fg};font-size:10px;"
-                     f"text-align:center;padding:3px 6px;border:1px solid #9DC3E6;"
+                s = (f"background:#{bg};color:#{fg};font-size:12px;"
+                     f"text-align:center;padding:4px 8px;border:1px solid #9DC3E6;"
                      f"line-height:1.5;")
                 if comp is None:
-                    cell_html = f'<span style="font-size:11px;font-weight:bold">{loss:.1f}s</span>'
+                    cell_html = f'<span style="font-size:13px;font-weight:bold">{loss:.1f}s</span>'
                 else:
                     cell_html = (
-                        f'<span style="font-size:11px;font-weight:bold">{loss:.1f}s</span>'
-                        f'<br><span style="font-size:9px;color:{comp_color}">↑{comp:.0f}s</span>'
+                        f'<span style="font-size:13px;font-weight:bold">{loss:.1f}s</span>'
+                        f'<br><span style="font-size:11px;color:{comp_color}">↑{comp:.0f}s</span>'
                     )
                 h.append(f'<td style="{s}">{cell_html}</td>')
         h.append('</tr>')

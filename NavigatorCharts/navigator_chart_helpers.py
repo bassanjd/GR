@@ -182,14 +182,18 @@ C_AXIS_FG   = "FFFFFF"
 C_TITLE_BG  = "D6E4F0"
 C_BORDER    = "9DC3E6"
 
+_ROW_H      = 28   # uniform row height for all data rows (px)
+_COL_W_LBL  = 14   # label column width (col A)
+_COL_W_DATA = 11   # data column width (cols B-J)
+
 BLACK_FILL = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
-BLACK_FONT = Font(color="000000", size=10)
+BLACK_FONT = Font(color="000000", size=12)
 
 
 def header_style(bold=True):
     return {
         "fill":      PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid"),
-        "font":      Font(color=C_HEADER_FG, bold=bold, size=10),
+        "font":      Font(color=C_HEADER_FG, bold=bold, size=12),
         "alignment": Alignment(horizontal="center", vertical="center"),
     }
 
@@ -197,7 +201,7 @@ def header_style(bold=True):
 def axis_style():
     return {
         "fill":      PatternFill(start_color=C_AXIS_BG, end_color=C_AXIS_BG, fill_type="solid"),
-        "font":      Font(color=C_AXIS_FG, bold=True, size=10),
+        "font":      Font(color=C_AXIS_FG, bold=True, size=12),
         "alignment": Alignment(horizontal="center", vertical="center"),
     }
 
@@ -227,21 +231,21 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
 
     # Title row
     title_cell = ws.cell(R, C, title)
-    title_cell.font = Font(bold=True, size=11, color="1F4E79")
+    title_cell.font = Font(bold=True, size=13, color="1F4E79")
     title_cell.fill = PatternFill(start_color=C_TITLE_BG, end_color=C_TITLE_BG, fill_type="solid")
     ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
     R += 1
 
     # Subtitle row
     sub_cell = ws.cell(R, C, subtitle)
-    sub_cell.font = Font(italic=True, size=9, color="595959")
+    sub_cell.font = Font(italic=True, size=11, color="595959")
     ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
     R += 1
 
     # Column headers
     corner = ws.cell(R, C, "In ↓  Out →")
     corner.fill = PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid")
-    corner.font = Font(color=C_HEADER_FG, bold=True, size=9)
+    corner.font = Font(color=C_HEADER_FG, bold=True, size=11)
     corner.alignment = Alignment(horizontal="center", vertical="center")
 
     for j, spd in enumerate(SPEEDS):
@@ -284,6 +288,7 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
             else:
                 cell.value = round(val, 2)
                 cell.number_format = "0.0"
+                cell.font = Font(size=12)
                 cell.alignment = Alignment(horizontal="center")
             cell.border = thin_border()
 
@@ -346,21 +351,21 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
 
     # Title row
     title_cell = ws.cell(R, C, title)
-    title_cell.font = Font(bold=True, size=11, color="1F4E79")
+    title_cell.font = Font(bold=True, size=13, color="1F4E79")
     title_cell.fill = PatternFill(start_color=C_TITLE_BG, end_color=C_TITLE_BG, fill_type="solid")
     ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
     R += 1
 
     # Subtitle row
     sub_cell = ws.cell(R, C, subtitle)
-    sub_cell.font = Font(italic=True, size=9, color="595959")
+    sub_cell.font = Font(italic=True, size=11, color="595959")
     ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
     R += 1
 
     # Column headers
     corner = ws.cell(R, C, "In ↓  Out →")
     corner.fill = PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid")
-    corner.font = Font(color=C_HEADER_FG, bold=True, size=9)
+    corner.font = Font(color=C_HEADER_FG, bold=True, size=11)
     corner.alignment = Alignment(horizontal="center", vertical="center")
     for j, spd in enumerate(SPEEDS):
         cell = ws.cell(R, C + 1 + j, spd)
@@ -389,7 +394,6 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
     # Data rows
     for i, in_spd in enumerate(SPEEDS):
         zero_row = hide_zero_axis and i == 0
-        ws.row_dimensions[R + i].height = 28  # taller for two lines of text
 
         lbl = ws.cell(R + i, C, in_spd)
         if zero_row:
@@ -424,10 +428,10 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
                     lum = 0.299 * r_c + 0.587 * g_c + 0.114 * b_c
                     fg = "000000" if lum > 140 else "FFFFFF"
                     cell.fill = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
-                    cell.font = Font(size=10, color=fg)
+                    cell.font = Font(size=12, color=fg)
                 else:
                     cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
-                    cell.font = Font(size=10, color="000000")
+                    cell.font = Font(size=12, color="000000")
             cell.border = thin_border()
 
     return R + n  # next available row
@@ -444,11 +448,11 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
     label: optional string appended to each matrix title.
     delta_mph: overspeed increment for the combined turn matrices.
     """
-    ws.column_dimensions["A"].width = 10
+    ws.column_dimensions["A"].width = _COL_W_LBL
     for col in range(2, 11):
-        ws.column_dimensions[get_column_letter(col)].width = 8
-    for r in range(1, 75):
-        ws.row_dimensions[r].height = 16
+        ws.column_dimensions[get_column_letter(col)].width = _COL_W_DATA
+    for r in range(1, 110):
+        ws.row_dimensions[r].height = _ROW_H
 
     tag = f"  [{label}]" if label else ""
 
