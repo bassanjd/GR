@@ -37,6 +37,7 @@ from navigator_chart_helpers import (
     losses_to_dicts,
     matrix_stop_go,
     matrix_transition,
+    matrix_transition_combined,
     matrix_turn_combined,
     matrix_turn_compensation,
     matrix_turn_loss,
@@ -101,6 +102,67 @@ class TestBuildMatrix:
         m = _build_matrix(lambda i, o: None)
         assert isinstance(m, list)
         assert isinstance(m[0], list)
+
+
+# ── matrix_transition_combined ───────────────────────────────────────────────
+
+class TestMatrixTransitionCombined:
+    def test_diagonal_is_blank(self, linear_accel, linear_decel):
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            assert m[i][i] is BLANK
+
+    def test_values_always_non_negative(self, linear_accel, linear_decel):
+        """Every speed change costs extra time — no negative losses."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if m[i][j] is not BLANK:
+                    assert m[i][j][0] >= 0.0
+
+    def test_loss_matches_matrix_transition(self, linear_accel, linear_decel):
+        """Loss component must agree with matrix_transition at every non-diagonal cell."""
+        mc = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        mt = matrix_transition(linear_accel, linear_decel)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][0] == pytest.approx(mt[i][j])
+
+    def test_stop_column_comp_is_none(self, linear_accel, linear_decel):
+        """Out=0 cells (stopping) return (loss, None) — compensation not applicable."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        j = SPEEDS.index(0)
+        for i, in_s in enumerate(SPEEDS):
+            if in_s != 0:
+                assert m[i][j] is not BLANK
+                assert m[i][j][1] is None
+
+    def test_from_stop_comp_is_numeric(self, linear_accel, linear_decel):
+        """In=0 cells (starting from stop) have a numeric compensation."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        i = SPEEDS.index(0)
+        for j, out_s in enumerate(SPEEDS):
+            if out_s != 0:
+                assert m[i][j] is not BLANK
+                assert isinstance(m[i][j][1], float)
+
+    def test_comp_formula(self, linear_accel, linear_decel):
+        """comp = loss * out_s / delta_mph for non-zero exit speed cells."""
+        delta = 5
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=delta)
+        mt = matrix_transition(linear_accel, linear_decel)
+        in_s, out_s = 20, 40
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        expected_comp = mt[i][j] * out_s / delta
+        assert m[i][j][1] == pytest.approx(expected_comp)
+
+    def test_larger_delta_reduces_comp(self, linear_accel, linear_decel):
+        """Higher overspeed delta → fewer recovery seconds."""
+        mc5  = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        mc10 = matrix_transition_combined(linear_accel, linear_decel, delta_mph=10)
+        i, j = SPEEDS.index(20), SPEEDS.index(40)
+        assert mc5[i][j][1] > mc10[i][j][1]
 
 
 # ── matrix_transition ─────────────────────────────────────────────────────────

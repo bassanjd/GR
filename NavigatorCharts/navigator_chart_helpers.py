@@ -79,6 +79,28 @@ def matrix_turn_compensation(accel, decel, ref_mph, delta_mph):
     return _build_matrix(f)
 
 
+def matrix_transition_combined(accel, decel, delta_mph):
+    """Combined speed transition matrix: each cell is a (loss, comp) tuple, BLANK, or (loss, None).
+
+    loss = extra seconds for any speed change (same as matrix_transition).
+    comp = seconds to drive at exit_speed + delta_mph to recover the loss.
+    When out_s == 0 (stopping), comp is None — compensation is not applicable
+    because you can't drive faster after stopping; the Stop Sign matrix handles that.
+    Diagonal (no change) is BLANK.
+    """
+    def f(in_s, out_s):
+        if in_s == out_s:
+            return BLANK
+        if out_s > in_s:
+            loss = accel[out_s] - accel[in_s]
+        else:
+            loss = decel[in_s] - decel[out_s]
+        if out_s == 0:
+            return (loss, None)
+        return (loss, loss * out_s / delta_mph)
+    return _build_matrix(f)
+
+
 def matrix_turn_combined(accel, decel, ref_mph, delta_mph):
     """Combined turn matrix: each cell is a (loss, comp) tuple, or BLANK.
 
@@ -309,12 +331,15 @@ def _tricolor_hex(val, vmin, vmid, vmax, lo, mid, hi):
 
 def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
                                delta_mph, color_lo, color_mid, color_hi,
-                               mid_value=0.0, color_scale=True):
-    """Write a combined turn loss + compensation matrix to the worksheet.
+                               mid_value=0.0, color_scale=True, hide_zero_axis=True):
+    """Write a combined loss + compensation matrix to the worksheet.
 
     Each non-blank cell shows two lines: loss (top) and compensation (bottom).
-    Color scale is based on the loss value only.  Zero row/column are painted
-    black-on-black (hide_zero_axis behavior — combined matrices always mask these).
+    When comp is None (e.g., out_s=0 in the transition matrix), only the loss
+    is shown on one centered line.
+    Color scale is based on the loss value only.
+    hide_zero_axis: paint the In=0 row and Out=0 column black-on-black (default True
+    for turn matrices; pass False for the speed transition matrix).
     """
     n = len(SPEEDS)
     R, C = top_row, left_col
@@ -332,14 +357,14 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
     ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
     R += 1
 
-    # Column headers (zero column always hidden)
+    # Column headers
     corner = ws.cell(R, C, "In ↓  Out →")
     corner.fill = PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid")
     corner.font = Font(color=C_HEADER_FG, bold=True, size=9)
     corner.alignment = Alignment(horizontal="center", vertical="center")
     for j, spd in enumerate(SPEEDS):
         cell = ws.cell(R, C + 1 + j, spd)
-        if j == 0:
+        if hide_zero_axis and j == 0:
             cell.fill = BLACK_FILL
             cell.font = BLACK_FONT
             cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -347,11 +372,12 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
             apply(cell, header_style())
     R += 1
 
-    # Collect loss values for explicit color computation (loss values only, non-zero axes)
+    # Collect loss values for explicit color computation (exclude zero-axis rows/cols if hidden)
     loss_vals = [
         val[0]
-        for i, row in enumerate(matrix) if i > 0
-        for j, val in enumerate(row) if j > 0 and val is not BLANK
+        for i, row in enumerate(matrix) if not (hide_zero_axis and i == 0)
+        for j, val in enumerate(row)
+        if not (hide_zero_axis and j == 0) and val is not BLANK and isinstance(val, tuple)
     ]
     if color_scale and loss_vals:
         vmin = min(loss_vals)
@@ -362,7 +388,7 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
 
     # Data rows
     for i, in_spd in enumerate(SPEEDS):
-        zero_row = (i == 0)
+        zero_row = hide_zero_axis and i == 0
         ws.row_dimensions[R + i].height = 28  # taller for two lines of text
 
         lbl = ws.cell(R + i, C, in_spd)
@@ -375,7 +401,7 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
 
         for j, val in enumerate(matrix[i]):
             cell = ws.cell(R + i, C + 1 + j)
-            zero_col = (j == 0)
+            zero_col = hide_zero_axis and j == 0
 
             if zero_row or zero_col:
                 cell.fill = BLACK_FILL
@@ -386,8 +412,12 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
                 cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
             else:
                 loss, comp = val
-                cell.value = f"{loss:.1f}s\n↑{comp:.0f}s"
-                cell.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+                if comp is None:
+                    cell.value = f"{loss:.1f}s"
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    cell.value = f"{loss:.1f}s\n↑{comp:.0f}s"
+                    cell.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
                 if color_scale and loss_vals:
                     bg = _tricolor_hex(loss, vmin, vmid, vmax, color_lo, color_mid, color_hi)
                     r_c, g_c, b_c = _hex_to_rgb(bg)
@@ -422,19 +452,21 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
 
     tag = f"  [{label}]" if label else ""
 
-    m1 = matrix_transition(accel, decel)
+    m1 = matrix_transition_combined(accel, decel, delta_mph=delta_mph)
     m2 = matrix_stop_go(accel, decel)
     m3 = matrix_turn_combined(accel, decel, ref_mph=15, delta_mph=delta_mph)
     m4 = matrix_turn_combined(accel, decel, ref_mph=20, delta_mph=delta_mph)
 
-    next_row = write_matrix(
+    next_row = write_combined_turn_matrix(
         ws, m1,
-        title=f"1.  Speed Transition Time (seconds){tag}",
-        subtitle="Extra seconds vs. flying straight through · blank diagonal = no change",
+        title=f"1.  Speed Transition — top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds{tag}",
+        subtitle=f"Extra seconds vs. flying straight through · Out=0 col shows loss only (stopping, use Stop Sign chart to compensate)",
         top_row=1, left_col=1,
+        delta_mph=delta_mph,
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
         color_scale=color_scale,
+        hide_zero_axis=False,
     )
     next_row = write_matrix(
         ws, m2,
