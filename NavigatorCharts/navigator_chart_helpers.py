@@ -59,6 +59,26 @@ def matrix_turn_loss(accel, decel, ref_mph):
     return _build_matrix(f)
 
 
+def matrix_turn_compensation(accel, decel, ref_mph, delta_mph):
+    """Seconds to drive at (exit_speed + delta_mph) to recover the turn time loss.
+
+    Formula: compensation = turn_loss * exit_speed / delta_mph
+    Derived from: at exit_speed mph, driving delta_mph faster saves (delta_mph / exit_speed)
+    seconds for every second driven, so seconds_needed = turn_loss / (delta_mph / exit_speed).
+
+    Blank when entry or exit < ref_mph (same masking as matrix_turn_loss).
+    Zero when there is no turn loss (entry == exit == ref_mph).
+    """
+    def f(in_s, out_s):
+        if in_s < ref_mph or out_s < ref_mph:
+            return BLANK
+        loss = (decel[in_s] - decel[ref_mph]) + (accel[out_s] - accel[ref_mph])
+        if out_s == 0:
+            return BLANK
+        return loss * out_s / delta_mph
+    return _build_matrix(f)
+
+
 # ── Data loading / loss computation ──────────────────────────────────────────
 
 def load_calibration_runs():
@@ -249,15 +269,16 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
     return R + n  # next available row
 
 
-def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True):
+def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True, delta_mph=5):
     """
-    Write 4 reference matrices directly into an existing openpyxl worksheet.
+    Write 6 reference matrices directly into an existing openpyxl worksheet.
     label: optional string appended to each matrix title.
+    delta_mph: overspeed increment for the compensation matrices (5 and 6).
     """
     ws.column_dimensions["A"].width = 10
     for col in range(2, 11):
         ws.column_dimensions[get_column_letter(col)].width = 8
-    for r in range(1, 80):
+    for r in range(1, 110):
         ws.row_dimensions[r].height = 16
 
     tag = f"  [{label}]" if label else ""
@@ -266,6 +287,8 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
     m2 = matrix_stop_go(accel, decel)
     m3 = matrix_turn_loss(accel, decel, ref_mph=15)
     m4 = matrix_turn_loss(accel, decel, ref_mph=20)
+    m5 = matrix_turn_compensation(accel, decel, ref_mph=15, delta_mph=delta_mph)
+    m6 = matrix_turn_compensation(accel, decel, ref_mph=20, delta_mph=delta_mph)
 
     next_row = write_matrix(
         ws, m1,
@@ -309,6 +332,32 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
         hide_zero_axis=True,
         color_scale=color_scale,
     )
+    next_row = write_matrix(
+        ws, m5,
+        title=f"5.  Turn Loss Recovery at 15 mph ref — drive +{delta_mph} mph for N seconds{tag}",
+        subtitle=(
+            f"After turn, drive exit+{delta_mph} mph for this many seconds to get back on schedule "
+            "· blank where In or Out < 15 mph"
+        ),
+        top_row=next_row + 2, left_col=1,
+        color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
+        mid_value=0.0,
+        hide_zero_axis=True,
+        color_scale=color_scale,
+    )
+    next_row = write_matrix(
+        ws, m6,
+        title=f"6.  Turn Loss Recovery at 20 mph ref — drive +{delta_mph} mph for N seconds{tag}",
+        subtitle=(
+            f"After turn, drive exit+{delta_mph} mph for this many seconds to get back on schedule "
+            "· blank where In or Out < 20 mph"
+        ),
+        top_row=next_row + 2, left_col=1,
+        color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
+        mid_value=0.0,
+        hide_zero_axis=True,
+        color_scale=color_scale,
+    )
 
     note_row = next_row + 2
     note = ws.cell(note_row, 1,
@@ -316,12 +365,13 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
     note.font = Font(italic=True, size=8, color="808080")
 
 
-def build_reference_workbook(accel, decel, label="", color_scale=True):
-    """Return a new openpyxl Workbook with 4 reference matrices (for in-memory export)."""
+def build_reference_workbook(accel, decel, label="", color_scale=True, delta_mph=5):
+    """Return a new openpyxl Workbook with 6 reference matrices (for in-memory export)."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Navigator Charts"
-    write_reference_charts_to_sheet(ws, accel, decel, label, color_scale=color_scale)
+    write_reference_charts_to_sheet(ws, accel, decel, label, color_scale=color_scale,
+                                    delta_mph=delta_mph)
     return wb
 
 
@@ -421,6 +471,7 @@ def build_combined_workbook(
     accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
     accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
     color_scale=True,
+    delta_mph=5,
 ):
     """Return a two-sheet workbook: All Data and Filtered, each with matrices + reference data."""
     wb = openpyxl.Workbook()
@@ -429,14 +480,14 @@ def build_combined_workbook(
     ws_all.title = "All Data"
     if accel_all is not None:
         write_reference_charts_to_sheet(ws_all, accel_all, decel_all, "all data",
-                                        color_scale=color_scale)
-        _write_reference_section(ws_all, 60, losses_all, ca_all, cd_all, df_all_runs, "All Data")
+                                        color_scale=color_scale, delta_mph=delta_mph)
+        _write_reference_section(ws_all, 120, losses_all, ca_all, cd_all, df_all_runs, "All Data")
 
     ws_filt = wb.create_sheet("Filtered")
     if accel_filt is not None:
         write_reference_charts_to_sheet(ws_filt, accel_filt, decel_filt, "filtered",
-                                        color_scale=color_scale)
-        _write_reference_section(ws_filt, 60, losses_filt, ca_filt, cd_filt, df_filt_runs,
+                                        color_scale=color_scale, delta_mph=delta_mph)
+        _write_reference_section(ws_filt, 120, losses_filt, ca_filt, cd_filt, df_filt_runs,
                                  "Filtered")
 
     return wb

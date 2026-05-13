@@ -6,6 +6,7 @@ Covers:
   - matrix_transition: diagonal blanks, accel/decel branches
   - matrix_stop_go: corner blank, from-stop, to-stop, mid-cell formula
   - matrix_turn_loss: corner blank, raw-cost rows/cols, reference-zero diagonal
+  - matrix_turn_compensation: blank masking, zero diagonal, formula, delta scaling
   - compute_losses: None guards, column contract, value correctness
   - losses_to_dicts: None passthrough, zero anchor, MPH mapping, NaN fill
   - Excel style helpers: header_style, axis_style, thin_border, apply
@@ -36,6 +37,7 @@ from navigator_chart_helpers import (
     losses_to_dicts,
     matrix_stop_go,
     matrix_transition,
+    matrix_turn_compensation,
     matrix_turn_loss,
     thin_border,
 )
@@ -231,6 +233,71 @@ class TestMatrixTurnLoss:
         m20 = matrix_turn_loss(linear_accel, linear_decel, ref_mph=20)
         i, j = SPEEDS.index(30), SPEEDS.index(25)
         assert m15[i][j] != m20[i][j]
+
+
+# ── matrix_turn_compensation ──────────────────────────────────────────────────
+
+class TestMatrixTurnCompensation:
+    def test_entrance_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where in_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i, in_s in enumerate(SPEEDS):
+            for j in range(len(SPEEDS)):
+                if in_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_exit_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where out_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j, out_s in enumerate(SPEEDS):
+                if out_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_ref_diagonal_is_zero(self, linear_accel, linear_decel):
+        """At the reference speed on both sides, turn loss is zero so compensation is zero."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        i = j = SPEEDS.index(ref)
+        assert m[i][j] == pytest.approx(0.0)
+
+    def test_general_cell_formula(self, linear_accel, linear_decel):
+        """compensation = turn_loss * out_s / delta_mph."""
+        ref, delta = 20, 5
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        in_s, out_s = 30, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss = (
+            (linear_decel[in_s] - linear_decel[ref])
+            + (linear_accel[out_s] - linear_accel[ref])
+        )
+        expected = loss * out_s / delta
+        assert m[i][j] == pytest.approx(expected)
+
+    def test_larger_delta_gives_smaller_compensation(self, linear_accel, linear_decel):
+        """Higher overspeed means fewer seconds needed to recover."""
+        ref = 20
+        m5 = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        m10 = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=10)
+        in_s, out_s = 35, 30
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        assert m5[i][j] > m10[i][j]
+
+    def test_compensation_matches_turn_loss_matrix_masking(self, linear_accel, linear_decel):
+        """Blank pattern matches matrix_turn_loss for the same ref_mph."""
+        ref = 15
+        mc = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                assert (mc[i][j] is BLANK) == (ml[i][j] is BLANK)
+
+    def test_shape(self, linear_accel, linear_decel):
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=15, delta_mph=5)
+        assert len(m) == len(SPEEDS)
+        assert all(len(row) == len(SPEEDS) for row in m)
 
 
 # ── compute_losses ────────────────────────────────────────────────────────────

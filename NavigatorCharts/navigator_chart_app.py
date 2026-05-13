@@ -32,6 +32,7 @@ from navigator_chart_helpers import (
     losses_to_dicts,
     matrix_stop_go,
     matrix_transition,
+    matrix_turn_compensation,
     matrix_turn_loss,
 )
 
@@ -51,11 +52,13 @@ def build_combined_export_bytes(
     accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
     accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
     color_scale=True,
+    delta_mph=5,
 ):
     wb = build_combined_workbook(
         accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
         accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
         color_scale=color_scale,
+        delta_mph=delta_mph,
     )
     buf = io.BytesIO()
     wb.save(buf)
@@ -414,8 +417,8 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
     return "".join(h)
 
 
-def render_matrix_html(accel, decel, color_scale=True):
-    """Render all four reference matrices as styled HTML tables."""
+def render_matrix_html(accel, decel, color_scale=True, delta_mph=5):
+    """Render all six reference matrices as styled HTML tables."""
     if accel is None:
         st.caption("Insufficient data to build matrices.")
         return
@@ -424,6 +427,8 @@ def render_matrix_html(accel, decel, color_scale=True):
     m2 = matrix_stop_go(accel, decel)
     m3 = matrix_turn_loss(accel, decel, ref_mph=15)
     m4 = matrix_turn_loss(accel, decel, ref_mph=20)
+    m5 = matrix_turn_compensation(accel, decel, ref_mph=15, delta_mph=delta_mph)
+    m6 = matrix_turn_compensation(accel, decel, ref_mph=20, delta_mph=delta_mph)
 
     html = '<div style="overflow-x:auto;">'
     html += matrix_html(
@@ -462,6 +467,30 @@ def render_matrix_html(accel, decel, color_scale=True):
         hide_zero_axis=True,
         color_scale=color_scale,
     )
+    html += matrix_html(
+        m5,
+        title=f"5.  Turn Loss Recovery at 15 mph ref — drive +{delta_mph} mph for N seconds",
+        subtitle=(
+            f"After turn, hold exit+{delta_mph} mph for this many seconds to get back on schedule "
+            "· blank where In or Out < 15 mph"
+        ),
+        c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
+        mid_value=0.0,
+        hide_zero_axis=True,
+        color_scale=color_scale,
+    )
+    html += matrix_html(
+        m6,
+        title=f"6.  Turn Loss Recovery at 20 mph ref — drive +{delta_mph} mph for N seconds",
+        subtitle=(
+            f"After turn, hold exit+{delta_mph} mph for this many seconds to get back on schedule "
+            "· blank where In or Out < 20 mph"
+        ),
+        c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
+        mid_value=0.0,
+        hide_zero_axis=True,
+        color_scale=color_scale,
+    )
     html += '</div>'
     st.markdown(html, unsafe_allow_html=True)
 
@@ -479,6 +508,12 @@ with st.sidebar:
         "Auto-exclude runs", min_value=0, max_value=15, value=3,
         help="Greedy degree-2 polynomial fit selects which runs to exclude. "
              "6 is a good default — gives smooth curves with minimal data loss.",
+    )
+
+    delta_mph = st.slider(
+        "Compensation overspeed (mph)", min_value=1, max_value=15, value=5,
+        help="After a turn, how many mph over exit speed the driver holds to recover the "
+             "lost time. Used for the Turn Loss Recovery matrices (5 & 6).",
     )
 
     all_dates = sorted(df_all["date"].unique(), reverse=True)
@@ -593,6 +628,7 @@ with tab_charts:
                 accel_all, decel_all, losses_all, ca_all, cd_all, df_visible,
                 accel_filt_fit, decel_filt_fit, losses_filt, ca_filt, cd_filt, df_all_with_excl,
                 color_scale=use_color_scale,
+                delta_mph=delta_mph,
             ),
             file_name=f"{_ts}_navigator_charts.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -606,11 +642,12 @@ with tab_charts:
 
     with col_charts_all:
         st.subheader("All Data")
-        render_matrix_html(accel_all, decel_all, color_scale=use_color_scale)
+        render_matrix_html(accel_all, decel_all, color_scale=use_color_scale, delta_mph=delta_mph)
 
     with col_charts_filt:
         st.subheader(filt_label)
-        render_matrix_html(accel_filt_fit, decel_filt_fit, color_scale=use_color_scale)
+        render_matrix_html(accel_filt_fit, decel_filt_fit, color_scale=use_color_scale,
+                           delta_mph=delta_mph)
 
 # ── Tab: Methodology ──────────────────────────────────────────────────────────
 
