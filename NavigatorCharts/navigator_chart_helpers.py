@@ -186,8 +186,8 @@ _ROW_H      = 42   # uniform row height for all data rows (px) — 50% taller th
 _COL_W_LBL  = 14   # label column width (col A)
 _COL_W_DATA = 11   # data column width (cols B-J)
 
-BLACK_FILL = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
-BLACK_FONT = Font(color="000000", size=12)
+BLACK_FILL = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+BLACK_FONT = Font(color="D9D9D9", size=12)  # grey-on-grey: values present but visually suppressed
 
 
 def header_style(bold=True):
