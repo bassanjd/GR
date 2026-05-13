@@ -700,6 +700,38 @@ with tab_charts:
 
 with tab_method:
     st.markdown("""
+## Compensation Stopwatch — When to Start and Stop
+
+After a turn, the driver holds the compensation speed (exit speed + Δ mph) for the number
+of seconds shown in the bottom line of the turn chart cell. Here is exactly when the
+navigator works the stopwatch:
+
+| Moment | Navigator action |
+|---|---|
+| Turn exit is clear, driver begins accelerating | **Start stopwatch** |
+| Comp seconds elapsed | **Call "back"** → driver begins returning to exit speed |
+| Driver settles at exit speed | Clock is already stopped — no further action |
+
+**Start the stopwatch** the moment the turn exit is clear and the driver begins
+accelerating above the target exit speed — not after the compensation speed is
+reached. Starting at the onset of acceleration captures the full recovery window,
+since the car is already gaining distance on the ideal pace from the first extra
+foot-second of speed above the exit speed.
+
+**Stop the stopwatch / call "back"** when comp_s seconds have elapsed. At that
+signal the driver begins decelerating back to the target exit speed. That
+deceleration happens *after* the timer, not before.
+
+The formula `comp_s = loss_s × exit_mph ÷ Δmph` assumes a theoretical square-wave
+profile — instantaneous jump to comp speed, hold it, instantaneous return. Real life
+has a ramp up and a ramp down. Starting the clock at the *beginning* of acceleration
+(rather than after comp speed is reached) includes the ramp-up; stopping the clock at
+the *start* of the return excludes the ramp-down. Because the ramp-down at 5 mph over
+for a second or two runs slightly in your favor, the net error is small and conservative
+— you will slightly over-recover rather than under-recover.
+
+---
+
 ## About This App
 
 This app processes timed calibration runs to produce the **navigator charts**
