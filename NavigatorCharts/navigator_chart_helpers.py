@@ -177,7 +177,7 @@ def losses_to_dicts(losses):
 
 C_HEADER_BG = "1F4E79"
 C_HEADER_FG = "FFFFFF"
-C_AXIS_BG   = "2E75B6"
+C_AXIS_BG   = "1F4E79"
 C_AXIS_FG   = "FFFFFF"
 C_TITLE_BG  = "D6E4F0"
 C_BORDER    = "9DC3E6"
