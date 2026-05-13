@@ -32,6 +32,7 @@ from navigator_chart_helpers import (
     losses_to_dicts,
     matrix_stop_go,
     matrix_transition,
+    matrix_turn_combined,
     matrix_turn_compensation,
     matrix_turn_loss,
 )
@@ -417,18 +418,77 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
     return "".join(h)
 
 
+def matrix_combined_html(matrix, title, subtitle, delta_mph,
+                         c_lo, c_mid, c_hi, mid_value, color_scale=True):
+    """HTML string for a combined turn loss + compensation matrix.
+
+    Each cell shows two lines: loss (top, larger) and compensation (bottom, smaller).
+    Color scale maps to the loss value only.  Zero row/column hidden (black-on-black).
+    """
+    visible_loss = [
+        val[0]
+        for i, row in enumerate(matrix) if i > 0
+        for j, val in enumerate(row) if j > 0 and val is not None
+    ]
+    vmin = min(visible_loss) if visible_loss else 0.0
+    vmax = max(visible_loss) if visible_loss else 1.0
+    vmid = max(vmin, min(vmax, mid_value))
+
+    n = len(SPEEDS)
+    h = [f'<table style="border-collapse:collapse;'
+         f'font-family:Calibri,Arial,sans-serif;margin-bottom:20px;">']
+    h.append(f'<tr><td colspan="{n+1}" style="{_S_TITLE}">{title}</td></tr>')
+    h.append(f'<tr><td colspan="{n+1}" style="{_S_SUB}">{subtitle}</td></tr>')
+
+    h.append('<tr>')
+    h.append(f'<td style="{_S_CORNER}">In ↓&nbsp;&nbsp;Out →</td>')
+    for j, spd in enumerate(SPEEDS):
+        s = _S_BLACK if j == 0 else _S_HDR
+        h.append(f'<td style="{s}">{spd}</td>')
+    h.append('</tr>')
+
+    for i, in_spd in enumerate(SPEEDS):
+        zero_row = (i == 0)
+        h.append('<tr>')
+        h.append(f'<td style="{_S_BLACK if zero_row else _S_AXIS}">{in_spd}</td>')
+        for j, val in enumerate(matrix[i]):
+            zero_col = (j == 0)
+            if zero_row or zero_col:
+                h.append(f'<td style="{_S_BLACK}"></td>')
+            elif val is None:
+                h.append(f'<td style="{_S_BLANK}"></td>')
+            else:
+                loss, comp = val
+                if color_scale:
+                    bg = _scale_color(loss, vmin, vmid, vmax, c_lo, c_mid, c_hi)
+                    fg = "000000" if _luminance(bg) > 140 else "FFFFFF"
+                else:
+                    bg, fg = "F2F2F2", "000000"
+                comp_color = "#444" if fg == "000000" else "#DDD"
+                s = (f"background:#{bg};color:#{fg};font-size:10px;"
+                     f"text-align:center;padding:3px 6px;border:1px solid #9DC3E6;"
+                     f"line-height:1.5;")
+                cell_html = (
+                    f'<span style="font-size:11px;font-weight:bold">{loss:.1f}s</span>'
+                    f'<br><span style="font-size:9px;color:{comp_color}">↑{comp:.0f}s</span>'
+                )
+                h.append(f'<td style="{s}">{cell_html}</td>')
+        h.append('</tr>')
+
+    h.append('</table>')
+    return "".join(h)
+
+
 def render_matrix_html(accel, decel, color_scale=True, delta_mph=5):
-    """Render all six reference matrices as styled HTML tables."""
+    """Render all four reference matrices as styled HTML tables."""
     if accel is None:
         st.caption("Insufficient data to build matrices.")
         return
 
     m1 = matrix_transition(accel, decel)
     m2 = matrix_stop_go(accel, decel)
-    m3 = matrix_turn_loss(accel, decel, ref_mph=15)
-    m4 = matrix_turn_loss(accel, decel, ref_mph=20)
-    m5 = matrix_turn_compensation(accel, decel, ref_mph=15, delta_mph=delta_mph)
-    m6 = matrix_turn_compensation(accel, decel, ref_mph=20, delta_mph=delta_mph)
+    m3 = matrix_turn_combined(accel, decel, ref_mph=15, delta_mph=delta_mph)
+    m4 = matrix_turn_combined(accel, decel, ref_mph=20, delta_mph=delta_mph)
 
     html = '<div style="overflow-x:auto;">'
     html += matrix_html(
@@ -449,46 +509,22 @@ def render_matrix_html(accel, decel, color_scale=True, delta_mph=5):
         hide_zero_axis=True,
         color_scale=color_scale,
     )
-    html += matrix_html(
+    html += matrix_combined_html(
         m3,
-        title="3.  Turn Time Lost vs. 15 mph reference (seconds)",
-        subtitle="Extra seconds vs. In=15→15 · cells where In or Out < 15 mph are blank",
+        title=f"3.  Turn — 15 mph ref  ·  top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds",
+        subtitle="Blank where In or Out < 15 mph  ·  color scale on loss (top line)",
+        delta_mph=delta_mph,
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
-        hide_zero_axis=True,
         color_scale=color_scale,
     )
-    html += matrix_html(
+    html += matrix_combined_html(
         m4,
-        title="4.  Turn Time Lost vs. 20 mph reference (seconds)",
-        subtitle="Extra seconds vs. In=20→20 · cells where In or Out < 20 mph are blank",
+        title=f"4.  Turn — 20 mph ref  ·  top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds",
+        subtitle="Blank where In or Out < 20 mph  ·  color scale on loss (top line)",
+        delta_mph=delta_mph,
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
-        hide_zero_axis=True,
-        color_scale=color_scale,
-    )
-    html += matrix_html(
-        m5,
-        title=f"5.  Turn Loss Recovery at 15 mph ref — drive +{delta_mph} mph for N seconds",
-        subtitle=(
-            f"After turn, hold exit+{delta_mph} mph for this many seconds to get back on schedule "
-            "· blank where In or Out < 15 mph"
-        ),
-        c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
-        mid_value=0.0,
-        hide_zero_axis=True,
-        color_scale=color_scale,
-    )
-    html += matrix_html(
-        m6,
-        title=f"6.  Turn Loss Recovery at 20 mph ref — drive +{delta_mph} mph for N seconds",
-        subtitle=(
-            f"After turn, hold exit+{delta_mph} mph for this many seconds to get back on schedule "
-            "· blank where In or Out < 20 mph"
-        ),
-        c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
-        mid_value=0.0,
-        hide_zero_axis=True,
         color_scale=color_scale,
     )
     html += '</div>'

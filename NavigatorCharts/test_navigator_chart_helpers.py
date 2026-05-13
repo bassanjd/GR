@@ -37,6 +37,7 @@ from navigator_chart_helpers import (
     losses_to_dicts,
     matrix_stop_go,
     matrix_transition,
+    matrix_turn_combined,
     matrix_turn_compensation,
     matrix_turn_loss,
     thin_border,
@@ -233,6 +234,76 @@ class TestMatrixTurnLoss:
         m20 = matrix_turn_loss(linear_accel, linear_decel, ref_mph=20)
         i, j = SPEEDS.index(30), SPEEDS.index(25)
         assert m15[i][j] != m20[i][j]
+
+
+# ── matrix_turn_combined ─────────────────────────────────────────────────────
+
+class TestMatrixTurnCombined:
+    def test_shape(self, linear_accel, linear_decel):
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=20, delta_mph=5)
+        assert len(m) == len(SPEEDS)
+        assert all(len(row) == len(SPEEDS) for row in m)
+
+    def test_entrance_lt_ref_is_blank(self, linear_accel, linear_decel):
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i, in_s in enumerate(SPEEDS):
+            for j in range(len(SPEEDS)):
+                if in_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_exit_lt_ref_is_blank(self, linear_accel, linear_decel):
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j, out_s in enumerate(SPEEDS):
+                if out_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_blank_pattern_matches_turn_loss(self, linear_accel, linear_decel):
+        """BLANK cells must be identical to matrix_turn_loss at the same ref."""
+        ref = 15
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                assert (mc[i][j] is BLANK) == (ml[i][j] is BLANK)
+
+    def test_ref_diagonal_is_zero_tuple(self, linear_accel, linear_decel):
+        """At ref speed on both sides, loss and comp are both 0."""
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        i = j = SPEEDS.index(ref)
+        assert m[i][j] == pytest.approx((0.0, 0.0))
+
+    def test_loss_component_matches_turn_loss(self, linear_accel, linear_decel):
+        """First element of each tuple must equal matrix_turn_loss at the same index."""
+        ref = 20
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][0] == pytest.approx(ml[i][j])
+
+    def test_comp_component_matches_turn_compensation(self, linear_accel, linear_decel):
+        """Second element of each tuple must equal matrix_turn_compensation at the same index."""
+        ref, delta = 20, 5
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        mcomp = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][1] == pytest.approx(mcomp[i][j])
+
+    def test_larger_delta_reduces_comp(self, linear_accel, linear_decel):
+        """Higher overspeed delta → fewer seconds needed to recover."""
+        ref = 20
+        mc5  = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        mc10 = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=10)
+        in_s, out_s = 35, 30
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        assert mc5[i][j][1] > mc10[i][j][1]
 
 
 # ── matrix_turn_compensation ──────────────────────────────────────────────────
