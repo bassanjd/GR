@@ -475,3 +475,61 @@ def get_run_timing_refs(
     if exit_d is None and entry_d is not None:
         exit_d = entry_d + trap.dist_mi
     return entry_d, exit_d
+
+
+# ── Data loaders ──────────────────────────────────────────────────────────────
+
+def load_racebox(path: str) -> pd.DataFrame:
+    """Load a RaceBox parquet file and normalise to the standard internal schema.
+
+    RaceBox columns used:
+        Time      — ISO-8601 string (e.g. '2026-03-10T18:03:09.600')
+        Latitude  — decimal degrees
+        Longitude — decimal degrees
+        Speed     — mph (confirmed by GPS cross-check)
+
+    Derived columns added to match the standard schema:
+        Elapsed time (sec)  — seconds since first record
+        Distance (mi)       — cumulative haversine distance
+        Speed (mph)         — alias of Speed
+        Date                — date string (YYYY-MM-DD)
+    """
+    p  = Path(path)
+    df = pd.read_parquet(p)
+
+    df["_ts"] = pd.to_datetime(df["Time"])
+    df = df.sort_values("_ts").reset_index(drop=True)
+    df["Elapsed time (sec)"] = (df["_ts"] - df["_ts"].iloc[0]).dt.total_seconds()
+    df = df.drop_duplicates(subset="Elapsed time (sec)", keep="first").reset_index(drop=True)
+
+    # Replace zero lat/lon with NaN (GPS lock lost), then interpolate across dropouts
+    df.loc[df["Latitude"] == 0, "Latitude"]   = np.nan
+    df.loc[df["Longitude"] == 0, "Longitude"] = np.nan
+    df["Latitude"]  = df["Latitude"].interpolate()
+    df["Longitude"] = df["Longitude"].interpolate()
+
+    df["Distance (mi)"] = haversine_cumulative_mi(
+        df["Latitude"].to_numpy(), df["Longitude"].to_numpy()
+    )
+    df["Speed (mph)"] = df["Speed"]
+    df["Date"]        = df["_ts"].dt.strftime("%Y-%m-%d")
+    df = df.drop(columns=["_ts"])
+    return df.reset_index(drop=True)
+
+
+def load_speed_tracker(path: str) -> pd.DataFrame:
+    """Load a speed_tracker parquet or CSV and normalise to the standard schema.
+
+    Speed-tracker files are pre-processed and already carry the standard
+    columns (Elapsed time (sec), Distance (mi), Speed (mph), Latitude,
+    Longitude).  This function only sorts and deduplicates.
+    """
+    p = Path(path)
+    if p.suffix == ".parquet":
+        df = pd.read_parquet(p)
+    else:
+        df = pd.read_csv(p, skipinitialspace=True)
+        df.columns = df.columns.str.strip()
+    df = df.sort_values("Elapsed time (sec)")
+    df = df.drop_duplicates(subset="Elapsed time (sec)", keep="first")
+    return df.reset_index(drop=True)

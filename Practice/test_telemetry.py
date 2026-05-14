@@ -19,6 +19,8 @@ from telemetry import (
     find_crossing_dist,
     get_run_timing_refs,
     haversine_cumulative_mi,
+    load_racebox,
+    load_speed_tracker,
     run_finish_type,
     run_start_type,
     segment_exercise_runs,
