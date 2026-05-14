@@ -59,6 +59,63 @@ def matrix_turn_loss(accel, decel, ref_mph):
     return _build_matrix(f)
 
 
+def matrix_turn_compensation(accel, decel, ref_mph, delta_mph):
+    """Seconds to drive at (exit_speed + delta_mph) to recover the turn time loss.
+
+    Formula: compensation = turn_loss * exit_speed / delta_mph
+    Derived from: at exit_speed mph, driving delta_mph faster saves (delta_mph / exit_speed)
+    seconds for every second driven, so seconds_needed = turn_loss / (delta_mph / exit_speed).
+
+    Blank when entry or exit < ref_mph (same masking as matrix_turn_loss).
+    Zero when there is no turn loss (entry == exit == ref_mph).
+    """
+    def f(in_s, out_s):
+        if in_s < ref_mph or out_s < ref_mph:
+            return BLANK
+        loss = (decel[in_s] - decel[ref_mph]) + (accel[out_s] - accel[ref_mph])
+        if out_s == 0:
+            return BLANK
+        return loss * out_s / delta_mph
+    return _build_matrix(f)
+
+
+def matrix_transition_combined(accel, decel, delta_mph):
+    """Combined speed transition matrix: each cell is a (loss, comp) tuple, BLANK, or (loss, None).
+
+    loss = extra seconds for any speed change (same as matrix_transition).
+    comp = seconds to drive at exit_speed + delta_mph to recover the loss.
+    When out_s == 0 (stopping), comp is None — compensation is not applicable
+    because you can't drive faster after stopping; the Stop Sign matrix handles that.
+    Diagonal (no change) is BLANK.
+    """
+    def f(in_s, out_s):
+        if in_s == out_s:
+            return BLANK
+        if out_s > in_s:
+            loss = accel[out_s] - accel[in_s]
+        else:
+            loss = decel[in_s] - decel[out_s]
+        if out_s == 0:
+            return (loss, None)
+        return (loss, loss * out_s / delta_mph)
+    return _build_matrix(f)
+
+
+def matrix_turn_combined(accel, decel, ref_mph, delta_mph):
+    """Combined turn matrix: each cell is a (loss, comp) tuple, or BLANK.
+
+    loss = matrix_turn_loss value; comp = matrix_turn_compensation value.
+    Blank when in_s < ref_mph or out_s < ref_mph (same masking as both individual matrices).
+    """
+    def f(in_s, out_s):
+        if in_s < ref_mph or out_s < ref_mph:
+            return BLANK
+        loss = (decel[in_s] - decel[ref_mph]) + (accel[out_s] - accel[ref_mph])
+        comp = loss * out_s / delta_mph if out_s != 0 else 0.0
+        return (loss, comp)
+    return _build_matrix(f)
+
+
 # ── Data loading / loss computation ──────────────────────────────────────────
 
 def load_calibration_runs():
@@ -120,19 +177,23 @@ def losses_to_dicts(losses):
 
 C_HEADER_BG = "1F4E79"
 C_HEADER_FG = "FFFFFF"
-C_AXIS_BG   = "2E75B6"
+C_AXIS_BG   = "1F4E79"
 C_AXIS_FG   = "FFFFFF"
 C_TITLE_BG  = "D6E4F0"
 C_BORDER    = "9DC3E6"
 
-BLACK_FILL = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
-BLACK_FONT = Font(color="000000", size=10)
+_ROW_H      = 42   # uniform row height for all data rows (px) — 50% taller than original 28
+_COL_W_LBL  = 14   # label column width (col A)
+_COL_W_DATA = 11   # data column width (cols B-J)
+
+BLACK_FILL = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+BLACK_FONT = Font(color="D9D9D9", size=12)  # grey-on-grey: values present but visually suppressed
 
 
 def header_style(bold=True):
     return {
         "fill":      PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid"),
-        "font":      Font(color=C_HEADER_FG, bold=bold, size=10),
+        "font":      Font(color=C_HEADER_FG, bold=bold, size=24),
         "alignment": Alignment(horizontal="center", vertical="center"),
     }
 
@@ -140,7 +201,7 @@ def header_style(bold=True):
 def axis_style():
     return {
         "fill":      PatternFill(start_color=C_AXIS_BG, end_color=C_AXIS_BG, fill_type="solid"),
-        "font":      Font(color=C_AXIS_FG, bold=True, size=10),
+        "font":      Font(color=C_AXIS_FG, bold=True, size=24),
         "alignment": Alignment(horizontal="center", vertical="center"),
     }
 
@@ -170,21 +231,21 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
 
     # Title row
     title_cell = ws.cell(R, C, title)
-    title_cell.font = Font(bold=True, size=11, color="1F4E79")
+    title_cell.font = Font(bold=True, size=13, color="1F4E79")
     title_cell.fill = PatternFill(start_color=C_TITLE_BG, end_color=C_TITLE_BG, fill_type="solid")
     ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
     R += 1
 
     # Subtitle row
     sub_cell = ws.cell(R, C, subtitle)
-    sub_cell.font = Font(italic=True, size=9, color="595959")
+    sub_cell.font = Font(italic=True, size=11, color="595959")
     ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
     R += 1
 
     # Column headers
     corner = ws.cell(R, C, "In ↓  Out →")
     corner.fill = PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid")
-    corner.font = Font(color=C_HEADER_FG, bold=True, size=9)
+    corner.font = Font(color=C_HEADER_FG, bold=True, size=11)
     corner.alignment = Alignment(horizontal="center", vertical="center")
 
     for j, spd in enumerate(SPEEDS):
@@ -220,14 +281,15 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
                 cell.font = BLACK_FONT
                 if val is not BLANK:
                     cell.number_format = "0.0"
-                cell.alignment = Alignment(horizontal="center")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
             elif val is BLANK:
                 cell.value = None
                 cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
             else:
                 cell.value = round(val, 2)
                 cell.number_format = "0.0"
-                cell.alignment = Alignment(horizontal="center")
+                cell.font = Font(size=12)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = thin_border()
 
     data_end_row = R + n - 1
@@ -249,32 +311,166 @@ def write_matrix(ws, matrix, title, subtitle, top_row, left_col,
     return R + n  # next available row
 
 
-def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True):
+def _hex_to_rgb(h):
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _lerp_hex(c1, c2, t):
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r2, g2, b2 = _hex_to_rgb(c2)
+    return (f"{int(r1+t*(r2-r1)):02X}"
+            f"{int(g1+t*(g2-g1)):02X}"
+            f"{int(b1+t*(b2-b1)):02X}")
+
+
+def _tricolor_hex(val, vmin, vmid, vmax, lo, mid, hi):
+    """Return a hex background color using a tricolor scale."""
+    if vmax == vmin:
+        return mid
+    if val <= vmid:
+        t = (val - vmin) / (vmid - vmin) if vmid > vmin else 0.0
+        return _lerp_hex(lo, mid, max(0.0, min(1.0, t)))
+    t = (val - vmid) / (vmax - vmid) if vmax > vmid else 1.0
+    return _lerp_hex(mid, hi, max(0.0, min(1.0, t)))
+
+
+def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
+                               delta_mph, color_lo, color_mid, color_hi,
+                               mid_value=0.0, color_scale=True, hide_zero_axis=True):
+    """Write a combined loss + compensation matrix to the worksheet.
+
+    Each non-blank cell shows two lines: loss (top) and compensation (bottom).
+    When comp is None (e.g., out_s=0 in the transition matrix), only the loss
+    is shown on one centered line.
+    Color scale is based on the loss value only.
+    hide_zero_axis: paint the In=0 row and Out=0 column black-on-black (default True
+    for turn matrices; pass False for the speed transition matrix).
+    """
+    n = len(SPEEDS)
+    R, C = top_row, left_col
+
+    # Title row
+    title_cell = ws.cell(R, C, title)
+    title_cell.font = Font(bold=True, size=13, color="1F4E79")
+    title_cell.fill = PatternFill(start_color=C_TITLE_BG, end_color=C_TITLE_BG, fill_type="solid")
+    ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
+    R += 1
+
+    # Subtitle row
+    sub_cell = ws.cell(R, C, subtitle)
+    sub_cell.font = Font(italic=True, size=11, color="595959")
+    ws.merge_cells(start_row=R, start_column=C, end_row=R, end_column=C + n)
+    R += 1
+
+    # Column headers
+    corner = ws.cell(R, C, "In ↓  Out →")
+    corner.fill = PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid")
+    corner.font = Font(color=C_HEADER_FG, bold=True, size=11)
+    corner.alignment = Alignment(horizontal="center", vertical="center")
+    for j, spd in enumerate(SPEEDS):
+        cell = ws.cell(R, C + 1 + j, spd)
+        if hide_zero_axis and j == 0:
+            cell.fill = BLACK_FILL
+            cell.font = BLACK_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        else:
+            apply(cell, header_style())
+    R += 1
+
+    # Collect loss values for explicit color computation (exclude zero-axis rows/cols if hidden)
+    loss_vals = [
+        val[0]
+        for i, row in enumerate(matrix) if not (hide_zero_axis and i == 0)
+        for j, val in enumerate(row)
+        if not (hide_zero_axis and j == 0) and val is not BLANK and isinstance(val, tuple)
+    ]
+    if color_scale and loss_vals:
+        vmin = min(loss_vals)
+        vmax = max(loss_vals)
+        vmid = max(vmin, min(vmax, mid_value))
+    else:
+        vmin = vmax = vmid = 0.0
+
+    # Data rows
+    for i, in_spd in enumerate(SPEEDS):
+        zero_row = hide_zero_axis and i == 0
+
+        lbl = ws.cell(R + i, C, in_spd)
+        if zero_row:
+            lbl.fill = BLACK_FILL
+            lbl.font = BLACK_FONT
+            lbl.alignment = Alignment(horizontal="center", vertical="center")
+        else:
+            apply(lbl, axis_style())
+
+        for j, val in enumerate(matrix[i]):
+            cell = ws.cell(R + i, C + 1 + j)
+            zero_col = hide_zero_axis and j == 0
+
+            if zero_row or zero_col:
+                cell.fill = BLACK_FILL
+                cell.font = BLACK_FONT
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif val is BLANK:
+                cell.value = None
+                cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+            else:
+                loss, comp = val
+                if comp is None:
+                    cell.value = f"{loss:.1f}"
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    cell.value = f"{loss:.1f}\n{delta_mph}↑{comp:.1f}"
+                    cell.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+                if color_scale and loss_vals:
+                    bg = _tricolor_hex(loss, vmin, vmid, vmax, color_lo, color_mid, color_hi)
+                    r_c, g_c, b_c = _hex_to_rgb(bg)
+                    lum = 0.299 * r_c + 0.587 * g_c + 0.114 * b_c
+                    fg = "000000" if lum > 140 else "FFFFFF"
+                    cell.fill = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
+                    cell.font = Font(size=12, color=fg)
+                else:
+                    cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+                    cell.font = Font(size=12, color="000000")
+            cell.border = thin_border()
+
+    return R + n  # next available row
+
+
+def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True, delta_mph=5):
     """
     Write 4 reference matrices directly into an existing openpyxl worksheet.
+
+    Matrices 1 and 2 are single-value (speed transition and stop sign).
+    Matrices 3 and 4 are combined turn matrices: each cell shows the turn loss on
+    top and the recovery time (drive +delta_mph mph for N seconds) on the bottom.
+
     label: optional string appended to each matrix title.
+    delta_mph: overspeed increment for the combined turn matrices.
     """
-    ws.column_dimensions["A"].width = 10
+    ws.column_dimensions["A"].width = _COL_W_LBL
     for col in range(2, 11):
-        ws.column_dimensions[get_column_letter(col)].width = 8
-    for r in range(1, 80):
-        ws.row_dimensions[r].height = 16
+        ws.column_dimensions[get_column_letter(col)].width = _COL_W_DATA
+    for r in range(1, 110):
+        ws.row_dimensions[r].height = _ROW_H
 
     tag = f"  [{label}]" if label else ""
 
-    m1 = matrix_transition(accel, decel)
+    m1 = matrix_transition_combined(accel, decel, delta_mph=delta_mph)
     m2 = matrix_stop_go(accel, decel)
-    m3 = matrix_turn_loss(accel, decel, ref_mph=15)
-    m4 = matrix_turn_loss(accel, decel, ref_mph=20)
+    m3 = matrix_turn_combined(accel, decel, ref_mph=15, delta_mph=delta_mph)
+    m4 = matrix_turn_combined(accel, decel, ref_mph=20, delta_mph=delta_mph)
 
-    next_row = write_matrix(
+    next_row = write_combined_turn_matrix(
         ws, m1,
-        title=f"1.  Speed Transition Time (seconds){tag}",
-        subtitle="Extra seconds vs. flying straight through · blank diagonal = no change",
+        title=f"1.  Speed Transition — top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds{tag}",
+        subtitle=f"Extra seconds vs. flying straight through · Out=0 col shows loss only (stopping, use Stop Sign chart to compensate)",
         top_row=1, left_col=1,
+        delta_mph=delta_mph,
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
         color_scale=color_scale,
+        hide_zero_axis=False,
     )
     next_row = write_matrix(
         ws, m2,
@@ -289,24 +485,24 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
         hide_zero_axis=True,
         color_scale=color_scale,
     )
-    next_row = write_matrix(
+    next_row = write_combined_turn_matrix(
         ws, m3,
-        title=f"3.  Turn Time Lost vs. 15 mph reference (seconds){tag}",
-        subtitle="Extra seconds vs. In=15→15 · cells where In or Out < 15 mph are blank",
+        title=f"3.  Turn — 15 mph ref  ·  top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds{tag}",
+        subtitle=f"Blank where In or Out < 15 mph  ·  color scale on loss (top line)",
         top_row=next_row + 2, left_col=1,
+        delta_mph=delta_mph,
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
-        hide_zero_axis=True,
         color_scale=color_scale,
     )
-    next_row = write_matrix(
+    next_row = write_combined_turn_matrix(
         ws, m4,
-        title=f"4.  Turn Time Lost vs. 20 mph reference (seconds){tag}",
-        subtitle="Extra seconds vs. In=20→20 · cells where In or Out < 20 mph are blank",
+        title=f"4.  Turn — 20 mph ref  ·  top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds{tag}",
+        subtitle=f"Blank where In or Out < 20 mph  ·  color scale on loss (top line)",
         top_row=next_row + 2, left_col=1,
+        delta_mph=delta_mph,
         color_lo="63BE7B", color_mid="FFEB84", color_hi="F8696B",
         mid_value=0.0,
-        hide_zero_axis=True,
         color_scale=color_scale,
     )
 
@@ -316,12 +512,13 @@ def write_reference_charts_to_sheet(ws, accel, decel, label="", color_scale=True
     note.font = Font(italic=True, size=8, color="808080")
 
 
-def build_reference_workbook(accel, decel, label="", color_scale=True):
+def build_reference_workbook(accel, decel, label="", color_scale=True, delta_mph=5):
     """Return a new openpyxl Workbook with 4 reference matrices (for in-memory export)."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Navigator Charts"
-    write_reference_charts_to_sheet(ws, accel, decel, label, color_scale=color_scale)
+    write_reference_charts_to_sheet(ws, accel, decel, label, color_scale=color_scale,
+                                    delta_mph=delta_mph)
     return wb
 
 
@@ -421,6 +618,7 @@ def build_combined_workbook(
     accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
     accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
     color_scale=True,
+    delta_mph=5,
 ):
     """Return a two-sheet workbook: All Data and Filtered, each with matrices + reference data."""
     wb = openpyxl.Workbook()
@@ -429,14 +627,14 @@ def build_combined_workbook(
     ws_all.title = "All Data"
     if accel_all is not None:
         write_reference_charts_to_sheet(ws_all, accel_all, decel_all, "all data",
-                                        color_scale=color_scale)
-        _write_reference_section(ws_all, 60, losses_all, ca_all, cd_all, df_all_runs, "All Data")
+                                        color_scale=color_scale, delta_mph=delta_mph)
+        _write_reference_section(ws_all, 65, losses_all, ca_all, cd_all, df_all_runs, "All Data")
 
     ws_filt = wb.create_sheet("Filtered")
     if accel_filt is not None:
         write_reference_charts_to_sheet(ws_filt, accel_filt, decel_filt, "filtered",
-                                        color_scale=color_scale)
-        _write_reference_section(ws_filt, 60, losses_filt, ca_filt, cd_filt, df_filt_runs,
+                                        color_scale=color_scale, delta_mph=delta_mph)
+        _write_reference_section(ws_filt, 65, losses_filt, ca_filt, cd_filt, df_filt_runs,
                                  "Filtered")
 
     return wb

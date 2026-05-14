@@ -31,7 +31,9 @@ from navigator_chart_helpers import (
     load_calibration_runs,
     losses_to_dicts,
     matrix_stop_go,
-    matrix_transition,
+    matrix_transition_combined,
+    matrix_turn_combined,
+    matrix_turn_compensation,
     matrix_turn_loss,
 )
 
@@ -51,11 +53,13 @@ def build_combined_export_bytes(
     accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
     accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
     color_scale=True,
+    delta_mph=5,
 ):
     wb = build_combined_workbook(
         accel_all, decel_all, losses_all, ca_all, cd_all, df_all_runs,
         accel_filt, decel_filt, losses_filt, ca_filt, cd_filt, df_filt_runs,
         color_scale=color_scale,
+        delta_mph=delta_mph,
     )
     buf = io.BytesIO()
     wb.save(buf)
@@ -347,19 +351,19 @@ def _luminance(hex_color):
 
 
 # Inline style strings matching Excel constants (C_HEADER_BG, C_AXIS_BG, etc.)
-_S_TITLE  = ("background:#D6E4F0;color:#1F4E79;font-weight:bold;font-size:12px;"
+_S_TITLE  = ("background:#D6E4F0;color:#1F4E79;font-weight:bold;font-size:14px;"
               "padding:5px 7px;")
-_S_SUB    = "color:#595959;font-style:italic;font-size:9px;padding:2px 7px 5px;"
-_S_CORNER = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:9px;"
-             "text-align:center;padding:3px 6px;border:1px solid #9DC3E6;"
+_S_SUB    = "color:#595959;font-style:italic;font-size:11px;padding:2px 7px 5px;"
+_S_CORNER = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:22px;"
+             "text-align:center;padding:4px 8px;border:1px solid #9DC3E6;"
              "white-space:nowrap;")
-_S_HDR    = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:10px;"
-             "text-align:center;padding:4px 10px;border:1px solid #9DC3E6;")
-_S_AXIS   = ("background:#2E75B6;color:#FFF;font-weight:bold;font-size:10px;"
-             "text-align:center;padding:4px 10px;border:1px solid #9DC3E6;")
-_S_BLANK  = "background:#D9D9D9;border:1px solid #9DC3E6;padding:4px 10px;"
-_S_BLACK  = ("background:#000;color:#000;font-size:10px;text-align:center;"
-             "padding:4px 10px;border:1px solid #333;")
+_S_HDR    = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:24px;"
+             "text-align:center;padding:5px 12px;min-width:52px;border:1px solid #9DC3E6;")
+_S_AXIS   = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:24px;"
+             "text-align:center;padding:5px 12px;min-width:52px;border:1px solid #9DC3E6;")
+_S_BLANK  = "background:#D9D9D9;border:1px solid #9DC3E6;padding:4px 8px;min-width:52px;"
+_S_BLACK  = ("background:#D9D9D9;color:#D9D9D9;font-size:12px;text-align:center;"
+             "padding:4px 8px;min-width:52px;border:1px solid #9DC3E6;")
 
 
 def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
@@ -390,7 +394,7 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
 
     for i, in_spd in enumerate(SPEEDS):
         zero_row = hide_zero_axis and i == 0
-        h.append('<tr>')
+        h.append('<tr style="height:52px">')
         h.append(f'<td style="{_S_BLACK if zero_row else _S_AXIS}">{in_spd}</td>')
         for j, val in enumerate(matrix[i]):
             zero_col = hide_zero_axis and j == 0
@@ -405,34 +409,106 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
                     fg = "000000" if _luminance(bg) > 140 else "FFFFFF"
                 else:
                     bg, fg = "F2F2F2", "000000"
-                s = (f"background:#{bg};color:#{fg};font-size:10px;"
-                     f"text-align:center;padding:4px 10px;border:1px solid #9DC3E6;")
-                h.append(f'<td style="{s}">{val:.1f}</td>')
+                s = (f"background:#{bg};color:#{fg};font-size:12px;"
+                     f"text-align:center;vertical-align:middle;padding:4px 8px;"
+                     f"min-width:52px;border:1px solid #9DC3E6;")
+                h.append(f'<td style="{s}"><span style="font-size:13px;font-weight:bold">{val:.1f}</span></td>')
         h.append('</tr>')
 
     h.append('</table>')
     return "".join(h)
 
 
-def render_matrix_html(accel, decel, color_scale=True):
+def matrix_combined_html(matrix, title, subtitle, delta_mph,
+                         c_lo, c_mid, c_hi, mid_value, color_scale=True,
+                         hide_zero_axis=True):
+    """HTML string for a combined loss + compensation matrix.
+
+    Each cell shows two lines: loss (top, larger) and compensation (bottom, smaller).
+    When comp is None (e.g., out_s=0 cells in the transition matrix), only loss is shown.
+    Color scale maps to the loss value only.
+    hide_zero_axis: paint In=0 row and Out=0 column black (True for turn matrices;
+    False for the speed transition matrix where zero speed is meaningful).
+    """
+    visible_loss = [
+        val[0]
+        for i, row in enumerate(matrix) if not (hide_zero_axis and i == 0)
+        for j, val in enumerate(row)
+        if not (hide_zero_axis and j == 0) and val is not None and isinstance(val, tuple)
+    ]
+    vmin = min(visible_loss) if visible_loss else 0.0
+    vmax = max(visible_loss) if visible_loss else 1.0
+    vmid = max(vmin, min(vmax, mid_value))
+
+    n = len(SPEEDS)
+    h = [f'<table style="border-collapse:collapse;'
+         f'font-family:Calibri,Arial,sans-serif;margin-bottom:20px;">']
+    h.append(f'<tr><td colspan="{n+1}" style="{_S_TITLE}">{title}</td></tr>')
+    h.append(f'<tr><td colspan="{n+1}" style="{_S_SUB}">{subtitle}</td></tr>')
+
+    h.append('<tr>')
+    h.append(f'<td style="{_S_CORNER}">In ↓&nbsp;&nbsp;Out →</td>')
+    for j, spd in enumerate(SPEEDS):
+        s = _S_BLACK if (hide_zero_axis and j == 0) else _S_HDR
+        h.append(f'<td style="{s}">{spd}</td>')
+    h.append('</tr>')
+
+    for i, in_spd in enumerate(SPEEDS):
+        zero_row = hide_zero_axis and i == 0
+        h.append('<tr style="height:52px">')
+        h.append(f'<td style="{_S_BLACK if zero_row else _S_AXIS}">{in_spd}</td>')
+        for j, val in enumerate(matrix[i]):
+            zero_col = hide_zero_axis and j == 0
+            if zero_row or zero_col:
+                h.append(f'<td style="{_S_BLACK}"></td>')
+            elif val is None:
+                h.append(f'<td style="{_S_BLANK}"></td>')
+            else:
+                loss, comp = val
+                if color_scale:
+                    bg = _scale_color(loss, vmin, vmid, vmax, c_lo, c_mid, c_hi)
+                    fg = "000000" if _luminance(bg) > 140 else "FFFFFF"
+                else:
+                    bg, fg = "F2F2F2", "000000"
+                comp_color = "#444" if fg == "000000" else "#DDD"
+                s = (f"background:#{bg};color:#{fg};font-size:12px;"
+                     f"text-align:center;vertical-align:middle;padding:4px 8px;"
+                     f"min-width:52px;border:1px solid #9DC3E6;line-height:1.5;")
+                if comp is None:
+                    cell_html = f'<span style="font-size:13px;font-weight:bold">{loss:.1f}</span>'
+                else:
+                    cell_html = (
+                        f'<span style="font-size:13px;font-weight:bold">{loss:.1f}</span>'
+                        f'<br><span style="font-size:11px;color:{comp_color}">{delta_mph}↑{comp:.1f}</span>'
+                    )
+                h.append(f'<td style="{s}">{cell_html}</td>')
+        h.append('</tr>')
+
+    h.append('</table>')
+    return "".join(h)
+
+
+def render_matrix_html(accel, decel, color_scale=True, delta_mph=5):
     """Render all four reference matrices as styled HTML tables."""
     if accel is None:
         st.caption("Insufficient data to build matrices.")
         return
 
-    m1 = matrix_transition(accel, decel)
+    m1 = matrix_transition_combined(accel, decel, delta_mph=delta_mph)
     m2 = matrix_stop_go(accel, decel)
-    m3 = matrix_turn_loss(accel, decel, ref_mph=15)
-    m4 = matrix_turn_loss(accel, decel, ref_mph=20)
+    m3 = matrix_turn_combined(accel, decel, ref_mph=15, delta_mph=delta_mph)
+    m4 = matrix_turn_combined(accel, decel, ref_mph=20, delta_mph=delta_mph)
 
     html = '<div style="overflow-x:auto;">'
-    html += matrix_html(
+    html += matrix_combined_html(
         m1,
-        title="1.  Speed Transition Time (seconds)",
-        subtitle="Extra seconds vs. flying straight through · blank diagonal = no change",
+        title=f"1.  Speed Transition — top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds",
+        subtitle="Extra seconds vs. flying straight through · Out=0 col shows loss only (use Stop Sign chart for compensation after stopping)",
+        delta_mph=delta_mph,
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
         color_scale=color_scale,
+        hide_zero_axis=False,
     )
     html += matrix_html(
         m2,
@@ -444,22 +520,22 @@ def render_matrix_html(accel, decel, color_scale=True):
         hide_zero_axis=True,
         color_scale=color_scale,
     )
-    html += matrix_html(
+    html += matrix_combined_html(
         m3,
-        title="3.  Turn Time Lost vs. 15 mph reference (seconds)",
-        subtitle="Extra seconds vs. In=15→15 · cells where In or Out < 15 mph are blank",
+        title=f"3.  Turn — 15 mph ref  ·  top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds",
+        subtitle="Blank where In or Out < 15 mph  ·  color scale on loss (top line)",
+        delta_mph=delta_mph,
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
-        hide_zero_axis=True,
         color_scale=color_scale,
     )
-    html += matrix_html(
+    html += matrix_combined_html(
         m4,
-        title="4.  Turn Time Lost vs. 20 mph reference (seconds)",
-        subtitle="Extra seconds vs. In=20→20 · cells where In or Out < 20 mph are blank",
+        title=f"4.  Turn — 20 mph ref  ·  top: seconds lost  ·  bottom: drive +{delta_mph} mph for N seconds",
+        subtitle="Blank where In or Out < 20 mph  ·  color scale on loss (top line)",
+        delta_mph=delta_mph,
         c_lo="63BE7B", c_mid="FFEB84", c_hi="F8696B",
         mid_value=0.0,
-        hide_zero_axis=True,
         color_scale=color_scale,
     )
     html += '</div>'
@@ -479,6 +555,12 @@ with st.sidebar:
         "Auto-exclude runs", min_value=0, max_value=15, value=3,
         help="Greedy degree-2 polynomial fit selects which runs to exclude. "
              "6 is a good default — gives smooth curves with minimal data loss.",
+    )
+
+    delta_mph = st.slider(
+        "Compensation overspeed (mph)", min_value=1, max_value=15, value=5,
+        help="After a turn, how many mph over exit speed the driver holds to recover the "
+             "lost time. Used for the Turn Loss Recovery matrices (5 & 6).",
     )
 
     all_dates = sorted(df_all["date"].unique(), reverse=True)
@@ -544,7 +626,7 @@ accel_all,  decel_all  = losses_to_dicts(losses_all)
 losses_filt = compute_losses(df_kept)
 accel_filt, decel_filt = losses_to_dicts(losses_filt)
 
-filt_label = f"Filtered ({n_excl} excluded)" if n_excl else "Filtered (none excluded)"
+filt_label = f"Filtered & curve-fit ({n_excl} excluded)" if n_excl else "Filtered & curve-fit (none excluded)"
 
 # ── Fit coefficients (used in both Summary tab and export) ────────────────────
 
@@ -593,6 +675,7 @@ with tab_charts:
                 accel_all, decel_all, losses_all, ca_all, cd_all, df_visible,
                 accel_filt_fit, decel_filt_fit, losses_filt, ca_filt, cd_filt, df_all_with_excl,
                 color_scale=use_color_scale,
+                delta_mph=delta_mph,
             ),
             file_name=f"{_ts}_navigator_charts.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -606,20 +689,62 @@ with tab_charts:
 
     with col_charts_all:
         st.subheader("All Data")
-        render_matrix_html(accel_all, decel_all, color_scale=use_color_scale)
+        render_matrix_html(accel_all, decel_all, color_scale=use_color_scale, delta_mph=delta_mph)
 
     with col_charts_filt:
         st.subheader(filt_label)
-        render_matrix_html(accel_filt_fit, decel_filt_fit, color_scale=use_color_scale)
+        render_matrix_html(accel_filt_fit, decel_filt_fit, color_scale=use_color_scale,
+                           delta_mph=delta_mph)
 
 # ── Tab: Methodology ──────────────────────────────────────────────────────────
 
 with tab_method:
     st.markdown("""
+## Compensation Stopwatch — When to Start and Stop
+
+After a turn, the driver holds the compensation speed (exit speed + Δ mph) for the number
+of seconds shown in the bottom line of the turn chart cell. Here is exactly when the
+navigator works the stopwatch:
+
+| Moment | Navigator action |
+|---|---|
+| Turn exit is complete and at target exitspeed, driver begins accelerating | **Start stopwatch** |
+| Compensation seconds elapsed | **Call "back"** → driver begins returning to exit speed |
+| Driver settles at exit speed | Clock is already stopped — no further action |
+
+**Start the stopwatch** the moment the turn exit is complete and when the driver begins
+accelerating above the target exit speed — not after the compensation speed is
+reached. Starting at the onset of acceleration captures the full recovery window,
+since the car is already gaining distance on the ideal pace from the first extra
+foot-second of speed above the exit speed.
+
+**Stop the stopwatch / call "back"** when the compensation time has elapsed. At that
+signal the driver begins decelerating back to the target exit speed. That
+deceleration happens *after* the timer, not before.
+
+**Formula derivation**: After a turn costs `loss` extra seconds, the car that flew
+straight through has traveled `exit_mph × loss / 3600` extra miles. Driving `Δmph`
+faster closes that gap at `Δmph / 3600` miles per second, so:
+
+```
+comp_s = gap_miles / closing_rate = (exit_mph × loss / 3600) / (Δmph / 3600)
+       = loss × exit_mph / Δmph
+```
+
+The formula assumes a theoretical square-wave profile — instantaneous jump to
+compensation speed, hold it, instantaneous return. Real life has a ramp up and a ramp
+down. Starting the clock at the *beginning* of acceleration (rather than after
+compensation speed is reached) includes the ramp-up; stopping the clock at the *start*
+of the return excludes the ramp-down. Because the ramp-down at 5 mph over for a second
+or two runs slightly in your favor, the net error is small and conservative — you will
+slightly over-recover rather than under-recover.
+
+---
+
 ## About This App
 
 This app processes timed calibration runs to produce the **navigator charts**
-used in-car during the Great Race. The charts give the navigator a lookup table showing
+used in-car during the race. The charts give the navigator a lookup table showing
 how many seconds are gained or lost whenever the car changes speed — for example,
 accelerating from a stop sign to cruise speed, or slowing from 45 mph to make a turn.
 

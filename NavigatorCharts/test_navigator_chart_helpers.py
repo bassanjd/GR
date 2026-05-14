@@ -6,6 +6,13 @@ Covers:
   - matrix_transition: diagonal blanks, accel/decel branches
   - matrix_stop_go: corner blank, from-stop, to-stop, mid-cell formula
   - matrix_turn_loss: corner blank, raw-cost rows/cols, reference-zero diagonal
+  - matrix_turn_compensation: blank masking, zero diagonal, formula, delta scaling,
+      physical gap-closing derivation
+  - matrix_transition_combined: diagonal BLANK, loss=transition loss, stop-column
+      comp=None, from-stop comp=numeric, formula, delta scaling, comp non-negative,
+      physical gap-closing derivation
+  - matrix_turn_combined: shape, blank masking, zero diagonal tuple, loss matches
+      turn_loss, comp matches turn_compensation, delta scaling, physical derivation
   - compute_losses: None guards, column contract, value correctness
   - losses_to_dicts: None passthrough, zero anchor, MPH mapping, NaN fill
   - Excel style helpers: header_style, axis_style, thin_border, apply
@@ -36,6 +43,9 @@ from navigator_chart_helpers import (
     losses_to_dicts,
     matrix_stop_go,
     matrix_transition,
+    matrix_transition_combined,
+    matrix_turn_combined,
+    matrix_turn_compensation,
     matrix_turn_loss,
     thin_border,
 )
@@ -98,6 +108,89 @@ class TestBuildMatrix:
         m = _build_matrix(lambda i, o: None)
         assert isinstance(m, list)
         assert isinstance(m[0], list)
+
+
+# ── matrix_transition_combined ───────────────────────────────────────────────
+
+class TestMatrixTransitionCombined:
+    def test_diagonal_is_blank(self, linear_accel, linear_decel):
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            assert m[i][i] is BLANK
+
+    def test_values_always_non_negative(self, linear_accel, linear_decel):
+        """Every speed change costs extra time — no negative losses."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if m[i][j] is not BLANK:
+                    assert m[i][j][0] >= 0.0
+
+    def test_loss_matches_matrix_transition(self, linear_accel, linear_decel):
+        """Loss component must agree with matrix_transition at every non-diagonal cell."""
+        mc = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        mt = matrix_transition(linear_accel, linear_decel)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][0] == pytest.approx(mt[i][j])
+
+    def test_stop_column_comp_is_none(self, linear_accel, linear_decel):
+        """Out=0 cells (stopping) return (loss, None) — compensation not applicable."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        j = SPEEDS.index(0)
+        for i, in_s in enumerate(SPEEDS):
+            if in_s != 0:
+                assert m[i][j] is not BLANK
+                assert m[i][j][1] is None
+
+    def test_from_stop_comp_is_numeric(self, linear_accel, linear_decel):
+        """In=0 cells (starting from stop) have a numeric compensation."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        i = SPEEDS.index(0)
+        for j, out_s in enumerate(SPEEDS):
+            if out_s != 0:
+                assert m[i][j] is not BLANK
+                assert isinstance(m[i][j][1], float)
+
+    def test_comp_formula(self, linear_accel, linear_decel):
+        """comp = loss * out_s / delta_mph for non-zero exit speed cells."""
+        delta = 5
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=delta)
+        mt = matrix_transition(linear_accel, linear_decel)
+        in_s, out_s = 20, 40
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        expected_comp = mt[i][j] * out_s / delta
+        assert m[i][j][1] == pytest.approx(expected_comp)
+
+    def test_larger_delta_reduces_comp(self, linear_accel, linear_decel):
+        """Higher overspeed delta → fewer recovery seconds."""
+        mc5  = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        mc10 = matrix_transition_combined(linear_accel, linear_decel, delta_mph=10)
+        i, j = SPEEDS.index(20), SPEEDS.index(40)
+        assert mc5[i][j][1] > mc10[i][j][1]
+
+    def test_comp_nonnegative_for_nonzero_exit(self, linear_accel, linear_decel):
+        """Compensation is always >= 0 — you can only recover, not go back in time."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if m[i][j] is not BLANK:
+                    _, comp = m[i][j]
+                    if comp is not None:
+                        assert comp >= 0.0
+
+    def test_comp_physical_derivation(self, linear_accel, linear_decel):
+        """gap_miles / closing_rate_mps matches formula for a speed-change transition."""
+        delta = 7
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=delta)
+        in_s, out_s = 15, 45
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss, comp = m[i][j]
+        gap_miles = out_s * loss / 3600.0
+        closing_rate_miles_per_s = delta / 3600.0
+        expected = gap_miles / closing_rate_miles_per_s
+        assert comp == pytest.approx(expected)
 
 
 # ── matrix_transition ─────────────────────────────────────────────────────────
@@ -231,6 +324,173 @@ class TestMatrixTurnLoss:
         m20 = matrix_turn_loss(linear_accel, linear_decel, ref_mph=20)
         i, j = SPEEDS.index(30), SPEEDS.index(25)
         assert m15[i][j] != m20[i][j]
+
+
+# ── matrix_turn_combined ─────────────────────────────────────────────────────
+
+class TestMatrixTurnCombined:
+    def test_shape(self, linear_accel, linear_decel):
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=20, delta_mph=5)
+        assert len(m) == len(SPEEDS)
+        assert all(len(row) == len(SPEEDS) for row in m)
+
+    def test_entrance_lt_ref_is_blank(self, linear_accel, linear_decel):
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i, in_s in enumerate(SPEEDS):
+            for j in range(len(SPEEDS)):
+                if in_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_exit_lt_ref_is_blank(self, linear_accel, linear_decel):
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j, out_s in enumerate(SPEEDS):
+                if out_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_blank_pattern_matches_turn_loss(self, linear_accel, linear_decel):
+        """BLANK cells must be identical to matrix_turn_loss at the same ref."""
+        ref = 15
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                assert (mc[i][j] is BLANK) == (ml[i][j] is BLANK)
+
+    def test_ref_diagonal_is_zero_tuple(self, linear_accel, linear_decel):
+        """At ref speed on both sides, loss and comp are both 0."""
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        i = j = SPEEDS.index(ref)
+        assert m[i][j] == pytest.approx((0.0, 0.0))
+
+    def test_loss_component_matches_turn_loss(self, linear_accel, linear_decel):
+        """First element of each tuple must equal matrix_turn_loss at the same index."""
+        ref = 20
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][0] == pytest.approx(ml[i][j])
+
+    def test_comp_component_matches_turn_compensation(self, linear_accel, linear_decel):
+        """Second element of each tuple must equal matrix_turn_compensation at the same index."""
+        ref, delta = 20, 5
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        mcomp = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][1] == pytest.approx(mcomp[i][j])
+
+    def test_larger_delta_reduces_comp(self, linear_accel, linear_decel):
+        """Higher overspeed delta → fewer seconds needed to recover."""
+        ref = 20
+        mc5  = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        mc10 = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=10)
+        in_s, out_s = 35, 30
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        assert mc5[i][j][1] > mc10[i][j][1]
+
+    def test_comp_physical_derivation(self, linear_accel, linear_decel):
+        """Validate turn combined comp via gap-closing physics (independent of formula)."""
+        ref, delta = 20, 7
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        in_s, out_s = 35, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss, comp = mc[i][j]
+        gap_miles = out_s * loss / 3600.0
+        closing_rate_miles_per_s = delta / 3600.0
+        expected = gap_miles / closing_rate_miles_per_s
+        assert comp == pytest.approx(expected)
+
+
+# ── matrix_turn_compensation ──────────────────────────────────────────────────
+
+class TestMatrixTurnCompensation:
+    def test_entrance_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where in_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i, in_s in enumerate(SPEEDS):
+            for j in range(len(SPEEDS)):
+                if in_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_exit_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where out_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j, out_s in enumerate(SPEEDS):
+                if out_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_ref_diagonal_is_zero(self, linear_accel, linear_decel):
+        """At the reference speed on both sides, turn loss is zero so compensation is zero."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        i = j = SPEEDS.index(ref)
+        assert m[i][j] == pytest.approx(0.0)
+
+    def test_general_cell_formula(self, linear_accel, linear_decel):
+        """compensation = turn_loss * out_s / delta_mph."""
+        ref, delta = 20, 5
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        in_s, out_s = 30, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss = (
+            (linear_decel[in_s] - linear_decel[ref])
+            + (linear_accel[out_s] - linear_accel[ref])
+        )
+        expected = loss * out_s / delta
+        assert m[i][j] == pytest.approx(expected)
+
+    def test_larger_delta_gives_smaller_compensation(self, linear_accel, linear_decel):
+        """Higher overspeed means fewer seconds needed to recover."""
+        ref = 20
+        m5 = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        m10 = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=10)
+        in_s, out_s = 35, 30
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        assert m5[i][j] > m10[i][j]
+
+    def test_compensation_matches_turn_loss_matrix_masking(self, linear_accel, linear_decel):
+        """Blank pattern matches matrix_turn_loss for the same ref_mph."""
+        ref = 15
+        mc = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                assert (mc[i][j] is BLANK) == (ml[i][j] is BLANK)
+
+    def test_shape(self, linear_accel, linear_decel):
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=15, delta_mph=5)
+        assert len(m) == len(SPEEDS)
+        assert all(len(row) == len(SPEEDS) for row in m)
+
+    def test_physical_gap_closing_derivation(self, linear_accel, linear_decel):
+        """Validate from first principles: gap_miles / closing_rate_mps == formula.
+
+        After a turn you're 'loss' seconds late.  The ideal car (flying straight at
+        exit_speed) has traveled exit_speed * loss / 3600 miles ahead.  Driving
+        delta_mph faster closes that gap at delta_mph / 3600 miles per second, so
+        compensation = (exit_speed * loss / 3600) / (delta_mph / 3600)
+                     = loss * exit_speed / delta_mph.
+        """
+        ref, delta = 20, 5
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        in_s, out_s = 30, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss = ((linear_decel[in_s] - linear_decel[ref])
+                + (linear_accel[out_s] - linear_accel[ref]))
+        gap_miles = out_s * loss / 3600.0
+        closing_rate_miles_per_s = delta / 3600.0
+        expected = gap_miles / closing_rate_miles_per_s
+        assert m[i][j] == pytest.approx(expected)
 
 
 # ── compute_losses ────────────────────────────────────────────────────────────
