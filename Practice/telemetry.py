@@ -1,27 +1,17 @@
 """
-telemetry.py — Shared GPS telemetry analysis for Great Race practice apps.
+telemetry.py — Data-source-agnostic GPS telemetry analysis for Great Race practice apps.
 
-All functions here are data-source-agnostic: they operate on any DataFrame
-that has been normalised to the standard internal schema:
+All functions here operate on any DataFrame normalised to the standard internal schema:
 
     Elapsed time (sec)  — time axis
     Distance (mi)       — cumulative GPS odometer (haversine)
     Speed (mph)         — vehicle speed
     Latitude, Longitude — GPS position (decimal degrees)
-    Time                — original timestamp string
+    Time                — timestamp string (HH:MM:SS)
     Date                — date string (YYYY-MM-DD)
 
-Data loaders (load_racebox, load_speed_tracker) normalise their respective
-source formats to this schema.  Wrap them with @st.cache_data in the calling
-app.
-
-Adding a new data source
-------------------------
-1. Write a load_<source>(path: str) -> pd.DataFrame that produces the schema
-   above.
-2. Optionally initialise a TrapConfig if the source provides trap coordinates.
-3. Call segment_exercise_runs / compute_derivatives / etc. as normal — the
-   analysis layer requires no changes.
+Schema translation (converting source parquet files to this schema) lives in
+loaders.py.  Call loaders.load_any(path) in apps; wrap with @st.cache_data.
 """
 
 from __future__ import annotations
@@ -29,7 +19,6 @@ from __future__ import annotations
 import dataclasses
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 
 # ── Physics constants ─────────────────────────────────────────────────────────

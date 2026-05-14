@@ -5,7 +5,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
 from sklearn.ensemble import RandomForestRegressor
-from scipy import stats
 import json
 import zipfile
 import tempfile

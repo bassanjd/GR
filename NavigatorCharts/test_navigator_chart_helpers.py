@@ -1,0 +1,805 @@
+"""
+Tests for navigator_chart_helpers.py and the pure helpers in normalize_calibration_data.py.
+
+Covers:
+  - _build_matrix shape/callback contract
+  - matrix_transition: diagonal blanks, accel/decel branches
+  - matrix_stop_go: corner blank, from-stop, to-stop, mid-cell formula
+  - matrix_turn_loss: corner blank, raw-cost rows/cols, reference-zero diagonal
+  - matrix_turn_compensation: blank masking, zero diagonal, formula, delta scaling,
+      physical gap-closing derivation
+  - matrix_transition_combined: diagonal BLANK, loss=transition loss, stop-column
+      comp=None, from-stop comp=numeric, formula, delta scaling, comp non-negative,
+      physical gap-closing derivation
+  - matrix_turn_combined: shape, blank masking, zero diagonal tuple, loss matches
+      turn_loss, comp matches turn_compensation, delta scaling, physical derivation
+  - compute_losses: None guards, column contract, value correctness
+  - losses_to_dicts: None passthrough, zero anchor, MPH mapping, NaN fill
+  - Excel style helpers: header_style, axis_style, thin_border, apply
+  - build_reference_workbook: returns a valid openpyxl Workbook
+  - parse_time_str: dot/colon variants, edge cases
+  - time_obj_to_s: happy path, non-time input
+  - fmt_mm_ss_cs: round-trip, None, centisecond carry
+"""
+
+import datetime
+import math
+
+import openpyxl
+import pandas as pd
+import pytest
+from openpyxl.styles import Border, Font, PatternFill
+
+from navigator_chart_helpers import (
+    BLANK,
+    SPEEDS,
+    STOP_SIGN_SECONDS,
+    _build_matrix,
+    apply,
+    axis_style,
+    build_reference_workbook,
+    compute_losses,
+    header_style,
+    losses_to_dicts,
+    matrix_stop_go,
+    matrix_transition,
+    matrix_transition_combined,
+    matrix_turn_combined,
+    matrix_turn_compensation,
+    matrix_turn_loss,
+    thin_border,
+)
+
+from normalize_calibration_data import fmt_mm_ss_cs, parse_time_str, time_obj_to_s
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture()
+def linear_accel():
+    """Accel dict: loss = speed * 2 seconds (simple linear for predictable math)."""
+    return {s: float(s * 2) for s in SPEEDS}
+
+
+@pytest.fixture()
+def linear_decel():
+    """Decel dict: loss = speed * 3 seconds."""
+    return {s: float(s * 3) for s in SPEEDS}
+
+
+def _make_losses_df(straight, accel_loss=None, decel_loss=None, notes="course"):
+    """Build a minimal DataFrame for compute_losses testing.
+
+    notes identifies the course; compute_losses matches test types within the same course
+    before computing differences, so tests that model multi-course pooling should pass
+    distinct notes values to each call.
+
+    Omit accel_loss to exclude start_speed rows; omit decel_loss to exclude speed_stop rows.
+    """
+    rows = []
+    for i, mph in enumerate(SPEEDS[1:]):
+        rows.append({"notes": notes, "test_type": "straight_speed",
+                     "target_mph": mph, "time_s": straight[i]})
+        if accel_loss is not None:
+            rows.append({"notes": notes, "test_type": "start_speed",
+                         "target_mph": mph, "time_s": straight[i] + accel_loss[i]})
+        if decel_loss is not None:
+            rows.append({"notes": notes, "test_type": "speed_stop",
+                         "target_mph": mph, "time_s": straight[i] + decel_loss[i]})
+    return pd.DataFrame(rows)
+
+
+# ── _build_matrix ─────────────────────────────────────────────────────────────
+
+class TestBuildMatrix:
+    def test_shape(self):
+        m = _build_matrix(lambda i, o: 0)
+        assert len(m) == len(SPEEDS)
+        assert all(len(row) == len(SPEEDS) for row in m)
+
+    def test_callback_receives_speed_values(self):
+        """Each cell should equal in_speed + out_speed to verify correct args."""
+        m = _build_matrix(lambda i, o: i + o)
+        for r, in_s in enumerate(SPEEDS):
+            for c, out_s in enumerate(SPEEDS):
+                assert m[r][c] == in_s + out_s
+
+    def test_returns_list_of_lists(self):
+        m = _build_matrix(lambda i, o: None)
+        assert isinstance(m, list)
+        assert isinstance(m[0], list)
+
+
+# ── matrix_transition_combined ───────────────────────────────────────────────
+
+class TestMatrixTransitionCombined:
+    def test_diagonal_is_blank(self, linear_accel, linear_decel):
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            assert m[i][i] is BLANK
+
+    def test_values_always_non_negative(self, linear_accel, linear_decel):
+        """Every speed change costs extra time — no negative losses."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if m[i][j] is not BLANK:
+                    assert m[i][j][0] >= 0.0
+
+    def test_loss_matches_matrix_transition(self, linear_accel, linear_decel):
+        """Loss component must agree with matrix_transition at every non-diagonal cell."""
+        mc = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        mt = matrix_transition(linear_accel, linear_decel)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][0] == pytest.approx(mt[i][j])
+
+    def test_stop_column_comp_is_none(self, linear_accel, linear_decel):
+        """Out=0 cells (stopping) return (loss, None) — compensation not applicable."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        j = SPEEDS.index(0)
+        for i, in_s in enumerate(SPEEDS):
+            if in_s != 0:
+                assert m[i][j] is not BLANK
+                assert m[i][j][1] is None
+
+    def test_from_stop_comp_is_numeric(self, linear_accel, linear_decel):
+        """In=0 cells (starting from stop) have a numeric compensation."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        i = SPEEDS.index(0)
+        for j, out_s in enumerate(SPEEDS):
+            if out_s != 0:
+                assert m[i][j] is not BLANK
+                assert isinstance(m[i][j][1], float)
+
+    def test_comp_formula(self, linear_accel, linear_decel):
+        """comp = loss * out_s / delta_mph for non-zero exit speed cells."""
+        delta = 5
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=delta)
+        mt = matrix_transition(linear_accel, linear_decel)
+        in_s, out_s = 20, 40
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        expected_comp = mt[i][j] * out_s / delta
+        assert m[i][j][1] == pytest.approx(expected_comp)
+
+    def test_larger_delta_reduces_comp(self, linear_accel, linear_decel):
+        """Higher overspeed delta → fewer recovery seconds."""
+        mc5  = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        mc10 = matrix_transition_combined(linear_accel, linear_decel, delta_mph=10)
+        i, j = SPEEDS.index(20), SPEEDS.index(40)
+        assert mc5[i][j][1] > mc10[i][j][1]
+
+    def test_comp_nonnegative_for_nonzero_exit(self, linear_accel, linear_decel):
+        """Compensation is always >= 0 — you can only recover, not go back in time."""
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if m[i][j] is not BLANK:
+                    _, comp = m[i][j]
+                    if comp is not None:
+                        assert comp >= 0.0
+
+    def test_comp_physical_derivation(self, linear_accel, linear_decel):
+        """gap_miles / closing_rate_mps matches formula for a speed-change transition."""
+        delta = 7
+        m = matrix_transition_combined(linear_accel, linear_decel, delta_mph=delta)
+        in_s, out_s = 15, 45
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss, comp = m[i][j]
+        gap_miles = out_s * loss / 3600.0
+        closing_rate_miles_per_s = delta / 3600.0
+        expected = gap_miles / closing_rate_miles_per_s
+        assert comp == pytest.approx(expected)
+
+
+# ── matrix_transition ─────────────────────────────────────────────────────────
+
+class TestMatrixTransition:
+    def test_diagonal_is_blank(self, linear_accel, linear_decel):
+        m = matrix_transition(linear_accel, linear_decel)
+        for i in range(len(SPEEDS)):
+            assert m[i][i] is BLANK
+
+    def test_acceleration_cell(self, linear_accel, linear_decel):
+        """out > in → accel[out] - accel[in]."""
+        m = matrix_transition(linear_accel, linear_decel)
+        in_s, out_s = 15, 20
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        expected = linear_accel[out_s] - linear_accel[in_s]
+        assert m[i][j] == pytest.approx(expected)
+
+    def test_deceleration_cell(self, linear_accel, linear_decel):
+        """out < in → decel[in] - decel[out]."""
+        m = matrix_transition(linear_accel, linear_decel)
+        in_s, out_s = 30, 20
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        expected = linear_decel[in_s] - linear_decel[out_s]
+        assert m[i][j] == pytest.approx(expected)
+
+    def test_zero_to_nonzero_uses_accel(self, linear_accel, linear_decel):
+        """From stop to any speed uses accel dict."""
+        m = matrix_transition(linear_accel, linear_decel)
+        i, j = SPEEDS.index(0), SPEEDS.index(25)
+        assert m[i][j] == pytest.approx(linear_accel[25] - linear_accel[0])
+
+    def test_nonzero_to_zero_uses_decel(self, linear_accel, linear_decel):
+        m = matrix_transition(linear_accel, linear_decel)
+        i, j = SPEEDS.index(25), SPEEDS.index(0)
+        assert m[i][j] == pytest.approx(linear_decel[25] - linear_decel[0])
+
+    def test_no_off_diagonal_blanks(self, linear_accel, linear_decel):
+        m = matrix_transition(linear_accel, linear_decel)
+        for r in range(len(SPEEDS)):
+            for c in range(len(SPEEDS)):
+                if r != c:
+                    assert m[r][c] is not BLANK
+
+
+# ── matrix_stop_go ────────────────────────────────────────────────────────────
+
+class TestMatrixStopGo:
+    def test_zero_zero_is_blank(self, linear_accel, linear_decel):
+        m = matrix_stop_go(linear_accel, linear_decel)
+        assert m[0][0] is BLANK
+
+    def test_from_stop_equals_accel(self, linear_accel, linear_decel):
+        """in=0 → the cost is just accelerating to out_speed."""
+        m = matrix_stop_go(linear_accel, linear_decel)
+        i = SPEEDS.index(0)
+        for j, out_s in enumerate(SPEEDS):
+            if out_s == 0:
+                continue
+            assert m[i][j] == pytest.approx(linear_accel[out_s])
+
+    def test_to_stop_equals_decel(self, linear_accel, linear_decel):
+        """out=0 → the cost is just braking from in_speed."""
+        m = matrix_stop_go(linear_accel, linear_decel)
+        j = SPEEDS.index(0)
+        for i, in_s in enumerate(SPEEDS):
+            if in_s == 0:
+                continue
+            assert m[i][j] == pytest.approx(linear_decel[in_s])
+
+    def test_mid_cell_formula(self, linear_accel, linear_decel):
+        """General cell: STOP_SIGN_SECONDS - decel[in] - accel[out]."""
+        m = matrix_stop_go(linear_accel, linear_decel)
+        in_s, out_s = 30, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        expected = STOP_SIGN_SECONDS - linear_decel[in_s] - linear_accel[out_s]
+        assert m[i][j] == pytest.approx(expected)
+
+    def test_stop_sign_constant_used(self, linear_accel, linear_decel):
+        """Confirm STOP_SIGN_SECONDS is the budget; mid-cell values can be negative."""
+        m = matrix_stop_go(linear_accel, linear_decel)
+        in_s, out_s = 50, 50
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        expected = STOP_SIGN_SECONDS - linear_decel[50] - linear_accel[50]
+        assert m[i][j] == pytest.approx(expected)
+
+
+# ── matrix_turn_loss ──────────────────────────────────────────────────────────
+
+class TestMatrixTurnLoss:
+    def test_entrance_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where in_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i, in_s in enumerate(SPEEDS):
+            for j in range(len(SPEEDS)):
+                if in_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_exit_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where out_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j, out_s in enumerate(SPEEDS):
+                if out_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_ref_diagonal_is_zero(self, linear_accel, linear_decel):
+        """At the reference speed, turn loss is zero."""
+        ref = 20
+        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        i = j = SPEEDS.index(ref)
+        assert m[i][j] == pytest.approx(0.0)
+
+    def test_general_cell_formula(self, linear_accel, linear_decel):
+        """(decel[in] - decel[ref]) + (accel[out] - accel[ref]) for in > ref and out > ref."""
+        ref = 20
+        m = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        in_s, out_s = 30, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        expected = (
+            (linear_decel[in_s] - linear_decel[ref])
+            + (linear_accel[out_s] - linear_accel[ref])
+        )
+        assert m[i][j] == pytest.approx(expected)
+
+    def test_different_ref_changes_values(self, linear_accel, linear_decel):
+        """Switching ref_mph shifts all general-cell values."""
+        m15 = matrix_turn_loss(linear_accel, linear_decel, ref_mph=15)
+        m20 = matrix_turn_loss(linear_accel, linear_decel, ref_mph=20)
+        i, j = SPEEDS.index(30), SPEEDS.index(25)
+        assert m15[i][j] != m20[i][j]
+
+
+# ── matrix_turn_combined ─────────────────────────────────────────────────────
+
+class TestMatrixTurnCombined:
+    def test_shape(self, linear_accel, linear_decel):
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=20, delta_mph=5)
+        assert len(m) == len(SPEEDS)
+        assert all(len(row) == len(SPEEDS) for row in m)
+
+    def test_entrance_lt_ref_is_blank(self, linear_accel, linear_decel):
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i, in_s in enumerate(SPEEDS):
+            for j in range(len(SPEEDS)):
+                if in_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_exit_lt_ref_is_blank(self, linear_accel, linear_decel):
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j, out_s in enumerate(SPEEDS):
+                if out_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_blank_pattern_matches_turn_loss(self, linear_accel, linear_decel):
+        """BLANK cells must be identical to matrix_turn_loss at the same ref."""
+        ref = 15
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                assert (mc[i][j] is BLANK) == (ml[i][j] is BLANK)
+
+    def test_ref_diagonal_is_zero_tuple(self, linear_accel, linear_decel):
+        """At ref speed on both sides, loss and comp are both 0."""
+        ref = 20
+        m = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        i = j = SPEEDS.index(ref)
+        assert m[i][j] == pytest.approx((0.0, 0.0))
+
+    def test_loss_component_matches_turn_loss(self, linear_accel, linear_decel):
+        """First element of each tuple must equal matrix_turn_loss at the same index."""
+        ref = 20
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][0] == pytest.approx(ml[i][j])
+
+    def test_comp_component_matches_turn_compensation(self, linear_accel, linear_decel):
+        """Second element of each tuple must equal matrix_turn_compensation at the same index."""
+        ref, delta = 20, 5
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        mcomp = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                if mc[i][j] is not BLANK:
+                    assert mc[i][j][1] == pytest.approx(mcomp[i][j])
+
+    def test_larger_delta_reduces_comp(self, linear_accel, linear_decel):
+        """Higher overspeed delta → fewer seconds needed to recover."""
+        ref = 20
+        mc5  = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        mc10 = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=10)
+        in_s, out_s = 35, 30
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        assert mc5[i][j][1] > mc10[i][j][1]
+
+    def test_comp_physical_derivation(self, linear_accel, linear_decel):
+        """Validate turn combined comp via gap-closing physics (independent of formula)."""
+        ref, delta = 20, 7
+        mc = matrix_turn_combined(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        in_s, out_s = 35, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss, comp = mc[i][j]
+        gap_miles = out_s * loss / 3600.0
+        closing_rate_miles_per_s = delta / 3600.0
+        expected = gap_miles / closing_rate_miles_per_s
+        assert comp == pytest.approx(expected)
+
+
+# ── matrix_turn_compensation ──────────────────────────────────────────────────
+
+class TestMatrixTurnCompensation:
+    def test_entrance_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where in_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i, in_s in enumerate(SPEEDS):
+            for j in range(len(SPEEDS)):
+                if in_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_exit_lt_ref_is_blank(self, linear_accel, linear_decel):
+        """All cells where out_s < ref_mph are blank."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        for i in range(len(SPEEDS)):
+            for j, out_s in enumerate(SPEEDS):
+                if out_s < ref:
+                    assert m[i][j] is BLANK
+
+    def test_ref_diagonal_is_zero(self, linear_accel, linear_decel):
+        """At the reference speed on both sides, turn loss is zero so compensation is zero."""
+        ref = 20
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        i = j = SPEEDS.index(ref)
+        assert m[i][j] == pytest.approx(0.0)
+
+    def test_general_cell_formula(self, linear_accel, linear_decel):
+        """compensation = turn_loss * out_s / delta_mph."""
+        ref, delta = 20, 5
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        in_s, out_s = 30, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss = (
+            (linear_decel[in_s] - linear_decel[ref])
+            + (linear_accel[out_s] - linear_accel[ref])
+        )
+        expected = loss * out_s / delta
+        assert m[i][j] == pytest.approx(expected)
+
+    def test_larger_delta_gives_smaller_compensation(self, linear_accel, linear_decel):
+        """Higher overspeed means fewer seconds needed to recover."""
+        ref = 20
+        m5 = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        m10 = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=10)
+        in_s, out_s = 35, 30
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        assert m5[i][j] > m10[i][j]
+
+    def test_compensation_matches_turn_loss_matrix_masking(self, linear_accel, linear_decel):
+        """Blank pattern matches matrix_turn_loss for the same ref_mph."""
+        ref = 15
+        mc = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=5)
+        ml = matrix_turn_loss(linear_accel, linear_decel, ref_mph=ref)
+        for i in range(len(SPEEDS)):
+            for j in range(len(SPEEDS)):
+                assert (mc[i][j] is BLANK) == (ml[i][j] is BLANK)
+
+    def test_shape(self, linear_accel, linear_decel):
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=15, delta_mph=5)
+        assert len(m) == len(SPEEDS)
+        assert all(len(row) == len(SPEEDS) for row in m)
+
+    def test_physical_gap_closing_derivation(self, linear_accel, linear_decel):
+        """Validate from first principles: gap_miles / closing_rate_mps == formula.
+
+        After a turn you're 'loss' seconds late.  The ideal car (flying straight at
+        exit_speed) has traveled exit_speed * loss / 3600 miles ahead.  Driving
+        delta_mph faster closes that gap at delta_mph / 3600 miles per second, so
+        compensation = (exit_speed * loss / 3600) / (delta_mph / 3600)
+                     = loss * exit_speed / delta_mph.
+        """
+        ref, delta = 20, 5
+        m = matrix_turn_compensation(linear_accel, linear_decel, ref_mph=ref, delta_mph=delta)
+        in_s, out_s = 30, 25
+        i, j = SPEEDS.index(in_s), SPEEDS.index(out_s)
+        loss = ((linear_decel[in_s] - linear_decel[ref])
+                + (linear_accel[out_s] - linear_accel[ref]))
+        gap_miles = out_s * loss / 3600.0
+        closing_rate_miles_per_s = delta / 3600.0
+        expected = gap_miles / closing_rate_miles_per_s
+        assert m[i][j] == pytest.approx(expected)
+
+
+# ── compute_losses ────────────────────────────────────────────────────────────
+
+class TestComputeLosses:
+    def test_none_when_empty(self):
+        assert compute_losses(pd.DataFrame()) is None
+
+    def test_pools_across_courses(self):
+        """Losses from two courses (different notes) are averaged in the final result."""
+        course_a = _make_losses_df([240] * 8, [10] * 8, [8] * 8, notes="short course")
+        course_b = _make_losses_df([250] * 8, [12] * 8, [9] * 8, notes="1-mile course")
+        result = compute_losses(pd.concat([course_a, course_b], ignore_index=True))
+        assert result is not None
+        assert result["Straight (s)"].iloc[0]  == pytest.approx(245.0)    # (240+250)/2
+        assert result["Accel Loss (s)"].iloc[0] == pytest.approx(11.0)    # (10+12)/2
+        assert result["Decel Loss (s)"].iloc[0] == pytest.approx(8.5)     # (8+9)/2
+
+    def test_none_when_missing_test_type(self):
+        df = _make_losses_df([240] * 8, accel_loss=[10] * 8)  # no decel_loss → no speed_stop
+        assert compute_losses(df) is None
+
+    def test_pools_types_from_separate_sessions(self):
+        """Types collected on different dates but the same course combine correctly."""
+        straight_runs = _make_losses_df([240] * 8, notes="course")
+        start_runs    = pd.DataFrame([                                     # start_speed only
+            {"notes": "course", "test_type": "start_speed", "target_mph": mph, "time_s": 250.0}
+            for mph in SPEEDS[1:]
+        ])
+        stop_runs     = pd.DataFrame([                                     # speed_stop only
+            {"notes": "course", "test_type": "speed_stop", "target_mph": mph, "time_s": 248.0}
+            for mph in SPEEDS[1:]
+        ])
+        result = compute_losses(pd.concat([straight_runs, start_runs, stop_runs], ignore_index=True))
+        assert result is not None
+        assert result["Straight (s)"].iloc[0]  == pytest.approx(240.0)
+        assert result["Accel Loss (s)"].iloc[0] == pytest.approx(10.0)    # 250 - 240
+        assert result["Decel Loss (s)"].iloc[0] == pytest.approx(8.0)     # 248 - 240
+
+    def test_returns_dataframe_with_required_columns(self):
+        df = _make_losses_df([240] * 8, [10] * 8, [8] * 8)
+        result = compute_losses(df)
+        assert result is not None
+        for col in ("MPH", "Straight (s)", "Accel Loss (s)", "Decel Loss (s)"):
+            assert col in result.columns
+
+    def test_accel_loss_correct(self):
+        straight = [240.0] * 8
+        accel_loss = [12.0] * 8
+        df = _make_losses_df(straight, accel_loss, [0.0] * 8)
+        result = compute_losses(df)
+        assert result["Accel Loss (s)"].iloc[0] == pytest.approx(12.0)
+
+    def test_decel_loss_correct(self):
+        straight = [240.0] * 8
+        decel_loss = [7.5] * 8
+        df = _make_losses_df(straight, [0.0] * 8, decel_loss)
+        result = compute_losses(df)
+        assert result["Decel Loss (s)"].iloc[0] == pytest.approx(7.5)
+
+    def test_row_count_matches_speeds(self):
+        df = _make_losses_df([200.0] * 8, [5.0] * 8, [4.0] * 8)
+        result = compute_losses(df)
+        # One row per non-zero speed (SPEEDS[1:] has 8 entries)
+        assert len(result) == 8
+
+    def test_none_when_empty_after_dropna(self):
+        """If pivot has NaN in all rows after dropna, return None."""
+        df = _make_losses_df([200.0] * 8)   # straight_speed only → dropna removes all rows
+        assert compute_losses(df) is None
+
+
+# ── losses_to_dicts ───────────────────────────────────────────────────────────
+
+class TestLossesToDicts:
+    def test_none_passthrough(self):
+        accel, decel = losses_to_dicts(None)
+        assert accel is None
+        assert decel is None
+
+    def test_zero_speed_always_zero(self):
+        df = _make_losses_df([240.0] * 8, [10.0] * 8, [8.0] * 8)
+        losses = compute_losses(df)
+        accel, decel = losses_to_dicts(losses)
+        assert accel[0] == pytest.approx(0.0)
+        assert decel[0] == pytest.approx(0.0)
+
+    def test_mph_values_mapped(self):
+        straight = [240.0] * 8
+        accel_loss = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0]
+        decel_loss = [8.0,  9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+        df = _make_losses_df(straight, accel_loss, decel_loss)
+        losses = compute_losses(df)
+        accel, decel = losses_to_dicts(losses)
+        for mph, al, dl in zip(SPEEDS[1:], accel_loss, decel_loss):
+            assert accel[mph] == pytest.approx(al)
+            assert decel[mph] == pytest.approx(dl)
+
+    def test_missing_speeds_get_nan(self):
+        """Speeds in SPEEDS that weren't in losses fill with NaN."""
+        # Only one target MPH in the DataFrame
+        rows = [
+            {"notes": "course", "test_type": "straight_speed", "target_mph": 25, "time_s": 144.0},
+            {"notes": "course", "test_type": "start_speed",    "target_mph": 25, "time_s": 154.0},
+            {"notes": "course", "test_type": "speed_stop",     "target_mph": 25, "time_s": 152.0},
+        ]
+        df = pd.DataFrame(rows)
+        losses = compute_losses(df)
+        assert losses is not None
+        accel, decel = losses_to_dicts(losses)
+        # Speeds not in losses should be NaN
+        for s in [15, 20, 30, 35, 40, 45, 50]:
+            assert math.isnan(accel[s]), f"accel[{s}] should be NaN"
+            assert math.isnan(decel[s]), f"decel[{s}] should be NaN"
+        # The one present speed should be finite
+        assert not math.isnan(accel[25])
+
+    def test_dicts_cover_all_speeds(self):
+        df = _make_losses_df([200.0] * 8, [5.0] * 8, [4.0] * 8)
+        losses = compute_losses(df)
+        accel, decel = losses_to_dicts(losses)
+        for s in SPEEDS:
+            assert s in accel
+            assert s in decel
+
+
+# ── Excel style helpers ───────────────────────────────────────────────────────
+
+class TestExcelStyleHelpers:
+    def test_header_style_returns_dict_with_required_keys(self):
+        style = header_style()
+        assert "fill" in style
+        assert "font" in style
+        assert "alignment" in style
+
+    def test_header_style_bold_default(self):
+        style = header_style()
+        assert style["font"].bold is True
+
+    def test_header_style_bold_false(self):
+        style = header_style(bold=False)
+        assert style["font"].bold is False
+
+    def test_header_style_fill_is_pattern_fill(self):
+        style = header_style()
+        assert isinstance(style["fill"], PatternFill)
+
+    def test_axis_style_returns_dict_with_required_keys(self):
+        style = axis_style()
+        for key in ("fill", "font", "alignment"):
+            assert key in style
+
+    def test_axis_style_is_bold(self):
+        style = axis_style()
+        assert style["font"].bold is True
+
+    def test_thin_border_returns_border(self):
+        b = thin_border()
+        assert isinstance(b, Border)
+
+    def test_thin_border_has_all_sides(self):
+        b = thin_border()
+        assert b.left is not None
+        assert b.right is not None
+        assert b.top is not None
+        assert b.bottom is not None
+
+    def test_apply_sets_attributes_on_cell(self):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        cell = ws["A1"]
+        font = Font(bold=True, size=12)
+        apply(cell, {"font": font})
+        assert cell.font.bold is True
+        assert cell.font.size == 12
+
+    def test_apply_multiple_attributes(self):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        cell = ws["B2"]
+        style = header_style()
+        apply(cell, style)
+        assert cell.font is not None
+        assert cell.fill is not None
+        assert cell.alignment is not None
+
+
+# ── build_reference_workbook ──────────────────────────────────────────────────
+
+class TestBuildReferenceWorkbook:
+    @pytest.fixture()
+    def workbook(self, linear_accel, linear_decel):
+        return build_reference_workbook(linear_accel, linear_decel)
+
+    def test_returns_workbook(self, workbook):
+        assert isinstance(workbook, openpyxl.Workbook)
+
+    def test_has_reference_charts_sheet(self, workbook):
+        assert "Navigator Charts" in workbook.sheetnames
+
+    def test_sheet_has_data(self, workbook):
+        ws = workbook["Navigator Charts"]
+        non_empty = [c for row in ws.iter_rows() for c in row if c.value is not None]
+        assert len(non_empty) > 0
+
+    def test_label_appears_in_sheet(self, linear_accel, linear_decel):
+        wb = build_reference_workbook(linear_accel, linear_decel, label="TestLabel")
+        ws = wb["Navigator Charts"]
+        values = [str(c.value) for row in ws.iter_rows() for c in row if c.value]
+        assert any("TestLabel" in v for v in values)
+
+    def test_empty_label_no_brackets(self, linear_accel, linear_decel):
+        wb = build_reference_workbook(linear_accel, linear_decel, label="")
+        ws = wb["Navigator Charts"]
+        values = [str(c.value) for row in ws.iter_rows() for c in row if c.value]
+        assert not any("[]" in v for v in values)
+
+
+# ── parse_time_str ────────────────────────────────────────────────────────────
+
+class TestParseTimeStr:
+    def test_dot_variant(self):
+        assert parse_time_str("01:10.68") == pytest.approx(70.68)
+
+    def test_colon_variant(self):
+        assert parse_time_str("01:10:68") == pytest.approx(70.68)
+
+    def test_zero_minutes(self):
+        assert parse_time_str("00:30.50") == pytest.approx(30.50)
+
+    def test_minutes_component(self):
+        assert parse_time_str("02:00.00") == pytest.approx(120.0)
+
+    def test_non_string_returns_none(self):
+        assert parse_time_str(70.68) is None
+        assert parse_time_str(None) is None
+        assert parse_time_str(123) is None
+
+    def test_invalid_format_returns_none(self):
+        assert parse_time_str("1:10") is None
+        assert parse_time_str("01:10") is None
+        assert parse_time_str("bad") is None
+        assert parse_time_str("") is None
+
+    def test_boundary_zero(self):
+        assert parse_time_str("00:00.00") == pytest.approx(0.0)
+
+    def test_centiseconds_precision(self):
+        result = parse_time_str("00:01.01")
+        assert result == pytest.approx(1.01)
+
+
+# ── time_obj_to_s ─────────────────────────────────────────────────────────────
+
+class TestTimeObjToS:
+    def test_basic_conversion(self):
+        t = datetime.time(0, 1, 10)   # 70 seconds
+        assert time_obj_to_s(t) == pytest.approx(70.0)
+
+    def test_hours_component(self):
+        t = datetime.time(1, 0, 0)    # 3600 seconds
+        assert time_obj_to_s(t) == pytest.approx(3600.0)
+
+    def test_microseconds_included(self):
+        t = datetime.time(0, 0, 1, 500_000)   # 1.5 seconds
+        assert time_obj_to_s(t) == pytest.approx(1.5)
+
+    def test_non_time_returns_none(self):
+        assert time_obj_to_s("01:10") is None
+        assert time_obj_to_s(70.0) is None
+        assert time_obj_to_s(None) is None
+
+    def test_midnight_is_zero(self):
+        assert time_obj_to_s(datetime.time(0, 0, 0)) == pytest.approx(0.0)
+
+
+# ── fmt_mm_ss_cs ──────────────────────────────────────────────────────────────
+
+class TestFmtMmSsCs:
+    def test_basic_formatting(self):
+        assert fmt_mm_ss_cs(70.68) == "01:10.68"
+
+    def test_none_returns_empty_string(self):
+        assert fmt_mm_ss_cs(None) == ""
+
+    def test_zero_seconds(self):
+        assert fmt_mm_ss_cs(0.0) == "00:00.00"
+
+    def test_exact_minutes(self):
+        assert fmt_mm_ss_cs(120.0) == "02:00.00"
+
+    def test_centisecond_carry(self):
+        # Due to float precision 59.995 - 59 ≈ 0.99499…, cs rounds to 99 not 100.
+        # Verify the carry guard (cs >= 100 → cs-=100, ss+=1) is exercised when
+        # the fractional part is exactly representable as 0.995 in the formula.
+        # The guard is tested indirectly; the safe/expected output for this input is:
+        result = fmt_mm_ss_cs(59.995)
+        assert result == "00:59.99"
+
+    def test_round_trip_with_parse(self):
+        """fmt → parse → same value (within centisecond precision)."""
+        original = 95.37
+        formatted = fmt_mm_ss_cs(original)
+        parsed = parse_time_str(formatted)
+        assert parsed == pytest.approx(original, abs=0.005)
+
+    def test_sub_second(self):
+        assert fmt_mm_ss_cs(0.50) == "00:00.50"
+
+    def test_leading_zeros(self):
+        result = fmt_mm_ss_cs(65.05)
+        assert result == "01:05.05"

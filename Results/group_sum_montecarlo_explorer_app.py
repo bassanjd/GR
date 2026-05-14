@@ -124,8 +124,6 @@ with tabs[0]:
 
     st.dataframe(pivot_df)
 
-    # fig = px.bar(pivot_df.reset_index(), x=row, y=val)
-
     pivot_reset = pivot_df.reset_index()
 
     # If no column dimension → single value column
@@ -359,17 +357,6 @@ with tabs[2]:
             showlegend=False
         ))
 
-    # for g in results:
-    #     fig.add_trace(go.Histogram(
-    #         x=results[g],
-    #         name=str(g),
-    #         opacity=0.5,
-    #         histnorm="probability density"))
-    #     fig.add_vline(
-    #         x=actual[g],  
-    #         # line_color='red', 
-    #         name=str(g))
-    
     fig.update_layout(barmode="overlay")
     st.plotly_chart(fig, use_container_width=True)
 

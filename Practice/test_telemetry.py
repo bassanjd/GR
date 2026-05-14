@@ -26,6 +26,7 @@ from telemetry import (
     segment_exercise_runs,
     smooth_series,
 )
+from loaders import load_racebox, load_speed_tracker
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
