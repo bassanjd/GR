@@ -479,7 +479,7 @@ def matrix_combined_html(matrix, title, subtitle, delta_mph,
                 else:
                     cell_html = (
                         f'<span style="font-size:13px;font-weight:bold">{loss:.1f}</span>'
-                        f'<br><span style="font-size:11px;color:{comp_color}">{delta_mph}↑{comp:.0f}</span>'
+                        f'<br><span style="font-size:11px;color:{comp_color}">{delta_mph}↑{comp:.1f}</span>'
                     )
                 h.append(f'<td style="{s}">{cell_html}</td>')
         h.append('</tr>')

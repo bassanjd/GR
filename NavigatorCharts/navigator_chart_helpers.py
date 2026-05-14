@@ -420,7 +420,7 @@ def write_combined_turn_matrix(ws, matrix, title, subtitle, top_row, left_col,
                     cell.value = f"{loss:.1f}"
                     cell.alignment = Alignment(horizontal="center", vertical="center")
                 else:
-                    cell.value = f"{loss:.1f}\n{delta_mph}↑{comp:.0f}"
+                    cell.value = f"{loss:.1f}\n{delta_mph}↑{comp:.1f}"
                     cell.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
                 if color_scale and loss_vals:
                     bg = _tricolor_hex(loss, vmin, vmid, vmax, color_lo, color_mid, color_hi)
