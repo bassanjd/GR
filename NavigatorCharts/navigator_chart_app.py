@@ -354,12 +354,12 @@ def _luminance(hex_color):
 _S_TITLE  = ("background:#D6E4F0;color:#1F4E79;font-weight:bold;font-size:14px;"
               "padding:5px 7px;")
 _S_SUB    = "color:#595959;font-style:italic;font-size:11px;padding:2px 7px 5px;"
-_S_CORNER = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:11px;"
+_S_CORNER = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:22px;"
              "text-align:center;padding:4px 8px;border:1px solid #9DC3E6;"
              "white-space:nowrap;")
-_S_HDR    = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:12px;"
+_S_HDR    = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:24px;"
              "text-align:center;padding:5px 12px;min-width:52px;border:1px solid #9DC3E6;")
-_S_AXIS   = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:12px;"
+_S_AXIS   = ("background:#1F4E79;color:#FFF;font-weight:bold;font-size:24px;"
              "text-align:center;padding:5px 12px;min-width:52px;border:1px solid #9DC3E6;")
 _S_BLANK  = "background:#D9D9D9;border:1px solid #9DC3E6;padding:4px 8px;min-width:52px;"
 _S_BLACK  = ("background:#D9D9D9;color:#D9D9D9;font-size:12px;text-align:center;"
@@ -412,7 +412,7 @@ def matrix_html(matrix, title, subtitle, c_lo, c_mid, c_hi,
                 s = (f"background:#{bg};color:#{fg};font-size:12px;"
                      f"text-align:center;vertical-align:middle;padding:4px 8px;"
                      f"min-width:52px;border:1px solid #9DC3E6;")
-                h.append(f'<td style="{s}">{val:.1f}</td>')
+                h.append(f'<td style="{s}"><span style="font-size:13px;font-weight:bold">{val:.1f}</span></td>')
         h.append('</tr>')
 
     h.append('</table>')
@@ -626,7 +626,7 @@ accel_all,  decel_all  = losses_to_dicts(losses_all)
 losses_filt = compute_losses(df_kept)
 accel_filt, decel_filt = losses_to_dicts(losses_filt)
 
-filt_label = f"Filtered ({n_excl} excluded)" if n_excl else "Filtered (none excluded)"
+filt_label = f"Filtered & curve-fit ({n_excl} excluded)" if n_excl else "Filtered & curve-fit (none excluded)"
 
 # ── Fit coefficients (used in both Summary tab and export) ────────────────────
 
@@ -708,34 +708,43 @@ navigator works the stopwatch:
 
 | Moment | Navigator action |
 |---|---|
-| Turn exit is clear, driver begins accelerating | **Start stopwatch** |
-| Comp seconds elapsed | **Call "back"** → driver begins returning to exit speed |
+| Turn exit is complete and at target exitspeed, driver begins accelerating | **Start stopwatch** |
+| Compensation seconds elapsed | **Call "back"** → driver begins returning to exit speed |
 | Driver settles at exit speed | Clock is already stopped — no further action |
 
-**Start the stopwatch** the moment the turn exit is clear and the driver begins
+**Start the stopwatch** the moment the turn exit is complete and when the driver begins
 accelerating above the target exit speed — not after the compensation speed is
 reached. Starting at the onset of acceleration captures the full recovery window,
 since the car is already gaining distance on the ideal pace from the first extra
 foot-second of speed above the exit speed.
 
-**Stop the stopwatch / call "back"** when comp_s seconds have elapsed. At that
+**Stop the stopwatch / call "back"** when the compensation time has elapsed. At that
 signal the driver begins decelerating back to the target exit speed. That
 deceleration happens *after* the timer, not before.
 
-The formula `comp_s = loss_s × exit_mph ÷ Δmph` assumes a theoretical square-wave
-profile — instantaneous jump to comp speed, hold it, instantaneous return. Real life
-has a ramp up and a ramp down. Starting the clock at the *beginning* of acceleration
-(rather than after comp speed is reached) includes the ramp-up; stopping the clock at
-the *start* of the return excludes the ramp-down. Because the ramp-down at 5 mph over
-for a second or two runs slightly in your favor, the net error is small and conservative
-— you will slightly over-recover rather than under-recover.
+**Formula derivation**: After a turn costs `loss` extra seconds, the car that flew
+straight through has traveled `exit_mph × loss / 3600` extra miles. Driving `Δmph`
+faster closes that gap at `Δmph / 3600` miles per second, so:
+
+```
+comp_s = gap_miles / closing_rate = (exit_mph × loss / 3600) / (Δmph / 3600)
+       = loss × exit_mph / Δmph
+```
+
+The formula assumes a theoretical square-wave profile — instantaneous jump to
+compensation speed, hold it, instantaneous return. Real life has a ramp up and a ramp
+down. Starting the clock at the *beginning* of acceleration (rather than after
+compensation speed is reached) includes the ramp-up; stopping the clock at the *start*
+of the return excludes the ramp-down. Because the ramp-down at 5 mph over for a second
+or two runs slightly in your favor, the net error is small and conservative — you will
+slightly over-recover rather than under-recover.
 
 ---
 
 ## About This App
 
 This app processes timed calibration runs to produce the **navigator charts**
-used in-car during the Great Race. The charts give the navigator a lookup table showing
+used in-car during the race. The charts give the navigator a lookup table showing
 how many seconds are gained or lost whenever the car changes speed — for example,
 accelerating from a stop sign to cruise speed, or slowing from 45 mph to make a turn.
 

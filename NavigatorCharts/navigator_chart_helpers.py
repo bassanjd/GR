@@ -193,7 +193,7 @@ BLACK_FONT = Font(color="D9D9D9", size=12)  # grey-on-grey: values present but v
 def header_style(bold=True):
     return {
         "fill":      PatternFill(start_color=C_HEADER_BG, end_color=C_HEADER_BG, fill_type="solid"),
-        "font":      Font(color=C_HEADER_FG, bold=bold, size=12),
+        "font":      Font(color=C_HEADER_FG, bold=bold, size=24),
         "alignment": Alignment(horizontal="center", vertical="center"),
     }
 
@@ -201,7 +201,7 @@ def header_style(bold=True):
 def axis_style():
     return {
         "fill":      PatternFill(start_color=C_AXIS_BG, end_color=C_AXIS_BG, fill_type="solid"),
-        "font":      Font(color=C_AXIS_FG, bold=True, size=12),
+        "font":      Font(color=C_AXIS_FG, bold=True, size=24),
         "alignment": Alignment(horizontal="center", vertical="center"),
     }
 

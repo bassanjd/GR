@@ -246,14 +246,19 @@ Constants, pure matrix functions, loss computation, and openpyxl writing helpers
 **Matrix functions** (all return a `len(SPEEDS) × len(SPEEDS)` list-of-lists):
 - `matrix_transition(accel, decel)` — extra seconds for any speed change; diagonal is `BLANK`
 - `matrix_stop_go(accel, decel)` — standstill seconds remaining inside a mandatory stop
-- `matrix_turn_loss(accel, decel, ref_mph)` — time lost vs arriving/leaving at `ref_mph`
+- `matrix_turn_loss(accel, decel, ref_mph)` — time lost vs arriving/leaving at `ref_mph`; blank where in or out < ref_mph
+- `matrix_turn_compensation(accel, decel, ref_mph, delta_mph)` — seconds to drive at (exit_speed + delta_mph) to recover the turn loss; formula `loss × exit_speed / delta_mph`; blank where in or out < ref_mph
+- `matrix_transition_combined(accel, decel, delta_mph)` — combined speed-transition matrix; each non-diagonal cell is `(loss, comp)` where loss = matrix_transition value and comp = `loss × exit_speed / delta_mph`; stopping column (out=0) returns `(loss, None)` — use the Stop Sign matrix for compensation after stopping
+- `matrix_turn_combined(accel, decel, ref_mph, delta_mph)` — combined turn matrix; each non-blank cell is `(loss, comp)` where loss = turn loss and comp = turn compensation; blank where in or out < ref_mph
+
+**Compensation formula derivation**: `comp = loss × exit_speed / delta_mph`. After a turn or speed change costing `loss` seconds, the ideal car has traveled `exit_speed × loss / 3600` extra miles. Driving `delta_mph` faster closes that gap at `delta_mph / 3600` miles/second, requiring `loss × exit_speed / delta_mph` seconds. The stopwatch starts at the onset of acceleration (capturing the ramp-up) and stops when the compensation time elapses (before the ramp-down), so the net error is a slight over-recovery.
 
 **Data pipeline**:
 - `load_calibration_runs()` — reads the *Calibration Runs* sheet from `navigator_chart_normalized.xlsx`
 - `compute_losses(df)` — pivots rows from the latest date into per-speed accel/decel loss table; returns `None` if data incomplete
 - `losses_to_dicts(losses)` — converts loss DataFrame to `(accel, decel)` dicts keyed by MPH; missing speeds fill with `NaN`
 
-**Excel writing**: `write_matrix(...)`, `write_reference_charts_to_sheet(...)`, `build_reference_workbook(...)` — write four labeled, color-scaled matrices to openpyxl worksheets.
+**Excel writing**: `write_matrix(...)` — single-value matrix (used for Stop Sign); `write_combined_turn_matrix(...)` — combined (loss, comp) matrix with two-line cells; `write_reference_charts_to_sheet(...)`, `build_reference_workbook(...)` — write four reference matrices (1: speed transition combined, 2: stop sign, 3 & 4: turn combined at 15 and 20 mph ref) to openpyxl worksheets.
 
 ### `normalize_calibration_data.py` — raw data normalization
 
@@ -279,9 +284,9 @@ Three-tab layout (**Summary**, **Charts**, **Help**). Sidebar holds the date fil
 - Loss table with Fit Accel Loss and Fit Decel Loss columns; polynomial equations and R² values shown as captions
 - Run-times pivot table: rows = target speed, columns = run type (Straight / Start / Stop) with nested Avg / Std / N sub-columns; N cells highlighted where filtered count differs from the other column
 
-**Charts tab** — two columns (All Data / Filtered): download buttons for Excel export + four HTML reference matrices with green-yellow-red conditional formatting based on displayed (rounded) values.
+**Charts tab** — two columns (All Data / Filtered): download buttons for Excel export + four HTML reference matrices (speed transition, stop sign, turn ×2) with green-yellow-red conditional formatting. Matrices 1, 3, and 4 are combined: each cell shows the time loss on top and `delta_mph↑comp_s` on the bottom.
 
-**Help tab** — app overview, usage guide, result interpretation guidance, and auto-exclude methodology.
+**Help tab** — compensation stopwatch timing guide (when to start/stop the watch, ramp-up/ramp-down reasoning), app overview, usage guide, result interpretation guidance, and auto-exclude methodology.
 
 **Key helpers in the app** (not in `navigator_chart_helpers.py`):
 - `compute_auto_excludes(df, n)` — returns `(mask, excl_order)` boolean mask and integer order Series
@@ -496,7 +501,9 @@ Covers all pure analysis functions in `telemetry.py`: `TrapConfig` geometry, `ha
 
 #### `NavigatorCharts/test_navigator_chart_helpers.py`
 
-Covers all pure functions in `navigator_chart_helpers.py` and the time-parsing helpers in `normalize_calibration_data.py`: matrix math (`matrix_transition`, `matrix_stop_go`, `matrix_turn_loss`), loss pipeline (`compute_losses`, `losses_to_dicts`), Excel style helpers, `build_reference_workbook`, `parse_time_str`, `time_obj_to_s`, `fmt_mm_ss_cs`.
+Covers all pure functions in `navigator_chart_helpers.py` and the time-parsing helpers in `normalize_calibration_data.py`: matrix math (`matrix_transition`, `matrix_stop_go`, `matrix_turn_loss`, `matrix_turn_compensation`, `matrix_transition_combined`, `matrix_turn_combined`), loss pipeline (`compute_losses`, `losses_to_dicts`), Excel style helpers, `build_reference_workbook`, `parse_time_str`, `time_obj_to_s`, `fmt_mm_ss_cs`.
+
+Compensation formula tests use an independent physical derivation (`gap_miles / closing_rate = loss × exit_speed / delta_mph`) rather than restating the formula, providing genuine cross-validation.
 
 Test fixture `_make_losses_df` uses the correct parquet schema (`date`, `test_type`, `target_mph`, `time_s`). The `_TEST_DATE` local constant is used instead of a hardcoded year — `compute_losses` filters to `df["date"].max()` so any date works. `test_uses_latest_date_only` verifies that only the most recent date's rows contribute to losses.
 
