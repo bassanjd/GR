@@ -475,11 +475,11 @@ def matrix_combined_html(matrix, title, subtitle, delta_mph,
                      f"text-align:center;vertical-align:middle;padding:4px 8px;"
                      f"min-width:52px;border:1px solid #9DC3E6;line-height:1.5;")
                 if comp is None:
-                    cell_html = f'<span style="font-size:13px;font-weight:bold">{loss:.1f}s</span>'
+                    cell_html = f'<span style="font-size:13px;font-weight:bold">{loss:.1f}</span>'
                 else:
                     cell_html = (
-                        f'<span style="font-size:13px;font-weight:bold">{loss:.1f}s</span>'
-                        f'<br><span style="font-size:11px;color:{comp_color}">↑{comp:.0f}s</span>'
+                        f'<span style="font-size:13px;font-weight:bold">{loss:.1f}</span>'
+                        f'<br><span style="font-size:11px;color:{comp_color}">{delta_mph}↑{comp:.0f}</span>'
                     )
                 h.append(f'<td style="{s}">{cell_html}</td>')
         h.append('</tr>')
